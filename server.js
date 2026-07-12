@@ -123,7 +123,7 @@ const DOUG_CONFIG = Object.freeze({
     weekdayEnd: "19:30",
     saturdayStart: "10:00",
     saturdayEnd: "16:00",
-    sundayEnabled: false
+    sundayEnabled: true
   },
   preferredWindows: {
     morning: "09:15",
@@ -2046,12 +2046,30 @@ function parseClock(value) {
 }
 
 function validCallingDay(parts) {
-  return localDayOfWeek(parts) !== 0;
+  const day = localDayOfWeek(parts);
+
+  return (
+    day !== 0 ||
+    DOUG_CONFIG.operatingWindow.sundayEnabled
+  );
 }
 
 function operatingWindowForParts(parts) {
   const day = localDayOfWeek(parts);
-  if (day === 0) return null;
+  if (day === 0) {
+  if (!DOUG_CONFIG.operatingWindow.sundayEnabled) {
+    return null;
+  }
+
+  return {
+    start: parseClock(
+      DOUG_CONFIG.operatingWindow.weekdayStart
+    ),
+    end: parseClock(
+      DOUG_CONFIG.operatingWindow.weekdayEnd
+    )
+  };
+}
   if (day === 6) {
     return {
       start: parseClock(DOUG_CONFIG.operatingWindow.saturdayStart),
