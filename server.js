@@ -1,5 +1,3 @@
-"use strict";
-
 const express = require("express");
 const http = require("http");
 const { randomUUID, createHash } = require("crypto");
@@ -3405,4 +3403,715 @@ mediaServer.on(
 
             if (
               event.type ===
-              "response.output_audio_transcript.done
+              "response.output_audio_transcript.done"
+            ) {
+              await appendTranscript(
+                call.call_id,
+                "assistant",
+                event.transcript
+              );
+
+              return;
+            }
+
+            if (
+              event.type ===
+              "conversation.item.input_audio_transcription.completed"
+            ) {
+              await appendTranscript(
+                call.call_id,
+                "lead",
+                event.transcript
+              );
+
+              return;
+            }
+
+            if (
+              event.type ===
+              "response.function_call_arguments.done"
+            ) {
+              await handleToolCall(
+                event.name,
+                event.call_id,
+                event.arguments || "{}"
+              );
+
+              return;
+            }
+
+            if (
+              event.type ===
+                "response.output_item.done" &&
+              event.item &&
+              event.item.type ===
+                "function_call"
+            ) {
+              await handleToolCall(
+                event.item.name,
+                event.item.call_id,
+                event.item.arguments ||
+                  "{}"
+              );
+
+              return;
+            }
+
+            if (
+              event.type ===
+                "response.done" &&
+              event.response &&
+              Array.isArray(
+                event.response.output
+              )
+            ) {
+              for (
+                const item of
+                event.response.output
+              ) {
+                if (
+                  item &&
+                  item.type ===
+                    "function_call"
+                ) {
+                  await handleToolCall(
+                    item.name,
+                    item.call_id,
+                    item.arguments ||
+                      "{}"
+                  );
+                }
+              }
+
+              return;
+            }
+
+            if (
+              event.type ===
+              "error"
+            ) {
+              const message =
+                event.error?.message ||
+                event.message ||
+                "OpenAI Realtime error";
+
+              console.error(
+                `OpenAI Realtime error for ${call.call_id}:`,
+                message
+              );
+
+              await updateCallStatus(
+                call.call_id,
+                "in-progress",
+                {
+                  last_error:
+                    message
+                }
+              );
+            }
+          } catch (error) {
+            console.error(
+              `OpenAI event handler failed for ${
+                call
+                  ? call.call_id
+                  : "unknown"
+              }:`,
+              error
+            );
+          }
+        }
+      );
+
+      openaiSocket.on(
+        "error",
+        async (error) => {
+          try {
+            console.error(
+              `OpenAI socket error for ${call.call_id}:`,
+              error.message
+            );
+
+            await updateCallStatus(
+              call.call_id,
+              "in-progress",
+              {
+                last_error:
+                  error.message
+              }
+            );
+          } catch (updateError) {
+            console.error(
+              "Failed to save OpenAI socket error:",
+              updateError
+            );
+          }
+        }
+      );
+
+      openaiSocket.on(
+        "close",
+        (code, reason) => {
+          console.log(
+            `OpenAI socket closed for ${
+              call
+                ? call.call_id
+                : "unknown"
+            }: ${code} ${String(
+              reason || ""
+            )}`
+          );
+
+          if (
+            !closed &&
+            twilioSocket.readyState ===
+              WebSocket.OPEN
+          ) {
+            twilioSocket.close();
+          }
+        }
+      );
+    }
+
+    twilioSocket.on(
+      "message",
+      async (rawMessage) => {
+        try {
+          let message;
+
+          try {
+            message =
+              JSON.parse(
+                rawMessage.toString()
+              );
+          } catch {
+            return;
+          }
+
+          if (
+            message.event ===
+              "start"
+          ) {
+            const parameters =
+              message.start
+                ?.customParameters ||
+              {};
+
+            const callId =
+              cleanText(
+                parameters.call_id,
+                100
+              );
+
+            const token =
+              cleanText(
+                parameters.stream_token,
+                160
+              );
+
+            call =
+              await validateCallToken(
+                callId,
+                token
+              );
+
+            if (!call) {
+              twilioSocket.close(
+                1008,
+                "Invalid stream token"
+              );
+
+              return;
+            }
+
+            streamSid =
+              message.start
+                ?.streamSid ||
+              message.streamSid;
+
+            await updateCallStatus(
+              call.call_id,
+              "in-progress",
+              {
+                twilio_call_sid:
+                  message.start
+                    ?.callSid
+              }
+            );
+
+            call =
+              await getCallById(
+                call.call_id
+              );
+
+            connectToOpenAI();
+
+            return;
+          }
+
+          if (
+            message.event ===
+              "media"
+          ) {
+            const payload =
+              message.media
+                ?.payload;
+
+            latestMediaTimestamp =
+              Number(
+                message.media
+                  ?.timestamp ||
+                  0
+              );
+
+            if (!payload) {
+              return;
+            }
+
+            if (
+              !sendToOpenAI({
+                type:
+                  "input_audio_buffer.append",
+                audio:
+                  payload
+              })
+            ) {
+              if (
+                pendingAudio.length <
+                200
+              ) {
+                pendingAudio.push(
+                  payload
+                );
+              }
+            }
+
+            return;
+          }
+
+          if (
+            message.event ===
+              "stop"
+          ) {
+            closed = true;
+
+            if (
+              openaiSocket &&
+              openaiSocket.readyState ===
+                WebSocket.OPEN
+            ) {
+              openaiSocket.close();
+            }
+          }
+        } catch (error) {
+          console.error(
+            "Twilio media message handler failed:",
+            error
+          );
+
+          if (call) {
+            try {
+              await updateCallStatus(
+                call.call_id,
+                "in-progress",
+                {
+                  last_error:
+                    error.message
+                }
+              );
+            } catch (updateError) {
+              console.error(
+                "Failed to save Twilio handler error:",
+                updateError
+              );
+            }
+          }
+        }
+      }
+    );
+
+    twilioSocket.on(
+      "close",
+      () => {
+        closed = true;
+
+        if (
+          openaiSocket &&
+          openaiSocket.readyState ===
+            WebSocket.OPEN
+        ) {
+          openaiSocket.close();
+        }
+      }
+    );
+
+    twilioSocket.on(
+      "error",
+      (error) => {
+        console.error(
+          "Twilio media socket error:",
+          error.message
+        );
+      }
+    );
+  }
+);
+
+server.on(
+  "upgrade",
+  (
+    request,
+    socket,
+    head
+  ) => {
+    try {
+      const requestUrl =
+        new URL(
+          request.url,
+          `http://${
+            request.headers.host ||
+            "localhost"
+          }`
+        );
+
+      if (
+        requestUrl.pathname !==
+        "/api/v1/twilio/media"
+      ) {
+        socket.destroy();
+        return;
+      }
+
+      mediaServer.handleUpgrade(
+        request,
+        socket,
+        head,
+        (websocket) => {
+          mediaServer.emit(
+            "connection",
+            websocket,
+            request
+          );
+        }
+      );
+    } catch {
+      socket.destroy();
+    }
+  }
+);
+
+async function runScheduler() {
+  if (
+    !CALL_SCHEDULER_ENABLED ||
+    schedulerRunning
+  ) {
+    return;
+  }
+
+  schedulerRunning = true;
+
+  try {
+    const due =
+      await pool.query(
+        `
+          SELECT call_id
+          FROM ai_calls
+          WHERE
+            sequence_status IN (
+              'scheduled',
+              'waiting_retry',
+              'callback_scheduled'
+            )
+            AND next_attempt_at IS NOT NULL
+            AND next_attempt_at <= NOW()
+            AND attempts < max_attempts
+            AND do_not_call = FALSE
+            AND wrong_number = FALSE
+            AND invalid_number = FALSE
+          ORDER BY next_attempt_at ASC
+          LIMIT 10
+        `
+      );
+
+    for (
+      const row of due.rows
+    ) {
+      const claim =
+        await pool.query(
+          `
+            UPDATE ai_calls
+            SET
+              sequence_status = 'calling',
+              updated_at = NOW()
+            WHERE
+              call_id = $1
+              AND sequence_status IN (
+                'scheduled',
+                'waiting_retry',
+                'callback_scheduled'
+              )
+              AND next_attempt_at <= NOW()
+            RETURNING *
+          `,
+          [row.call_id]
+        );
+
+      if (!claim.rows[0]) {
+        continue;
+      }
+
+      try {
+        const call =
+          claim.rows[0];
+
+        if (
+          !insideOperatingWindow(
+            new Date(),
+            call.timezone ||
+              DEFAULT_TIMEZONE
+          )
+        ) {
+          const nextAttemptAt =
+            nextValidWindow(
+              call.timezone ||
+                DEFAULT_TIMEZONE,
+              new Date(),
+              DOUG_CONFIG
+                .preferredWindows
+                .morning,
+              0
+            );
+
+          await pool.query(
+            `
+              UPDATE ai_calls
+              SET
+                sequence_status = 'scheduled',
+                next_attempt_at = $2,
+                updated_at = NOW()
+              WHERE call_id = $1
+            `,
+            [
+              call.call_id,
+              nextAttemptAt
+            ]
+          );
+
+          continue;
+        }
+
+        await pool.query(
+          `
+            UPDATE ai_calls
+            SET
+              stream_token = $2,
+              status = 'created',
+              twilio_call_sid = NULL,
+              completed_at = NULL,
+              updated_at = NOW()
+            WHERE call_id = $1
+          `,
+          [
+            call.call_id,
+            createStreamToken()
+          ]
+        );
+
+        const refreshed =
+          await getCallById(
+            call.call_id
+          );
+
+        await placeTwilioCall(
+          refreshed
+        );
+      } catch (error) {
+        console.error(
+          `Scheduler failed for ${row.call_id}:`,
+          error.message
+        );
+
+        await pool.query(
+          `
+            UPDATE ai_calls
+            SET
+              sequence_status = 'waiting_retry',
+              next_attempt_at =
+                NOW() + INTERVAL '15 minutes',
+              last_error = $2,
+              updated_at = NOW()
+            WHERE call_id = $1
+          `,
+          [
+            row.call_id,
+            cleanText(
+              error.message,
+              4000
+            )
+          ]
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      "HELUX call scheduler failed:",
+      error
+    );
+  } finally {
+    schedulerRunning = false;
+  }
+}
+
+app.use(
+  (
+    error,
+    req,
+    res,
+    next
+  ) => {
+    const statusCode =
+      error instanceof HttpError
+        ? error.statusCode
+        : 500;
+
+    if (
+      statusCode >= 500
+    ) {
+      console.error(
+        "HELUX AI Workforce request failed:",
+        error
+      );
+    }
+
+    res
+      .status(statusCode)
+      .json({
+        success:
+          false,
+
+        error:
+          statusCode >= 500
+            ? "Internal server error."
+            : error.message
+      });
+  }
+);
+
+async function start() {
+  try {
+    await initializeDatabase();
+
+    server.listen(
+      PORT,
+      "0.0.0.0",
+      () => {
+        console.log(
+          `HELUX AI Workforce running on port ${PORT}`
+        );
+
+        console.log(
+          `Agent version: ${DOUG_CONFIG.agentVersion}`
+        );
+
+        console.log(
+          `Realtime model: ${OPENAI_REALTIME_MODEL}`
+        );
+
+        console.log(
+          `Voice: ${OPENAI_VOICE}`
+        );
+
+        console.log(
+          `Cadence: ${DOUG_CONFIG.cadenceVersion}`
+        );
+
+        console.log(
+          `Call scheduler: ${
+            CALL_SCHEDULER_ENABLED
+              ? "enabled"
+              : "disabled"
+          }`
+        );
+
+        console.log(
+          `Consent enforcement: ${
+            ENFORCE_CALL_CONSENT
+              ? "enabled"
+              : "disabled"
+          }`
+        );
+      }
+    );
+
+    if (
+      CALL_SCHEDULER_ENABLED
+    ) {
+      schedulerTimer =
+        setInterval(
+          () => {
+            void runScheduler();
+          },
+          SCHEDULER_INTERVAL_MS
+        );
+
+      void runScheduler();
+    }
+  } catch (error) {
+    console.error(
+      "HELUX AI Workforce failed to start:",
+      error
+    );
+
+    process.exit(1);
+  }
+}
+
+async function shutdown() {
+  console.log(
+    "HELUX AI Workforce shutting down."
+  );
+
+  if (schedulerTimer) {
+    clearInterval(
+      schedulerTimer
+    );
+  }
+
+  server.close(
+    async () => {
+      await pool.end();
+      process.exit(0);
+    }
+  );
+}
+
+process.on(
+  "SIGTERM",
+  shutdown
+);
+
+process.on(
+  "SIGINT",
+  shutdown
+);
+
+process.on(
+  "unhandledRejection",
+  (error) => {
+    console.error(
+      "Unhandled promise rejection:",
+      error
+    );
+  }
+);
+
+process.on(
+  "uncaughtException",
+  (error) => {
+    console.error(
+      "Uncaught exception:",
+      error
+    );
+  }
+);
+
+start();
