@@ -508,41 +508,49 @@ async function updateCallStatus(
   status,
   extra = {}
 ) {
-  const lastError = cleanText(
-    extra.last_error,
-    4000
-  );
+  const statusValue =
+    cleanText(status, 50) ||
+    "unknown";
 
-  const twilioCallSid = cleanText(
-    extra.twilio_call_sid,
-    80
-  );
+  const lastError =
+    cleanText(
+      extra.last_error,
+      4000
+    );
+
+  const twilioCallSid =
+    cleanText(
+      extra.twilio_call_sid,
+      80
+    );
 
   await pool.query(
     `
       UPDATE ai_calls
 
       SET
-        status = $2,
+        status =
+          $2::VARCHAR(50),
 
         twilio_call_sid =
           COALESCE(
-            $3,
+            $3::VARCHAR(80),
             twilio_call_sid
           ),
 
         last_error =
           COALESCE(
-            $4,
+            $4::TEXT,
             last_error
           ),
 
         started_at =
           CASE
-            WHEN $2 IN (
+            WHEN $2::VARCHAR(50) IN (
               'queued',
               'initiated',
               'ringing',
+              'answered',
               'in-progress'
             )
             THEN COALESCE(
@@ -555,8 +563,10 @@ async function updateCallStatus(
 
         answered_at =
           CASE
-            WHEN $2 =
+            WHEN $2::VARCHAR(50) IN (
+              'answered',
               'in-progress'
+            )
             THEN COALESCE(
               answered_at,
               NOW()
@@ -567,7 +577,7 @@ async function updateCallStatus(
 
         completed_at =
           CASE
-            WHEN $2 IN (
+            WHEN $2::VARCHAR(50) IN (
               'completed',
               'busy',
               'failed',
@@ -586,11 +596,12 @@ async function updateCallStatus(
           NOW()
 
       WHERE
-        call_id = $1
+        call_id =
+          $1::VARCHAR(100)
     `,
     [
       callId,
-      status,
+      statusValue,
       twilioCallSid,
       lastError
     ]
