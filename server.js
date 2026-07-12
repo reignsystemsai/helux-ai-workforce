@@ -1553,7 +1553,3 @@
     "Release the sequence lock."
   ]
 }
-Compose:
-New Message
-MinimizePop-outClose
-
