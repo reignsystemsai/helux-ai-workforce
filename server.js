@@ -6,24 +6,6 @@ const twilio = require("twilio");
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
 
-/*
- * HELUX AI WORKFORCE — DOUG 2.1
- * Recovery + operating-system build
- *
- * This file restores the working Twilio/OpenAI caller and safely integrates:
- * - Doug 2.1 conversation rules
- * - Realtime function tools
- * - six-attempt adaptive cadence
- * - call sequence and attempt tracking
- * - callback scheduling
- * - SMS application/DTI links
- * - specialist handoff and optional live transfer
- * - structured HELUX OS result callbacks
- *
- * The operating configuration is valid JavaScript inside this file. Raw JSON
- * must never replace server.js.
- */
-
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
 const HELUX_API_KEY = process.env.HELUX_API_KEY;
