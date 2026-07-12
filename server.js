@@ -1,3 +1,5 @@
+"use strict";
+
 const express = require("express");
 const http = require("http");
 const { randomUUID, createHash } = require("crypto");
@@ -5,6 +7,24 @@ const { Pool } = require("pg");
 const twilio = require("twilio");
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
+
+/*
+ * HELUX AI WORKFORCE — DOUG 2.1
+ * Recovery + operating-system build
+ *
+ * This file restores the working Twilio/OpenAI caller and safely integrates:
+ * - Doug 2.1 conversation rules
+ * - Realtime function tools
+ * - six-attempt adaptive cadence
+ * - call sequence and attempt tracking
+ * - callback scheduling
+ * - SMS application/DTI links
+ * - specialist handoff and optional live transfer
+ * - structured HELUX OS result callbacks
+ *
+ * The operating configuration is valid JavaScript inside this file. Raw JSON
+ * must never replace server.js.
+ */
 
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -26,7 +46,7 @@ const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2.1";
 const OPENAI_VOICE = process.env.OPENAI_VOICE || "marin";
 const OPENAI_TRANSCRIPTION_MODEL =
-  process.env.OPENAI_TRANSCRIPTION_MODEL || "";
+  process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
@@ -789,6 +809,7 @@ async function getCallById(callId) {
     `SELECT * FROM ai_calls WHERE call_id = $1 LIMIT 1`,
     [callId]
   );
+
   return result.rows[0] || null;
 }
 
@@ -797,6 +818,7 @@ async function getCallByRequestKey(requestKey) {
     `SELECT * FROM ai_calls WHERE request_key = $1 LIMIT 1`,
     [requestKey]
   );
+
   return result.rows[0] || null;
 }
 
@@ -805,6 +827,7 @@ async function getAttemptById(attemptId) {
     `SELECT * FROM call_attempts WHERE attempt_id = $1 LIMIT 1`,
     [attemptId]
   );
+
   return result.rows[0] || null;
 }
 
@@ -818,6 +841,7 @@ async function validateCallToken(callId, token) {
     `,
     [callId, token]
   );
+
   return result.rows[0] || null;
 }
 
@@ -908,6 +932,7 @@ async function updateCallStatus(callId, status, extra = {}) {
       SET
         status = $2::VARCHAR(50),
         twilio_call_sid = COALESCE($3::VARCHAR(80), twilio_call_sid),
+
         last_error = CASE
           WHEN $4::TEXT IS NOT NULL THEN $4::TEXT
           WHEN $2::VARCHAR(50) IN (
@@ -917,9 +942,11 @@ async function updateCallStatus(callId, status, extra = {}) {
             'answered',
             'in-progress',
             'completed'
-          ) THEN NULL
+          )
+          THEN NULL
           ELSE last_error
         END,
+
         started_at = CASE
           WHEN $2::VARCHAR(50) IN (
             'queued',
@@ -927,14 +954,17 @@ async function updateCallStatus(callId, status, extra = {}) {
             'ringing',
             'answered',
             'in-progress'
-          ) THEN COALESCE(started_at, NOW())
+          )
+          THEN COALESCE(started_at, NOW())
           ELSE started_at
         END,
+
         answered_at = CASE
           WHEN $2::VARCHAR(50) IN ('answered', 'in-progress')
-            THEN COALESCE(answered_at, NOW())
+          THEN COALESCE(answered_at, NOW())
           ELSE answered_at
         END,
+
         completed_at = CASE
           WHEN $2::VARCHAR(50) IN (
             'completed',
@@ -942,10 +972,13 @@ async function updateCallStatus(callId, status, extra = {}) {
             'failed',
             'no-answer',
             'canceled'
-          ) THEN COALESCE(completed_at, NOW())
+          )
+          THEN COALESCE(completed_at, NOW())
           ELSE completed_at
         END,
+
         updated_at = NOW()
+
       WHERE call_id = $1::VARCHAR(100)
     `,
     [callId, statusValue, twilioCallSid, lastError]
@@ -960,6 +993,7 @@ async function updateCallStatus(callId, status, extra = {}) {
         SET
           technical_status = $2::VARCHAR(50),
           twilio_call_sid = COALESCE($3::VARCHAR(80), twilio_call_sid),
+
           last_error = CASE
             WHEN $4::TEXT IS NOT NULL THEN $4::TEXT
             WHEN $2::VARCHAR(50) IN (
@@ -969,14 +1003,17 @@ async function updateCallStatus(callId, status, extra = {}) {
               'answered',
               'in-progress',
               'completed'
-            ) THEN NULL
+            )
+            THEN NULL
             ELSE last_error
           END,
+
           answered_at = CASE
             WHEN $2::VARCHAR(50) IN ('answered', 'in-progress')
-              THEN COALESCE(answered_at, NOW())
+            THEN COALESCE(answered_at, NOW())
             ELSE answered_at
           END,
+
           completed_at = CASE
             WHEN $2::VARCHAR(50) IN (
               'completed',
@@ -984,10 +1021,13 @@ async function updateCallStatus(callId, status, extra = {}) {
               'failed',
               'no-answer',
               'canceled'
-            ) THEN COALESCE(completed_at, NOW())
+            )
+            THEN COALESCE(completed_at, NOW())
             ELSE completed_at
           END,
+
           updated_at = NOW()
+
         WHERE attempt_id = $1
       `,
       [call.last_attempt_id, statusValue, twilioCallSid, lastError]
@@ -999,10 +1039,12 @@ async function notifyHelux(call) {
   try {
     const response = await fetch(`${HELUX_BASE_URL}${HELUX_RESULTS_PATH}`, {
       method: "POST",
+
       headers: {
         "Content-Type": "application/json",
         "x-helux-key": HELUX_API_KEY
       },
+
       body: JSON.stringify({
         case_id: call.case_id,
         lead_id: call.lead_id,
@@ -1021,6 +1063,7 @@ async function notifyHelux(call) {
         transcript: call.transcript || [],
         actions: call.actions || [],
         result: call.result || {},
+
         versions: {
           agent: call.agent_version,
           prompt: call.prompt_version,
@@ -1028,7 +1071,6 @@ async function notifyHelux(call) {
           knowledge: call.knowledge_version,
           routing: call.routing_version,
           cadence: call.cadence_version,
-``` [❶](code://python)
           realtime_model: OPENAI_REALTIME_MODEL,
           voice: OPENAI_VOICE
         }
@@ -1754,7 +1796,7 @@ async function executeDougTool(call, name, args) {
         "This is a preliminary estimate, not an underwriting result."
     };
   }
-``` [❶](code://python)
+
   if (name === "send_resource_link") {
     if (safeArgs.consent_confirmed !== true) {
       return {
@@ -2328,18 +2370,13 @@ app.get("/", (req, res) => {
       "HELUX AI Workforce is online.",
     version:
       DOUG_CONFIG.agentVersion,
-    worker:
-      "DPA outbound caller",
-    realtime_model:
-      OPENAI_REALTIME_MODEL,
-    voice:
-      OPENAI_VOICE,
-    cadence:
-      DOUG_CONFIG.cadenceVersion,
-    scheduler:
-      CALL_SCHEDULER_ENABLED
-        ? "enabled"
-        : "disabled"
+    worker: "DPA outbound caller",
+    realtime_model: OPENAI_REALTIME_MODEL,
+    voice: OPENAI_VOICE,
+    cadence: DOUG_CONFIG.cadenceVersion,
+    scheduler: CALL_SCHEDULER_ENABLED
+      ? "enabled"
+      : "disabled"
   });
 });
 
@@ -2351,10 +2388,8 @@ app.get("/health", async (req, res) => {
 
     res.json({
       status: "healthy",
-      service:
-        "helux-ai-workforce",
-      version:
-        DOUG_CONFIG.agentVersion,
+      service: "helux-ai-workforce",
+      version: DOUG_CONFIG.agentVersion,
       database: "connected",
       database_time:
         database.rows[0].database_time,
@@ -2388,6 +2423,7 @@ app.post(
   async (req, res, next) => {
     try {
       const payload = req.body || {};
+
       const requestKey =
         callRequestKey(payload);
 
@@ -2596,9 +2632,12 @@ app.post(
       }
 
       const twilioCall =
-        await placeTwilioCall(call, {
-          force: forceCallNow
-        });
+        await placeTwilioCall(
+          call,
+          {
+            force: forceCallNow
+          }
+        );
 
       res.status(201).json({
         success: true,
@@ -2620,6 +2659,7 @@ app.post(
     }
   }
 );
+
 app.post(
   "/api/v1/calls/:callId/retry",
   authenticateHelux,
@@ -2739,11 +2779,16 @@ app.get(
       res.json({
         success: true,
         call: {
-          call_id: call.call_id,
-          case_id: call.case_id,
-          lead_id: call.lead_id,
-          phone: call.phone,
-          status: call.status,
+          call_id:
+            call.call_id,
+          case_id:
+            call.case_id,
+          lead_id:
+            call.lead_id,
+          phone:
+            call.phone,
+          status:
+            call.status,
           sequence_status:
             call.sequence_status,
           twilio_call_sid:
@@ -2961,7 +3006,9 @@ app.post(
       }
 
       if (
-        terminalCallStatus(status)
+        terminalCallStatus(
+          status
+        )
       ) {
         await finalizeCadenceAfterTerminal(
           call.call_id,
@@ -3054,7 +3101,8 @@ mediaServer.on(
       if (
         !streamSid ||
         !lastAssistantItemId ||
-        responseStartTimestamp === null
+        responseStartTimestamp ===
+          null
       ) {
         return;
       }
@@ -3176,17 +3224,25 @@ mediaServer.on(
         () => {
           const inputAudio = {
             format: {
-              type: "audio/pcmu"
+              type:
+                "audio/pcmu"
             },
 
             turn_detection: {
-              type: "server_vad",
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 500,
-              create_response: true,
-              interrupt_response: true,
-              idle_timeout_ms: 12000
+              type:
+                "server_vad",
+              threshold:
+                0.5,
+              prefix_padding_ms:
+                300,
+              silence_duration_ms:
+                500,
+              create_response:
+                true,
+              interrupt_response:
+                true,
+              idle_timeout_ms:
+                12000
             }
           };
 
@@ -3196,14 +3252,17 @@ mediaServer.on(
             inputAudio.transcription = {
               model:
                 OPENAI_TRANSCRIPTION_MODEL,
-              language: "en"
+              language:
+                "en"
             };
           }
 
           sendToOpenAI({
-            type: "session.update",
+            type:
+              "session.update",
             session: {
-              type: "realtime",
+              type:
+                "realtime",
               model:
                 OPENAI_REALTIME_MODEL,
               output_modalities: [
@@ -3213,13 +3272,17 @@ mediaServer.on(
                 buildAgentInstructions(
                   call
                 ),
-              tools: DOUG_TOOLS,
-              tool_choice: "auto",
+              tools:
+                DOUG_TOOLS,
+              tool_choice:
+                "auto",
               audio: {
-                input: inputAudio,
+                input:
+                  inputAudio,
                 output: {
                   format: {
-                    type: "audio/pcmu"
+                    type:
+                      "audio/pcmu"
                   },
                   voice:
                     OPENAI_VOICE
@@ -3249,9 +3312,10 @@ mediaServer.on(
             let event;
 
             try {
-              event = JSON.parse(
-                rawMessage.toString()
-              );
+              event =
+                JSON.parse(
+                  rawMessage.toString()
+                );
             } catch {
               return;
             }
@@ -3341,646 +3405,4 @@ mediaServer.on(
 
             if (
               event.type ===
-              "response.output_audio_transcript.done"
-            ) {
-              await appendTranscript(
-                call.call_id,
-                "assistant",
-                event.transcript
-              );
-
-              return;
-            }
-
-            if (
-              event.type ===
-              "conversation.item.input_audio_transcription.completed"
-            ) {
-              await appendTranscript(
-                call.call_id,
-                "lead",
-                event.transcript
-              );
-
-              return;
-            }
-
-            if (
-              event.type ===
-              "response.function_call_arguments.done"
-            ) {
-              await handleToolCall(
-                event.name,
-                event.call_id,
-                event.arguments || "{}"
-              );
-
-              return;
-            }
-
-            if (
-              event.type ===
-                "response.output_item.done" &&
-              event.item &&
-              event.item.type ===
-                "function_call"
-            ) {
-              await handleToolCall(
-                event.item.name,
-                event.item.call_id,
-                event.item.arguments ||
-                  "{}"
-              );
-
-              return;
-            }
-
-            if (event.type === "error") {
-              const message =
-                event.error?.message ||
-                event.message ||
-                "OpenAI Realtime error";
-
-              console.error(
-                `OpenAI Realtime error for ${call.call_id}:`,
-                message
-              );
-
-              await updateCallStatus(
-                call.call_id,
-                "in-progress",
-                {
-                  last_error:
-                    message
-                }
-              );
-            }
-          } catch (error) {
-            console.error(
-              `OpenAI event handler failed for ${
-                call
-                  ? call.call_id
-                  : "unknown"
-              }:`,
-              error
-            );
-          }
-        }
-      );
-      openaiSocket.on(
-        "error",
-        async (error) => {
-          try {
-            console.error(
-              `OpenAI socket error for ${call.call_id}:`,
-              error.message
-            );
-
-            await updateCallStatus(
-              call.call_id,
-              "in-progress",
-              {
-                last_error:
-                  error.message
-              }
-            );
-          } catch (updateError) {
-            console.error(
-              "Failed to save OpenAI socket error:",
-              updateError
-            );
-          }
-        }
-      );
-
-      openaiSocket.on(
-        "close",
-        (code, reason) => {
-          console.log(
-            `OpenAI socket closed for ${
-              call
-                ? call.call_id
-                : "unknown"
-            }: ${code} ${String(
-              reason || ""
-            )}`
-          );
-
-          if (
-            !closed &&
-            twilioSocket.readyState ===
-              WebSocket.OPEN
-          ) {
-            twilioSocket.close();
-          }
-        }
-      );
-    }
-
-    twilioSocket.on(
-      "message",
-      async (rawMessage) => {
-        try {
-          let message;
-
-          try {
-            message = JSON.parse(
-              rawMessage.toString()
-            );
-          } catch {
-            return;
-          }
-
-          if (
-            message.event === "start"
-          ) {
-            const parameters =
-              message.start
-                ?.customParameters ||
-              {};
-
-            const callId = cleanText(
-              parameters.call_id,
-              100
-            );
-
-            const token = cleanText(
-              parameters.stream_token,
-              160
-            );
-
-            call =
-              await validateCallToken(
-                callId,
-                token
-              );
-
-            if (!call) {
-              twilioSocket.close(
-                1008,
-                "Invalid stream token"
-              );
-
-              return;
-            }
-
-            streamSid =
-              message.start?.streamSid ||
-              message.streamSid;
-
-            await updateCallStatus(
-              call.call_id,
-              "in-progress",
-              {
-                twilio_call_sid:
-                  message.start?.callSid
-              }
-            );
-
-            call =
-              await getCallById(
-                call.call_id
-              );
-
-            connectToOpenAI();
-
-            return;
-          }
-
-          if (
-            message.event === "media"
-          ) {
-            const payload =
-              message.media?.payload;
-
-            latestMediaTimestamp =
-              Number(
-                message.media
-                  ?.timestamp ||
-                  0
-              );
-
-            if (!payload) {
-              return;
-            }
-
-            if (
-              !sendToOpenAI({
-                type:
-                  "input_audio_buffer.append",
-                audio: payload
-              })
-            ) {
-              if (
-                pendingAudio.length <
-                200
-              ) {
-                pendingAudio.push(
-                  payload
-                );
-              }
-            }
-
-            return;
-          }
-
-          if (
-            message.event === "stop"
-          ) {
-            closed = true;
-
-            if (
-              openaiSocket &&
-              openaiSocket.readyState ===
-                WebSocket.OPEN
-            ) {
-              openaiSocket.close();
-            }
-          }
-        } catch (error) {
-          console.error(
-            "Twilio media message handler failed:",
-            error
-          );
-
-          if (call) {
-            try {
-              await updateCallStatus(
-                call.call_id,
-                "in-progress",
-                {
-                  last_error:
-                    error.message
-                }
-              );
-            } catch (updateError) {
-              console.error(
-                "Failed to save Twilio handler error:",
-                updateError
-              );
-            }
-          }
-        }
-      }
-    );
-
-    twilioSocket.on(
-      "close",
-      () => {
-        closed = true;
-
-        if (
-          openaiSocket &&
-          openaiSocket.readyState ===
-            WebSocket.OPEN
-        ) {
-          openaiSocket.close();
-        }
-      }
-    );
-
-    twilioSocket.on(
-      "error",
-      (error) => {
-        console.error(
-          "Twilio media socket error:",
-          error.message
-        );
-      }
-    );
-  }
-);
-
-server.on(
-  "upgrade",
-  (request, socket, head) => {
-    try {
-      const requestUrl = new URL(
-        request.url,
-        `http://${
-          request.headers.host ||
-          "localhost"
-        }`
-      );
-
-      if (
-        requestUrl.pathname !==
-        "/api/v1/twilio/media"
-      ) {
-        socket.destroy();
-        return;
-      }
-
-      mediaServer.handleUpgrade(
-        request,
-        socket,
-        head,
-        (websocket) => {
-          mediaServer.emit(
-            "connection",
-            websocket,
-            request
-          );
-        }
-      );
-    } catch {
-      socket.destroy();
-    }
-  }
-);
-
-async function runScheduler() {
-  if (
-    !CALL_SCHEDULER_ENABLED ||
-    schedulerRunning
-  ) {
-    return;
-  }
-
-  schedulerRunning = true;
-
-  try {
-    const due = await pool.query(
-      `
-        SELECT call_id
-        FROM ai_calls
-        WHERE
-          sequence_status IN (
-            'scheduled',
-            'waiting_retry',
-            'callback_scheduled'
-          )
-          AND next_attempt_at IS NOT NULL
-          AND next_attempt_at <= NOW()
-          AND attempts < max_attempts
-          AND do_not_call = FALSE
-          AND wrong_number = FALSE
-          AND invalid_number = FALSE
-        ORDER BY next_attempt_at ASC
-        LIMIT 10
-      `
-    );
-
-    for (const row of due.rows) {
-      const claim = await pool.query(
-        `
-          UPDATE ai_calls
-          SET
-            sequence_status = 'calling',
-            updated_at = NOW()
-          WHERE
-            call_id = $1
-            AND sequence_status IN (
-              'scheduled',
-              'waiting_retry',
-              'callback_scheduled'
-            )
-            AND next_attempt_at <= NOW()
-          RETURNING *
-        `,
-        [row.call_id]
-      );
-
-      if (!claim.rows[0]) {
-        continue;
-      }
-
-      try {
-        const call = claim.rows[0];
-
-        if (
-          !insideOperatingWindow(
-            new Date(),
-            call.timezone ||
-              DEFAULT_TIMEZONE
-          )
-        ) {
-          const nextAttemptAt =
-            nextValidWindow(
-              call.timezone ||
-                DEFAULT_TIMEZONE,
-              new Date(),
-              DOUG_CONFIG
-                .preferredWindows
-                .morning,
-              0
-            );
-
-          await pool.query(
-            `
-              UPDATE ai_calls
-              SET
-                sequence_status = 'scheduled',
-                next_attempt_at = $2,
-                updated_at = NOW()
-              WHERE call_id = $1
-            `,
-            [
-              call.call_id,
-              nextAttemptAt
-            ]
-          );
-
-          continue;
-        }
-
-        await pool.query(
-          `
-            UPDATE ai_calls
-            SET
-              stream_token = $2,
-              status = 'created',
-              twilio_call_sid = NULL,
-              completed_at = NULL,
-              updated_at = NOW()
-            WHERE call_id = $1
-          `,
-          [
-            call.call_id,
-            createStreamToken()
-          ]
-        );
-
-        const refreshed =
-          await getCallById(
-            call.call_id
-          );
-
-        await placeTwilioCall(
-          refreshed
-        );
-      } catch (error) {
-        console.error(
-          `Scheduler failed for ${row.call_id}:`,
-          error.message
-        );
-
-        await pool.query(
-          `
-            UPDATE ai_calls
-            SET
-              sequence_status = 'waiting_retry',
-              next_attempt_at =
-                NOW() + INTERVAL '15 minutes',
-              last_error = $2,
-              updated_at = NOW()
-            WHERE call_id = $1
-          `,
-          [
-            row.call_id,
-            cleanText(
-              error.message,
-              4000
-            )
-          ]
-        );
-      }
-    }
-  } catch (error) {
-    console.error(
-      "HELUX call scheduler failed:",
-      error
-    );
-  } finally {
-    schedulerRunning = false;
-  }
-}
-
-app.use(
-  (error, req, res, next) => {
-    const statusCode =
-      error instanceof HttpError
-        ? error.statusCode
-        : 500;
-
-    if (statusCode >= 500) {
-      console.error(
-        "HELUX AI Workforce request failed:",
-        error
-      );
-    }
-
-    res.status(statusCode).json({
-      success: false,
-      error:
-        statusCode >= 500
-          ? "Internal server error."
-          : error.message
-    });
-  }
-);
-
-async function start() {
-  try {
-    await initializeDatabase();
-
-    server.listen(
-      PORT,
-      "0.0.0.0",
-      () => {
-        console.log(
-          `HELUX AI Workforce running on port ${PORT}`
-        );
-
-        console.log(
-          `Agent version: ${DOUG_CONFIG.agentVersion}`
-        );
-
-        console.log(
-          `Realtime model: ${OPENAI_REALTIME_MODEL}`
-        );
-
-        console.log(
-          `Voice: ${OPENAI_VOICE}`
-        );
-
-        console.log(
-          `Cadence: ${DOUG_CONFIG.cadenceVersion}`
-        );
-
-        console.log(
-          `Call scheduler: ${
-            CALL_SCHEDULER_ENABLED
-              ? "enabled"
-              : "disabled"
-          }`
-        );
-
-        console.log(
-          `Consent enforcement: ${
-            ENFORCE_CALL_CONSENT
-              ? "enabled"
-              : "disabled"
-          }`
-        );
-      }
-    );
-
-    if (CALL_SCHEDULER_ENABLED) {
-      schedulerTimer = setInterval(
-        () => {
-          void runScheduler();
-        },
-        SCHEDULER_INTERVAL_MS
-      );
-
-      void runScheduler();
-    }
-  } catch (error) {
-    console.error(
-      "HELUX AI Workforce failed to start:",
-      error
-    );
-
-    process.exit(1);
-  }
-}
-
-async function shutdown() {
-  console.log(
-    "HELUX AI Workforce shutting down."
-  );
-
-  if (schedulerTimer) {
-    clearInterval(
-      schedulerTimer
-    );
-  }
-
-  server.close(async () => {
-    await pool.end();
-    process.exit(0);
-  });
-}
-
-process.on(
-  "SIGTERM",
-  shutdown
-);
-
-process.on(
-  "SIGINT",
-  shutdown
-);
-
-process.on(
-  "unhandledRejection",
-  (error) => {
-    console.error(
-      "Unhandled promise rejection:",
-      error
-    );
-  }
-);
-
-process.on(
-  "uncaughtException",
-  (error) => {
-    console.error(
-      "Uncaught exception:",
-      error
-    );
-  }
-);
-
-start();
+              "response.output_audio_transcript.done
