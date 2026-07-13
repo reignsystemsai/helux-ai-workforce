@@ -2726,12 +2726,6 @@ function operatingWindowForParts(parts) {
   };
 }
 
-    return {
-      start: parseClock(DOUG_CONFIG.operatingWindow.weekdayStart),
-      end: parseClock(DOUG_CONFIG.operatingWindow.weekdayEnd)
-    };
-  }
-
   if (day === 6) {
     return {
       start: parseClock(DOUG_CONFIG.operatingWindow.saturdayStart),
