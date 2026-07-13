@@ -7,7 +7,7 @@ const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
 
 /*
- * HELUX AI WORKFORCE — DAISY 2.3.0
+ * HELUX AI WORKFORCE — DAISY 2.5.0
  * Daisy, Doug's assistant: calling, callbacks, resources, and two-way monday.com control.
  * monday.com failures never block or terminate a customer call.
  */
@@ -101,6 +101,18 @@ const MONDAY_BOARD_ID = String(
 const MONDAY_SUBITEM_BOARD_ID = String(
   process.env.MONDAY_SUBITEM_BOARD_ID || "18421626716"
 );
+const DPA_BOARD_ID = cleanText(process.env.DPA_BOARD_ID, 100);
+const MONDAY_CALL_CONTROL_COLUMNS = Object.freeze({
+  has_realtor: "color_mm57ev4f",
+  applied_with_lender: "color_mm57bjwh",
+  app_started_confirmation: "color_mm576a7j",
+  time_frame: "color_mm57v24g"
+});
+const DPA_DEPARTMENT_COLUMNS = Object.freeze({
+  app_started: "color_mm571hke",
+  realtor_name: "text_mm57ngpn",
+  realtor_phone: "phone_mm5790vb"
+});
 const MONDAY_SYNC_REQUESTED =
   String(process.env.MONDAY_SYNC_ENABLED || "false").toLowerCase() === "true";
 const MONDAY_SYNC_ENABLED = Boolean(
@@ -153,13 +165,13 @@ if (missingEnvironment.length) {
 }
 
 const DOUG_CONFIG = Object.freeze({
-  agentVersion: "daisy-2.3.0",
-  promptVersion: "dpa-readiness-v1",
-  toolVersion: "tools-v1",
+  agentVersion: "daisy-2.5.0",
+  promptVersion: "dpa-conversation-workflow-v2.5",
+  toolVersion: "tools-v2.5",
   knowledgeVersion: "dpa-general-v1",
   routingVersion: "dpa-routing-v1",
   cadenceVersion: "dpa-ready-6-attempt-adaptive-v2",
-  mondayAdapterVersion: "monday-call-control-v2",
+  mondayAdapterVersion: "monday-call-control-v2.5",
   maxAttempts: 6,
   maxVoicemails: 2,
   minimumGapMinutes: 180,
@@ -238,6 +250,70 @@ function normalizePhone(value) {
   if (digits.length === 10) return `+1${digits}`;
   if (digits.length >= 11 && digits.length <= 15) return `+${digits}`;
   return original;
+}
+
+function validE164Phone(value) {
+  return /^\+[1-9]\d{7,14}$/.test(String(normalizePhone(value) || ""));
+}
+
+function normalizeTimeFrame(value) {
+  const normalized = normalizeMondayKey(value);
+  if (["3060", "3060days", "30to60", "30days60days"].includes(normalized)) {
+    return "30 - 60";
+  }
+  if (["6090", "6090days", "60to90", "60days90days"].includes(normalized)) {
+    return "60 - 90";
+  }
+  if (["justlooking", "looking", "nurture"].includes(normalized)) {
+    return "Just looking";
+  }
+  return null;
+}
+
+function interestForTimeFrame(value) {
+  const timeFrame = normalizeTimeFrame(value);
+  if (timeFrame === "30 - 60") return "High";
+  if (timeFrame === "60 - 90") return "Medium";
+  if (timeFrame === "Just looking") return "Nurture";
+  return null;
+}
+
+function normalizeDaisyAnswers(input) {
+  const answers = input && typeof input === "object" ? { ...input } : {};
+  const timeFrame = normalizeTimeFrame(answers.time_frame);
+  if (timeFrame) {
+    answers.time_frame = timeFrame;
+    answers.interest_level = interestForTimeFrame(timeFrame);
+  }
+  for (const key of ["has_realtor", "applied_with_lender"]) {
+    const normalized = normalizeBoolean(answers[key]);
+    if (normalized !== null) answers[key] = normalized ? "Yes" : "No";
+  }
+  if (answers.app_started_confirmation) {
+    answers.app_started_confirmation = cleanText(
+      answers.app_started_confirmation,
+      80
+    );
+  }
+  if (Object.prototype.hasOwnProperty.call(
+    answers,
+    "tentative_meeting_availability"
+  )) {
+    answers.tentative_meeting_availability = cleanText(
+      answers.tentative_meeting_availability,
+      1000
+    );
+  }
+  if (answers.application_link_sent !== undefined) {
+    answers.application_link_sent = answers.application_link_sent === true;
+  }
+  if (answers.application_follow_up_at) {
+    const followUp = new Date(answers.application_follow_up_at);
+    answers.application_follow_up_at = Number.isNaN(followUp.getTime())
+      ? null
+      : followUp.toISOString();
+  }
+  return answers;
 }
 
 function normalizeTimezone(value) {
@@ -325,6 +401,7 @@ function stopOutcome(outcome) {
     "specialist_handoff",
     "application_link_sent",
     "dti_calculator_sent",
+    "agent_notified",
     "needs_review",
     "not_interested",
     "wrong_number",
@@ -344,7 +421,11 @@ function confirmedConsent(payload) {
 function buildAgentInstructions(call) {
   const lead = call.payload || {};
   const result = call.result || {};
-  const firstName = cleanText(lead.first_name, 80) || "there";
+  const firstName = cleanText(lead.first_name, 80) || "";
+  const customerReference = firstName || "a recent DPA Help Center contact";
+  const identityRequest = firstName
+    ? `Hi, may I speak with ${firstName}?`
+    : "Hello, is this the person who recently reached out to DPA Help Center?";
   const city = cleanText(lead.city, 100) || "their area";
   const state = cleanText(lead.state, 50) || "";
   const creditScore = lead.credit_score ?? "not provided";
@@ -386,9 +467,39 @@ function buildAgentInstructions(call) {
     ? `You were recently looking for up to ${estimatedDpa} in down payment assistance to help purchase a home. Is that correct?`
     : "You were recently looking into down payment assistance to help purchase a home. Is that correct?";
 
+  if (lead.call_type === "dpa_agent_notification") {
+    const agentName = cleanText(lead.agent_name, 120) || "the assigned specialist";
+    const customerName = cleanText(lead.customer_name, 160) || "the customer";
+    return `
+You are Daisy, Doug's assistant with the DPA Help Center, making a brief internal notification call.
+First ask: "Hi, may I speak with ${agentName}?"
+After identity confirmation say: "Great—this is Daisy, Doug's assistant with DPA Help Center. I'm calling to let you know that ${customerName} has started the DPA application."
+Provide the customer's purchase timeframe (${lead.time_frame || "not recorded"}) and tentative in-person availability (${lead.tentative_meeting_availability || "not recorded"}). Explain that tentative availability is not a booked appointment. Ask the specialist to review DPA Department item ${lead.dpa_item_id}. Ask: "Can you confirm you received that?"
+Keep the entire call under one minute. After confirmation, call complete_call with outcome agent_notified, stop_sequence true, and next_action "Internal notification confirmed". If the person is unavailable, save a concise summary and complete the call without inventing confirmation.
+`.trim();
+  }
+
+  if (call.current_state === "application_checkpoint") {
+    return `
+You are Daisy with DPA Help Center. First verify identity using: "${identityRequest}"
+After identity confirmation say exactly: "Great, this is Daisy with DPA Help Center. We spoke yesterday about your interest in receiving down payment assistance. I'm calling to see if you had a chance to start the application."
+If yes, call record_application_checkpoint with started true and a concise summary. Do not continue customer cadence.
+If no, say exactly: "That's okay—I understand life happens. When would be a better time for me to follow up?" Confirm the new date, time, and timezone, then call schedule_callback with prospect_confirmed true and reason "Application checkpoint". Keep the sequence under Callbacks.
+Do not repeat intake questions.
+`.trim();
+  }
+
+  if (["reconnect_pending", "reconnect_in_progress"].includes(call.current_state)) {
+    return `
+You are Daisy with DPA Help Center reconnecting after an unexpected disconnect. First verify identity using: "${identityRequest}"
+After identity confirmation say exactly: "Great, this is Daisy with DPA Help Center. I think we got disconnected. Is now still a good time?"
+Resume from this saved summary: ${previousSummary}. Resume the saved next action: ${cleanText(call.next_action, 1200) || "continue the prior conversation"}. Do not restart the intake and do not repeat already confirmed answers. Use complete_call before ending.
+`.trim();
+  }
+
   return `
 You are Daisy, Doug's assistant with the DPA Help Center.
-You are calling ${firstName}, who completed a homebuyer readiness process.
+You are calling ${customerReference}, who completed a homebuyer readiness process.
 
 IDENTITY
 - Your name is Daisy.
@@ -403,7 +514,8 @@ VOICE STANDARD
 - Never sound like a telemarketer.
 - Keep most turns under two short sentences and approximately ${DOUG_CONFIG.voiceRules.maximumResponseSeconds} seconds.
 - Ask exactly one question at a time and pause for the answer.
-- Stop immediately when interrupted.
+- Brief listening acknowledgements such as "mmm-hmm," "uh-huh," "right," "okay," "yeah," and "I see" normally mean the customer is listening; continue naturally.
+- Stop for sustained speech, a real statement or question, or "wait," "stop," "hold on," or "excuse me."
 - Natural acknowledgements include: "Okay," "I see," "Understood," "That makes sense," "Got it," and "Perfect."
 - Avoid long speeches, repetition, sales hype, and robotic transitions.
 
@@ -432,8 +544,18 @@ LEAD INTELLIGENCE RULE
 - Confirm known information instead of restarting the website intake.
 - On a follow-up call, use the previous concern, summary, and agreed next step. Do not restart the original intake.
 
+CONFIRMATION-FIRST OBJECTIVES
+1. Confirm submitted information; never repeat the intake form.
+2. Determine purchase interest and normalize timeframe exactly to "30 - 60", "60 - 90", or "Just looking".
+3. Confirm whether the customer applied with another lender and whether they have a Realtor.
+4. Send the application link when directly requested or accepted, without asking permission twice.
+5. After the application SMS tool succeeds, set the customer's next checkpoint for the next day: confirm the date, time, and timezone, then call schedule_callback with reason "Application checkpoint". Never claim the link was sent until the tool succeeds, and never end the current call in a way that clears this future callback.
+6. For "30 - 60" or "60 - 90", collect tentative days/times for an in-person DPA specialist meeting. Clearly say this is not a booked appointment and only gives the specialist a general idea of availability.
+Map interest exactly: "30 - 60" = "High"; "60 - 90" = "Medium"; "Just looking" = "Nurture".
+Save has_realtor, applied_with_lender, app_started_confirmation, time_frame, interest_level, tentative_meeting_availability, application_link_sent, and application_follow_up_at as structured results.
+
 STATE MACHINE
-1. Greeting: ask for ${firstName} without revealing private information.
+1. Greeting: use the identity request below without revealing private information.
 2. Identity verification: confirm the person, introduce yourself as Doug's assistant, and use the correct first-call or follow-up opening.
 3. Readiness confirmation: confirm that the submitted credit, income, employment, and tax information remains current.
 4. Application status: determine whether they only completed the readiness form, received an application link, started an application, submitted one, or are already preapproved.
@@ -487,7 +609,7 @@ COMPLIANCE
 TOOLS
 - Use save_call_progress as meaningful information is confirmed.
 - Use calculate_preliminary_dti for DTI math.
-- Use send_resource_link only after the customer agrees to receive the link.
+- "Send it," "text it," a request for the application link, or agreement to receive it is direct permission. Call send_resource_link immediately and do not ask permission again.
 - Approved resources are: application, dti_calculator, prephub, credit_readiness, tax_readiness, and employment_readiness.
 - Use credit, tax, or employment readiness links only when that deficiency is relevant or the customer specifically requests that resource.
 - Use schedule_callback only after repeating and confirming the callback time.
@@ -499,13 +621,29 @@ TOOLS
 - Never say an action succeeded until the tool returns success.
 
 OPENING
-First ask: "Hi, may I speak with ${firstName}?"
-If this is the first call, after identity is confirmed say: "Hi ${firstName}, this is Daisy, Doug's assistant with the DPA Help Center. ${assistanceOpening}"
-If this is a scheduled follow-up, after identity is confirmed say: "Hi ${firstName}, this is Daisy, Doug's assistant with the DPA Help Center. I'm following up like we agreed. When we last spoke, you mentioned that ${previousConcern}. Have you had any additional thoughts or questions since then?"
+First say exactly: "${identityRequest}"
+If this is the first call, after identity is confirmed say: "Great—this is Daisy, Doug's assistant with DPA Help Center. ${assistanceOpening}"
+If this is a scheduled follow-up, after identity is confirmed say: "Great—this is Daisy, Doug's assistant with DPA Help Center. I'm following up like we agreed. When we last spoke, you mentioned that ${previousConcern}. Have you had any additional thoughts or questions since then?"
+Never repeat "Hi" after identity confirmation and never speak a name placeholder aloud.
 `.trim();
 }
 
 const DOUG_TOOLS = [
+  {
+    type: "function",
+    name: "record_application_checkpoint",
+    description:
+      "Record whether the customer started the application at the scheduled checkpoint.",
+    parameters: {
+      type: "object",
+      properties: {
+        started: { type: "boolean" },
+        summary: { type: "string" }
+      },
+      required: ["started", "summary"],
+      additionalProperties: false
+    }
+  },
   {
     type: "function",
     name: "save_call_progress",
@@ -710,7 +848,8 @@ const DOUG_TOOLS = [
             "wrong_number",
             "opt_out",
             "disconnected",
-            "technical_failure"
+            "technical_failure",
+            "agent_notified"
           ]
         },
         next_action: { type: "string" },
@@ -896,6 +1035,22 @@ async function initializeDatabase() {
     `
   );
 
+  await runMigrationStep(
+    "create sms_deliveries",
+    `
+      CREATE TABLE IF NOT EXISTS sms_deliveries (
+        message_sid VARCHAR(80) PRIMARY KEY,
+        call_id VARCHAR(100) NOT NULL,
+        message_type VARCHAR(80) NOT NULL,
+        status VARCHAR(50) NOT NULL DEFAULT 'accepted',
+        error_code VARCHAR(50),
+        error_message TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `
+  );
+
   const indexSteps = [
     [
       "idx_ai_calls_case_id",
@@ -932,6 +1087,10 @@ async function initializeDatabase() {
     [
       "idx_call_attempts_monday_subitem",
       "CREATE INDEX IF NOT EXISTS idx_call_attempts_monday_subitem ON call_attempts(monday_subitem_id)"
+    ],
+    [
+      "idx_sms_deliveries_call_id",
+      "CREATE INDEX IF NOT EXISTS idx_sms_deliveries_call_id ON sms_deliveries(call_id, message_type)"
     ]
   ];
 
@@ -1322,6 +1481,15 @@ function findMondayColumn(boardMetadata, aliases) {
   return null;
 }
 
+function findMondayColumnById(boardMetadata, columnId) {
+  const column = boardMetadata.columns.find(
+    (candidate) => String(candidate.id) === String(columnId)
+  );
+  return column
+    ? { ...column, settings: parseMondaySettings(column.settings) }
+    : null;
+}
+
 function findMondayGroup(boardMetadata, aliases) {
   const list = Array.isArray(aliases) ? aliases : [aliases];
   for (const alias of list) {
@@ -1356,7 +1524,12 @@ function mondayPhoneCountry(phone) {
 function mondayStatusValue(column, desiredLabel) {
   if (!desiredLabel) return null;
   const settings = parseMondaySettings(column.settings);
-  const labels = Array.isArray(settings.labels) ? settings.labels : [];
+  const labels = Array.isArray(settings.labels)
+    ? settings.labels
+    : Object.entries(settings.labels || {}).map(([id, label]) => ({
+        id,
+        label: typeof label === "object" ? label?.label || label?.name : label
+      }));
   const wanted = normalizeMondayKey(desiredLabel);
   const found = labels.find(
     (label) => normalizeMondayKey(label.label) === wanted
@@ -1416,6 +1589,14 @@ function assignMondayValue(target, boardMetadata, aliases, value) {
   target[column.id] = formatted;
 }
 
+function assignMondayValueById(target, boardMetadata, columnId, value) {
+  const column = findMondayColumnById(boardMetadata, columnId);
+  if (!column) return;
+  const formatted = mondayColumnValue(column, value);
+  if (formatted === null || formatted === undefined) return;
+  target[column.id] = formatted;
+}
+
 function sequenceStatusLabel(call) {
   if (call.do_not_call) return "Do Not Call";
   if (call.wrong_number) return "Wrong Number";
@@ -1463,6 +1644,8 @@ function businessOutcomeLabel(outcome) {
     follow_up_scheduled: "Follow-Up Scheduled",
     application_link_sent: "Application Sent",
     dti_calculator_sent: "DTI Sent",
+    agent_notified: "Agent Notified",
+    application_started_hot_lead: "Application Started — Hot Lead",
     needs_review: "Needs Review",
     nurture: "Nurture",
     not_interested: "Not Interested",
@@ -1550,6 +1733,7 @@ function leadDisplayName(call) {
 function buildMainMondayValues(call, latestAttempt, metadata) {
   const values = {};
   const board = metadata.main;
+  const result = normalizeDaisyAnswers(call.result || {});
 
   assignMondayValue(values, board, ["Lead ID"], call.lead_id);
   assignMondayValue(values, board, ["Case ID"], call.case_id);
@@ -1605,6 +1789,30 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
   assignMondayValue(values, board, ["Call Summary"], call.summary);
   assignMondayValue(values, board, ["Owner"], call.human_owner_id);
   assignMondayValue(values, board, ["Cadence Version"], call.cadence_version);
+  assignMondayValueById(
+    values,
+    board,
+    MONDAY_CALL_CONTROL_COLUMNS.has_realtor,
+    result.has_realtor
+  );
+  assignMondayValueById(
+    values,
+    board,
+    MONDAY_CALL_CONTROL_COLUMNS.applied_with_lender,
+    result.applied_with_lender
+  );
+  assignMondayValueById(
+    values,
+    board,
+    MONDAY_CALL_CONTROL_COLUMNS.app_started_confirmation,
+    result.app_started_confirmation
+  );
+  assignMondayValueById(
+    values,
+    board,
+    MONDAY_CALL_CONTROL_COLUMNS.time_frame,
+    result.time_frame
+  );
 
   return values;
 }
@@ -2041,7 +2249,225 @@ function mondayEventDateToUtc(value, timeZone) {
   );
 }
 
-async function ensureMondayWebhook(eventName, stateKey) {
+async function discoverDpaDepartmentBoard() {
+  const cached = await getIntegrationState("dpa_department_board");
+  const configuredId = DPA_BOARD_ID || cleanText(cached?.board_id, 100);
+  let boards = [];
+
+  if (configuredId) {
+    const data = await mondayRequest(
+      `query DaisyDpaBoard($ids: [ID!]) {
+        boards(ids: $ids) { id name columns { id title type settings } }
+      }`,
+      { ids: [configuredId] }
+    );
+    boards = data.boards || [];
+  } else {
+    const data = await mondayRequest(
+      `query DaisyFindDpaBoard {
+        boards(limit: 100) { id name columns { id title type settings } }
+      }`
+    );
+    boards = (data.boards || []).filter(
+      (board) => normalizeMondayKey(board.name) === "dpadepartment"
+    );
+  }
+
+  const board = boards.find(
+    (candidate) =>
+      configuredId || normalizeMondayKey(candidate.name) === "dpadepartment"
+  );
+  if (!board) {
+    if (DPA_BOARD_ID) {
+      throw new Error(`Configured DPA board ${DPA_BOARD_ID} was not found.`);
+    }
+    console.warn('monday.com board named "DPA Department" was not found.');
+    return null;
+  }
+  if (!findMondayColumnById(buildMondayBoardMetadata(board), DPA_DEPARTMENT_COLUMNS.app_started)) {
+    throw new Error(
+      `DPA Department board ${board.id} is missing App_started column ${DPA_DEPARTMENT_COLUMNS.app_started}.`
+    );
+  }
+  await setIntegrationState("dpa_department_board", {
+    board_id: String(board.id),
+    board_name: board.name,
+    discovered_at: new Date().toISOString()
+  });
+  return buildMondayBoardMetadata(board);
+}
+
+function mondayRawColumnValue(columnValue) {
+  if (!columnValue) return null;
+  if (columnValue.text) return cleanText(columnValue.text, 2000);
+  try {
+    const parsed = typeof columnValue.value === "string"
+      ? JSON.parse(columnValue.value)
+      : columnValue.value;
+    return cleanText(
+      parsed?.phone || parsed?.text || parsed?.label?.text || parsed?.label,
+      2000
+    );
+  } catch {
+    return cleanText(columnValue.value, 2000);
+  }
+}
+
+async function createMondayItemUpdate(itemId, body) {
+  await mondayRequest(
+    `mutation DaisyDpaUpdate($itemId: ID!, $body: String!) {
+      create_update(item_id: $itemId, body: $body) { id }
+    }`,
+    { itemId: String(itemId), body: cleanText(body, 5000) },
+    { idempotencyKey: `dpa-update:${itemId}:${body}` }
+  );
+}
+
+async function claimIntegrationEvent(stateKey, value) {
+  const result = await pool.query(
+    `
+      INSERT INTO integration_state (state_key, state_value, updated_at)
+      VALUES ($1, $2::jsonb, NOW())
+      ON CONFLICT (state_key) DO NOTHING
+      RETURNING state_key
+    `,
+    [stateKey, JSON.stringify(value || {})]
+  );
+  return result.rowCount === 1;
+}
+
+async function createDpaAgentNotification(itemId, statusLabel) {
+  const data = await mondayRequest(
+    `query DaisyDpaItem($ids: [ID!]) {
+      items(ids: $ids) {
+        id name
+        column_values {
+          id text value
+          column { title }
+        }
+      }
+    }`,
+    { ids: [String(itemId)] }
+  );
+  const item = data.items?.[0];
+  if (!item) throw new Error(`DPA Department item ${itemId} was not found.`);
+  const byId = new Map((item.column_values || []).map((column) => [column.id, column]));
+  const agentName = mondayRawColumnValue(byId.get(DPA_DEPARTMENT_COLUMNS.realtor_name));
+  const agentPhone = normalizePhone(
+    mondayRawColumnValue(byId.get(DPA_DEPARTMENT_COLUMNS.realtor_phone))
+  );
+  const byTitle = (aliases) => {
+    const wanted = aliases.map(normalizeMondayKey);
+    return (item.column_values || []).find((column) =>
+      wanted.some((alias) => normalizeMondayKey(column.column?.title).includes(alias))
+    );
+  };
+  const timeFrame = normalizeTimeFrame(
+    mondayRawColumnValue(byTitle(["Time frame", "Purchase timeframe", "Timeline"]))
+  );
+  const availability = mondayRawColumnValue(
+    byTitle(["Tentative meeting availability", "Meeting availability", "Availability"])
+  );
+
+  if (!agentPhone || !validE164Phone(agentPhone)) {
+    await createMondayItemUpdate(
+      item.id,
+      `Daisy could not create the application-started notification call because the assigned DPA Realtor phone is missing or invalid. Please correct ${DPA_DEPARTMENT_COLUMNS.realtor_phone} and notify the specialist manually.`
+    );
+    return { created: false, reason: "invalid_agent_phone" };
+  }
+
+  const eventKey = `dpa-agent-notification:${item.id}:${normalizeMondayKey(statusLabel)}`;
+  const claimed = await claimIntegrationEvent(eventKey, {
+    status: "claimed",
+    item_id: String(item.id),
+    app_started_status: statusLabel,
+    claimed_at: new Date().toISOString()
+  });
+  if (!claimed) return { created: false, reason: "duplicate" };
+
+  const callId = createPublicId("DPA-NOTIFY");
+  const streamToken = createStreamToken();
+  const payload = {
+    call_type: "dpa_agent_notification",
+    first_name: agentName,
+    agent_name: agentName,
+    customer_name: cleanText(item.name, 160) || "the customer",
+    dpa_item_id: String(item.id),
+    time_frame: timeFrame,
+    tentative_meeting_availability: availability,
+    app_started_status: statusLabel
+  };
+  const inserted = await pool.query(
+    `
+      INSERT INTO ai_calls (
+        call_id, request_key, phone, status, stream_token, payload,
+        max_attempts, timezone, consent_status, current_state, next_state,
+        agent_version, prompt_version, tool_version, knowledge_version,
+        routing_version, cadence_version, priority
+      ) VALUES (
+        $1, $2, $3, 'created', $4, $5::jsonb, 1, $6, 'confirmed',
+        'dpa_agent_notification', 'identity_confirmation',
+        $7, $8, $9, $10, $11, $12, 'urgent'
+      ) RETURNING *
+    `,
+    [
+      callId,
+      eventKey,
+      agentPhone,
+      streamToken,
+      JSON.stringify(payload),
+      DEFAULT_TIMEZONE,
+      DOUG_CONFIG.agentVersion,
+      DOUG_CONFIG.promptVersion,
+      DOUG_CONFIG.toolVersion,
+      DOUG_CONFIG.knowledgeVersion,
+      DOUG_CONFIG.routingVersion,
+      DOUG_CONFIG.cadenceVersion
+    ]
+  );
+  const notificationCall = inserted.rows[0];
+  if (insideOperatingWindow(new Date(), notificationCall.timezone)) {
+    await placeTwilioCall(notificationCall, { force: true });
+  } else {
+    const nextAttemptAt = nextValidWindow(
+      notificationCall.timezone,
+      new Date(),
+      DOUG_CONFIG.preferredWindows.morning,
+      0
+    );
+    await pool.query(
+      `UPDATE ai_calls SET sequence_status = 'scheduled', next_attempt_at = $2,
+       updated_at = NOW() WHERE call_id = $1`,
+      [notificationCall.call_id, nextAttemptAt]
+    );
+  }
+  await setIntegrationState(eventKey, {
+    status: "notification_created",
+    item_id: String(item.id),
+    call_id: notificationCall.call_id,
+    app_started_status: statusLabel,
+    created_at: new Date().toISOString()
+  });
+  return { created: true, call_id: notificationCall.call_id };
+}
+
+async function processDpaDepartmentEvent(event) {
+  if (!event) return false;
+  const state = await getIntegrationState("dpa_department_board");
+  const boardId = DPA_BOARD_ID || state?.board_id;
+  if (!boardId || String(event.boardId) !== String(boardId)) return false;
+  if (String(event.columnId) !== DPA_DEPARTMENT_COLUMNS.app_started) return true;
+  const status = mondayEventStatusLabel(event.value);
+  if (!["yes", "started", "confirmed", "complete", "completed"].includes(
+    normalizeMondayKey(status)
+  )) return true;
+  const itemId = event.pulseId || event.itemId;
+  if (itemId) await createDpaAgentNotification(itemId, status);
+  return true;
+}
+
+async function ensureMondayWebhook(eventName, stateKey, boardId = MONDAY_BOARD_ID) {
   const currentState = await getIntegrationState(stateKey);
   const currentId = currentState?.webhook_id
     ? String(currentState.webhook_id)
@@ -2052,7 +2478,7 @@ async function ensureMondayWebhook(eventName, stateKey) {
       `query HeluxWebhooks($boardId: ID!) {
         webhooks(board_id: $boardId) { id event board_id config }
       }`,
-      { boardId: MONDAY_BOARD_ID },
+      { boardId },
       { maxRetries: 1 }
     );
 
@@ -2076,8 +2502,8 @@ async function ensureMondayWebhook(eventName, stateKey) {
 
   const data = await mondayRequest(
     mutation,
-    { boardId: MONDAY_BOARD_ID, url: mondayWebhookUrl() },
-    { idempotencyKey: `create-webhook:${eventName}:${MONDAY_BOARD_ID}` }
+    { boardId, url: mondayWebhookUrl() },
+    { idempotencyKey: `create-webhook:${eventName}:${boardId}` }
   );
 
   const webhookId = data.create_webhook?.id;
@@ -2088,7 +2514,7 @@ async function ensureMondayWebhook(eventName, stateKey) {
   await setIntegrationState(stateKey, {
     webhook_id: String(webhookId),
     event: eventName,
-    board_id: MONDAY_BOARD_ID,
+    board_id: boardId,
     url: mondayWebhookUrl(),
     created_at: new Date().toISOString()
   });
@@ -2112,6 +2538,16 @@ async function ensureMondayInboundWebhooks() {
       "monday_webhook_item_moved_to_any_group"
     )
   );
+  const dpaBoard = await discoverDpaDepartmentBoard();
+  if (dpaBoard) {
+    results.push(
+      await ensureMondayWebhook(
+        "change_column_value",
+        "monday_webhook_dpa_app_started",
+        dpaBoard.id
+      )
+    );
+  }
   return results;
 }
 
@@ -2216,6 +2652,25 @@ async function applyMondayGroupControl(call, event) {
 async function applyMondayColumnControl(call, event) {
   const title = normalizeMondayKey(event.columnTitle || event.columnId);
   const value = event.value;
+  const columnId = String(event.columnId || "");
+
+  const structuredKey = Object.entries(MONDAY_CALL_CONTROL_COLUMNS).find(
+    ([, configuredId]) => configuredId === columnId
+  )?.[0];
+  if (structuredKey) {
+    let structuredValue = mondayEventStatusLabel(value);
+    if (structuredKey === "time_frame") {
+      structuredValue = normalizeTimeFrame(structuredValue);
+    }
+    if (!structuredValue) return false;
+    const patch = normalizeDaisyAnswers({ [structuredKey]: structuredValue });
+    const existing = normalizeDaisyAnswers(call.result || {});
+    if (JSON.stringify(patch) === JSON.stringify(
+      Object.fromEntries(Object.keys(patch).map((key) => [key, existing[key]]))
+    )) return false;
+    await mergeCallResult(call.call_id, patch);
+    return true;
+  }
 
   if (title === "nextcall") {
     const nextCall = mondayEventDateToUtc(value, call.timezone);
@@ -2443,6 +2898,7 @@ async function applyMondayColumnControl(call, event) {
   return false;
 }
 async function processMondayInboundEvent(event) {
+  if (await processDpaDepartmentEvent(event)) return;
   if (!event || String(event.boardId) !== String(MONDAY_BOARD_ID)) return;
 
   const itemId = event.pulseId || event.itemId;
@@ -2853,6 +3309,63 @@ function calculateNextAttemptAt(call) {
   );
 }
 
+async function scheduleUnexpectedReconnect(callId) {
+  const call = await getCallById(callId);
+  if (!call || call.payload?.call_type === "dpa_agent_notification") return false;
+  if (!call.last_attempt_id) return false;
+  const attempt = await getAttemptById(call.last_attempt_id);
+  const transcript = Array.isArray(attempt?.transcript) ? attempt.transcript : [];
+  const actions = Array.isArray(attempt?.actions) ? attempt.actions : [];
+  const completedByTool = actions.some(
+    (action) => action && action.action === "complete_call" && action.success
+  );
+  const alreadyScheduled = call.result?.unexpected_disconnect_reconnect_scheduled;
+  if (transcript.length < 2 || completedByTool || alreadyScheduled) return false;
+
+  const reconnectAt = new Date(Date.now() + 60 * 1000);
+  const savedSummary = cleanText(
+    call.summary ||
+      transcript
+        .slice(-6)
+        .map((entry) => `${entry.speaker}: ${entry.text}`)
+        .join(" | "),
+    4000
+  );
+  const updated = await pool.query(
+    `
+      UPDATE ai_calls
+      SET current_state = 'reconnect_pending',
+          next_state = COALESCE(next_state, 'resume_conversation'),
+          sequence_status = 'callback_scheduled', callback_requested = TRUE,
+          callback_at = $2, next_attempt_at = $2,
+          summary = COALESCE(summary, $3),
+          next_action = COALESCE(next_action, 'Resume after unexpected disconnect'),
+          completed_at = NULL, result = result || $4::jsonb, updated_at = NOW()
+      WHERE call_id = $1
+        AND COALESCE(result->>'unexpected_disconnect_reconnect_scheduled', 'false') <> 'true'
+      RETURNING call_id
+    `,
+    [
+      callId,
+      reconnectAt,
+      savedSummary,
+      JSON.stringify({
+        unexpected_disconnect_reconnect_scheduled: true,
+        unexpected_disconnect_at: new Date().toISOString(),
+        reconnect_at: reconnectAt.toISOString()
+      })
+    ]
+  );
+  if (!updated.rowCount) return false;
+  await appendAction(callId, {
+    action: "unexpected_disconnect_reconnect_scheduled",
+    success: true,
+    reconnect_at: reconnectAt.toISOString()
+  });
+  queueMondaySync(callId, "unexpected_disconnect_reconnect");
+  return true;
+}
+
 async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
   const call = await getCallById(callId);
   if (!call) return;
@@ -2867,6 +3380,46 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
       !Number.isNaN(callbackAt.getTime()) &&
       callbackAt > new Date()
   );
+
+  if (
+    call.result?.unexpected_disconnect_reconnect_attempted &&
+    !call.result?.unexpected_disconnect_reconnect_completed
+  ) {
+    const attempt = call.last_attempt_id
+      ? await getAttemptById(call.last_attempt_id)
+      : null;
+    const attemptTranscript = Array.isArray(attempt?.transcript)
+      ? attempt.transcript
+      : [];
+    if (attemptTranscript.length < 2) {
+      const retryAt = nextValidWindow(
+        call.timezone || DEFAULT_TIMEZONE,
+        new Date(Date.now() + 48 * 60 * 60 * 1000),
+        DOUG_CONFIG.preferredWindows.morning,
+        0
+      );
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET sequence_status = 'waiting_retry', callback_requested = FALSE,
+              callback_at = NULL, next_attempt_at = $2,
+              current_state = 'reconnect_not_answered', completed_at = NULL,
+              result = result || $3::jsonb, updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [
+          callId,
+          retryAt,
+          JSON.stringify({
+            unexpected_disconnect_reconnect_completed: true,
+            next_customer_attempt_at: retryAt.toISOString()
+          })
+        ]
+      );
+      queueMondaySync(callId, "reconnect_not_answered_48h_retry");
+      return;
+    }
+  }
 
   if (
     call.sequence_status === "callback_scheduled" &&
@@ -3020,6 +3573,21 @@ async function placeTwilioCall(call, options = {}) {
   const attemptNumber = Number(refreshedCall.attempts || 0) + 1;
   const attemptId = createPublicId("ATTEMPT");
 
+  if (refreshedCall.current_state === "reconnect_pending") {
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET current_state = 'reconnect_in_progress',
+            result = result || $2::jsonb, updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [
+        refreshedCall.call_id,
+        JSON.stringify({ unexpected_disconnect_reconnect_attempted: true })
+      ]
+    );
+  }
+
   await pool.query(
     `
       INSERT INTO call_attempts (
@@ -3144,6 +3712,33 @@ function formatCustomerCallbackTime(value, timeZone) {
   }).format(date);
 }
 
+function smsStatusCallbackUrl(call) {
+  const url = new URL(`${PUBLIC_BASE_URL}/api/v1/twilio/sms-status`);
+  url.searchParams.set("call_id", call.call_id);
+  url.searchParams.set("token", call.stream_token);
+  return url.toString();
+}
+
+async function trackSmsMessage(callId, message, messageType) {
+  await pool.query(
+    `
+      INSERT INTO sms_deliveries (
+        message_sid, call_id, message_type, status, updated_at
+      )
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (message_sid)
+      DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
+    `,
+    [
+      message.sid,
+      callId,
+      messageType,
+      cleanText(message.status, 50) || "accepted"
+    ]
+  );
+
+}
+
 async function executeDougTool(call, name, args) {
   const safeArgs = args && typeof args === "object" ? args : {};
 
@@ -3151,7 +3746,7 @@ async function executeDougTool(call, name, args) {
     const currentState = cleanText(safeArgs.current_state, 80) || "unknown";
     const nextState = cleanText(safeArgs.next_state, 80);
     const sentiment = cleanText(safeArgs.sentiment, 50);
-    const answers = safeArgs.answers || {};
+    const answers = normalizeDaisyAnswers(safeArgs.answers || {});
 
     await pool.query(
       `
@@ -3225,6 +3820,62 @@ async function executeDougTool(call, name, args) {
     };
   }
 
+  if (name === "record_application_checkpoint") {
+    if (safeArgs.started !== true) {
+      return {
+        success: false,
+        error: "Confirm a new callback date, time, and timezone, then use schedule_callback."
+      };
+    }
+
+    const summary =
+      cleanText(safeArgs.summary, 4000) ||
+      "Customer confirmed the DPA application was started.";
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET
+          current_state = 'application_started',
+          next_state = 'human_action',
+          outcome = 'application_started_hot_lead',
+          priority = 'urgent',
+          sequence_status = 'human_action',
+          next_action = 'Agent Needed: review started application',
+          summary = $2,
+          callback_at = NULL,
+          callback_requested = FALSE,
+          next_attempt_at = NULL,
+          result = result || $3::jsonb,
+          updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [
+        call.call_id,
+        summary,
+        JSON.stringify({
+          app_started_confirmation: "Started",
+          interest_level: "Hot",
+          business_outcome: "Application Started — Hot Lead"
+        })
+      ]
+    );
+    await appendAction(call.call_id, {
+      action: name,
+      success: true,
+      app_started_confirmation: "Started",
+      priority: "urgent"
+    });
+    queueMondaySync(call.call_id, "application_started_hot_lead");
+    return {
+      success: true,
+      app_started_confirmation: "Started",
+      interest_level: "Hot",
+      priority: "Urgent",
+      business_outcome: "Application Started — Hot Lead",
+      sequence_status: "human_action"
+    };
+  }
+
   if (name === "send_resource_link") {
     if (safeArgs.consent_confirmed !== true) {
       return {
@@ -3243,16 +3894,41 @@ async function executeDougTool(call, name, args) {
       const message = await twilioClient.messages.create({
         to: call.phone,
         from: TWILIO_FROM_NUMBER,
-        body: `Here is the ${resource.description} Daisy mentioned: ${resource.url}`
+        body: `Here is the ${resource.description} Daisy mentioned: ${resource.url}`,
+        statusCallback: smsStatusCallbackUrl(call)
       });
 
-      const patch = {
+      await trackSmsMessage(call.call_id, message, resourceType);
+
+      const patch = normalizeDaisyAnswers({
         [`${resourceType}_sent`]: true,
         last_resource_sent: resourceType,
-        last_resource_url: resource.url
-      };
+        last_resource_url: resource.url,
+        ...(resourceType === "application"
+          ? {
+              application_link_sent: true,
+              app_started_confirmation: "Agreed to Start",
+              application_sms_sid: message.sid,
+              application_sms_status:
+                cleanText(message.status, 50) || "accepted"
+            }
+          : {})
+      });
 
       await mergeCallResult(call.call_id, patch);
+      if (resourceType === "application") {
+        await pool.query(
+          `
+            UPDATE ai_calls
+            SET current_state = 'application_link_sent',
+                next_state = 'confirm_application_checkpoint',
+                next_action = 'Confirm next-day application checkpoint date, time, and timezone',
+                updated_at = NOW()
+            WHERE call_id = $1
+          `,
+          [call.call_id]
+        );
+      }
       await appendAction(call.call_id, {
         action: name,
         success: true,
@@ -3347,6 +4023,9 @@ async function executeDougTool(call, name, args) {
       ]
     );
 
+    const isApplicationCheckpoint = normalizeMondayKey(reason).includes(
+      "applicationcheckpoint"
+    );
     await mergeCallResult(call.call_id, {
       callback_at: callbackAt.toISOString(),
       callback_timezone: timezone,
@@ -3356,8 +4035,23 @@ async function executeDougTool(call, name, args) {
       discussion_summary: discussionSummary,
       follow_up_outcome: callbackOutcome,
       preferred_contact_method:
-        cleanText(safeArgs.preferred_contact_method, 30) || "phone"
+        cleanText(safeArgs.preferred_contact_method, 30) || "phone",
+      ...(isApplicationCheckpoint
+        ? {
+            application_follow_up_at: callbackAt.toISOString(),
+            app_started_confirmation: "Agreed to Start"
+          }
+        : {})
     });
+
+    if (isApplicationCheckpoint) {
+      await pool.query(
+        `UPDATE ai_calls SET current_state = 'application_checkpoint',
+         next_state = 'application_checkpoint', updated_at = NOW()
+         WHERE call_id = $1`,
+        [call.call_id]
+      );
+    }
 
     await appendAction(call.call_id, {
       action: name,
@@ -3626,8 +4320,8 @@ async function executeDougTool(call, name, args) {
       "qualified",
       "hot_transfer",
       "specialist_handoff",
-      "application_link_sent",
       "dti_calculator_sent",
+      "agent_notified",
       "not_interested",
       "wrong_number",
       "opt_out"
@@ -3979,6 +4673,22 @@ app.post(
       );
 
       const call = insertResult.rows[0];
+      await mergeCallResult(
+        call.call_id,
+        normalizeDaisyAnswers({
+          has_realtor: payload.has_realtor ?? payload.realtor_status ?? null,
+          applied_with_lender:
+            payload.applied_with_lender ?? payload.applied_other_lender ?? null,
+          app_started_confirmation:
+            payload.app_started_confirmation ?? payload.application_status ?? null,
+          time_frame: payload.time_frame ?? payload.timeframe ?? null,
+          interest_level: null,
+          tentative_meeting_availability:
+            payload.tentative_meeting_availability ?? null,
+          application_link_sent: false,
+          application_follow_up_at: null
+        })
+      );
       queueMondaySync(call.call_id, "sequence_created");
 
       const now = new Date();
@@ -4201,6 +4911,82 @@ app.post("/api/v1/twilio/voice", async (req, res, next) => {
   }
 });
 
+app.post("/api/v1/twilio/sms-status", async (req, res, next) => {
+  try {
+    const callId = cleanText(req.query.call_id, 100);
+    const token = cleanText(req.query.token, 160);
+    const call = await validateCallToken(callId, token);
+    if (!call) throw new HttpError(401, "Invalid call token.");
+
+    const messageSid = cleanText(req.body.MessageSid, 80);
+    const status = cleanText(req.body.MessageStatus, 50) || "unknown";
+    const errorCode = cleanText(req.body.ErrorCode, 50);
+    const errorMessage = cleanText(req.body.ErrorMessage, 2000);
+    if (!messageSid) throw new HttpError(422, "MessageSid is required.");
+
+    const tracked = await pool.query(
+      `
+        UPDATE sms_deliveries
+        SET status = $2, error_code = $3, error_message = $4,
+            updated_at = NOW()
+        WHERE message_sid = $1
+        RETURNING message_type
+      `,
+      [messageSid, status, errorCode, errorMessage]
+    );
+    const messageType =
+      tracked.rows[0]?.message_type ||
+      (call.result?.application_sms_sid === messageSid
+        ? "application"
+        : "unknown");
+    const failed = ["failed", "undelivered"].includes(status.toLowerCase());
+
+    await mergeCallResult(call.call_id, {
+      [`${messageType}_sms_status`]: status,
+      [`${messageType}_sms_error_code`]: errorCode,
+      [`${messageType}_sms_error`]: errorMessage,
+      ...(messageType === "application"
+        ? { application_sms_status: status, application_sms_failed: failed }
+        : {})
+    });
+    await appendAction(call.call_id, {
+      action: "sms_delivery_status",
+      success: !failed,
+      message_type: messageType,
+      message_sid: messageSid,
+      status,
+      error_code: errorCode,
+      error: errorMessage
+    });
+
+    if (messageType === "application" && failed) {
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET sequence_status = 'human_action',
+              outcome = 'needs_review',
+              next_action = 'Human must send the DPA application link manually',
+              callback_requested = FALSE,
+              callback_at = NULL,
+              next_attempt_at = NULL,
+              last_error = $2,
+              updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [
+          call.call_id,
+          `Application SMS ${status}${errorCode ? ` (${errorCode})` : ""}`
+        ]
+      );
+      queueMondaySync(call.call_id, `application_sms_${status}`);
+    }
+
+    res.status(204).end();
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/v1/twilio/status", async (req, res, next) => {
   try {
     const callId = cleanText(req.query.call_id, 100);
@@ -4264,7 +5050,24 @@ mediaServer.on("connection", (twilioSocket) => {
   let initialGreetingStarted = false;
   let pendingAudio = [];
   let closed = false;
+  let assistantResponseActive = false;
+  let responseCreatePending = false;
+  let responseCreateQueued = false;
+  let sustainedSpeechTimer = null;
   const handledToolCalls = new Set();
+  const handledUserTurns = new Set();
+
+  function briefListeningAcknowledgement(value) {
+    const normalized = String(value || "")
+      .toLowerCase()
+      .replace(/[^a-z\s-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return [
+      "mm hmm", "mmm hmm", "mhm", "uh huh", "right", "okay", "ok",
+      "yeah", "i see", "got it"
+    ].includes(normalized);
+  }
 
   function sendToOpenAI(event) {
     if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
@@ -4318,6 +5121,27 @@ mediaServer.on("connection", (twilioSocket) => {
     lastAssistantItemId = null;
   }
 
+  function requestAssistantResponse(options = {}) {
+    if (assistantResponseActive || responseCreatePending) {
+      if (options.queueIfBusy === true) responseCreateQueued = true;
+      return false;
+    }
+    responseCreatePending = true;
+    const event = { type: "response.create" };
+    if (options.response) event.response = options.response;
+    if (!sendToOpenAI(event)) {
+      responseCreatePending = false;
+      return false;
+    }
+    return true;
+  }
+
+  async function stopAssistantForCustomer() {
+    if (!assistantResponseActive) return;
+    sendToOpenAI({ type: "response.cancel" });
+    await handleInterruption();
+  }
+
   async function handleToolCall(name, toolCallId, argumentText) {
     if (!call || !toolCallId || handledToolCalls.has(toolCallId)) return;
     handledToolCalls.add(toolCallId);
@@ -4349,7 +5173,7 @@ mediaServer.on("connection", (twilioSocket) => {
         output: JSON.stringify(output)
       }
     });
-    sendToOpenAI({ type: "response.create" });
+    requestAssistantResponse({ queueIfBusy: true });
   }
 
   function connectToOpenAI() {
@@ -4377,8 +5201,8 @@ mediaServer.on("connection", (twilioSocket) => {
     threshold: 0.65,
     prefix_padding_ms: 250,
     silence_duration_ms: 600,
-    create_response: true,
-    interrupt_response: true,
+    create_response: false,
+    interrupt_response: false,
     idle_timeout_ms: 12000
   }
 };
@@ -4427,18 +5251,25 @@ mediaServer.on("connection", (twilioSocket) => {
      if (!initialGreetingStarted) {
   initialGreetingStarted = true;
 
-  sendToOpenAI({
-    type: "response.create",
+  const openingName = cleanText(call?.payload?.first_name, 80);
+  const internalCustomerName = cleanText(call?.payload?.customer_name, 160);
+  requestAssistantResponse({
     response: {
       output_modalities: ["audio"],
-      instructions: `Say exactly: "Hi, may I speak with ${
-  cleanText(call?.payload?.first_name, 80) ||
-  cleanText(call?.payload?.name, 80) ||
-  "the person who completed the form"
-}?" Do not say "the person's name," "the named person," or any placeholder. Say nothing else until they answer.`
+      instructions: openingName
+        ? `Say exactly: "Hi, may I speak with ${openingName}?" Say nothing else until they answer.`
+        : call?.payload?.call_type === "dpa_agent_notification"
+          ? `Say exactly: "Hi, may I speak with the DPA specialist assigned to ${internalCustomerName || "this application"}?" Say nothing else until they answer.`
+        : "Say exactly: \"Hello, is this the person who recently reached out to DPA Help Center?\" Do not speak a name placeholder. Say nothing else until they answer."
     }
   });
 }
+
+        if (event.type === "response.created") {
+          responseCreatePending = false;
+          assistantResponseActive = true;
+          return;
+        }
 
         if (
           event.type === "response.output_item.added" ||
@@ -4466,7 +5297,16 @@ mediaServer.on("connection", (twilioSocket) => {
         }
 
         if (event.type === "input_audio_buffer.speech_started") {
-          await handleInterruption();
+          if (sustainedSpeechTimer) clearTimeout(sustainedSpeechTimer);
+          sustainedSpeechTimer = setTimeout(() => {
+            void stopAssistantForCustomer();
+          }, 850);
+          return;
+        }
+
+        if (event.type === "input_audio_buffer.speech_stopped") {
+          if (sustainedSpeechTimer) clearTimeout(sustainedSpeechTimer);
+          sustainedSpeechTimer = null;
           return;
         }
 
@@ -4480,6 +5320,19 @@ mediaServer.on("connection", (twilioSocket) => {
           "conversation.item.input_audio_transcription.completed"
         ) {
           await appendTranscript(call.call_id, "lead", event.transcript);
+          const turnKey = String(
+            event.item_id ||
+              stableHash(`${event.transcript}:${event.audio_end_ms || ""}`)
+          );
+          if (handledUserTurns.has(turnKey)) return;
+          handledUserTurns.add(turnKey);
+          const acknowledgement = briefListeningAcknowledgement(event.transcript);
+          if (
+            (assistantResponseActive || responseCreatePending) &&
+            acknowledgement
+          ) return;
+          if (assistantResponseActive) await stopAssistantForCustomer();
+          requestAssistantResponse({ queueIfBusy: true });
           return;
         }
 
@@ -4505,12 +5358,10 @@ mediaServer.on("connection", (twilioSocket) => {
           return;
         }
 
-        if (
-          event.type === "response.done" &&
-          event.response &&
-          Array.isArray(event.response.output)
-        ) {
-          for (const item of event.response.output) {
+        if (event.type === "response.done") {
+          assistantResponseActive = false;
+          responseCreatePending = false;
+          for (const item of event.response?.output || []) {
             if (item && item.type === "function_call") {
               await handleToolCall(
                 item.name,
@@ -4518,6 +5369,10 @@ mediaServer.on("connection", (twilioSocket) => {
                 item.arguments || "{}"
               );
             }
+          }
+          if (responseCreateQueued) {
+            responseCreateQueued = false;
+            requestAssistantResponse();
           }
           return;
         }
@@ -4614,6 +5469,11 @@ mediaServer.on("connection", (twilioSocket) => {
 
       if (message.event === "stop") {
         closed = true;
+        if (call) {
+          void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
+            console.error("Failed to schedule disconnect reconnect:", error);
+          });
+        }
         if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
           openaiSocket.close();
         }
@@ -4634,6 +5494,12 @@ mediaServer.on("connection", (twilioSocket) => {
 
   twilioSocket.on("close", () => {
     closed = true;
+    if (sustainedSpeechTimer) clearTimeout(sustainedSpeechTimer);
+    if (call) {
+      void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
+        console.error("Failed to schedule disconnect reconnect:", error);
+      });
+    }
     if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
       openaiSocket.close();
     }
