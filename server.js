@@ -165,9 +165,11 @@ const DOUG_CONFIG = Object.freeze({
   minimumGapMinutes: 180,
   operatingWindow: {
     weekdayStart: "09:00",
-    weekdayEnd: "19:30",
-    saturdayStart: "10:00",
-    saturdayEnd: "16:00",
+    weekdayEnd: "23:59",
+    saturdayStart: "09:00",
+    saturdayEnd: "23:59",
+    sundayStart: "09:00",
+    sundayEnd: "23:59",
     sundayEnabled: true
   },
   preferredWindows: {
@@ -2713,10 +2715,16 @@ function validCallingDay(parts) {
 function operatingWindowForParts(parts) {
   const day = localDayOfWeek(parts);
 
-  if (day === 0) {
-    if (!DOUG_CONFIG.operatingWindow.sundayEnabled) {
-      return null;
-    }
+ if (day === 0) {
+  if (!DOUG_CONFIG.operatingWindow.sundayEnabled) {
+    return null;
+  }
+
+  return {
+    start: parseClock(DOUG_CONFIG.operatingWindow.sundayStart),
+    end: parseClock(DOUG_CONFIG.operatingWindow.sundayEnd)
+  };
+}
 
     return {
       start: parseClock(DOUG_CONFIG.operatingWindow.weekdayStart),
