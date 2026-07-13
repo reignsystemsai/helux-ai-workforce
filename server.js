@@ -4366,17 +4366,22 @@ mediaServer.on("connection", (twilioSocket) => {
 
     openaiSocket.on("open", () => {
       const inputAudio = {
-        format: { type: "audio/pcmu" },
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500,
-          create_response: true,
-          interrupt_response: true,
-          idle_timeout_ms: 12000
-        }
-      };
+  format: { type: "audio/pcmu" },
+
+  noise_reduction: {
+    type: "near_field"
+  },
+
+  turn_detection: {
+    type: "server_vad",
+    threshold: 0.65,
+    prefix_padding_ms: 250,
+    silence_duration_ms: 600,
+    create_response: true,
+    interrupt_response: true,
+    idle_timeout_ms: 12000
+  }
+};
 
       if (OPENAI_TRANSCRIPTION_MODEL) {
         inputAudio.transcription = {
@@ -4419,18 +4424,21 @@ mediaServer.on("connection", (twilioSocket) => {
           return;
         }
 
-        if (event.type === "session.updated" && !initialGreetingStarted) {
-          initialGreetingStarted = true;
-          sendToOpenAI({
-            type: "response.create",
-            response: {
-              output_modalities: ["audio"],
-              instructions:
-                "Start now with the identity-safe opening. Ask only whether the named person is available. Do not reveal financial information before identity confirmation."
-            }
-          });
-          return;
-        }
+     if (!initialGreetingStarted) {
+  initialGreetingStarted = true;
+
+  sendToOpenAI({
+    type: "response.create",
+    response: {
+      output_modalities: ["audio"],
+      instructions: `Say exactly: "Hi, may I speak with ${
+  cleanText(call?.payload?.first_name, 80) ||
+  cleanText(call?.payload?.name, 80) ||
+  "the person who completed the form"
+}?" Do not say "the person's name," "the named person," or any placeholder. Say nothing else until they answer.`
+    }
+  });
+}
 
         if (
           event.type === "response.output_item.added" ||
