@@ -7,8 +7,8 @@ const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
 
 /*
- * HELUX AI WORKFORCE — DOUG 2.1.2
- * Working Twilio/OpenAI caller + isolated monday.com command-center adapter.
+ * HELUX AI WORKFORCE — DAISY 2.3.0
+ * Daisy, Doug's assistant: calling, callbacks, resources, and two-way monday.com control.
  * monday.com failures never block or terminate a customer call.
  */
 
@@ -42,6 +42,41 @@ const DPA_APPLICATION_URL =
   process.env.DPA_APPLICATION_URL || "https://www.dpahelpcenter.com";
 const DTI_CALCULATOR_URL =
   process.env.DTI_CALCULATOR_URL || "https://www.dpahelpcenter.com/dti";
+const PREPHUB_URL =
+  process.env.PREPHUB_URL || "https://www.dpahelpcenter.com/prephub";
+const CREDIT_READINESS_URL =
+  process.env.CREDIT_READINESS_URL || "https://www.creditjump.ai/";
+const TAX_READINESS_URL =
+  process.env.TAX_READINESS_URL || "https://www.estimatemytaxreturn.com/";
+const EMPLOYMENT_READINESS_URL =
+  process.env.EMPLOYMENT_READINESS_URL || "https://www.dpahelpcenter.com/job";
+
+const DAISY_RESOURCE_LIBRARY = Object.freeze({
+  application: {
+    url: DPA_APPLICATION_URL,
+    description: "DPA Help Center application"
+  },
+  dti_calculator: {
+    url: DTI_CALCULATOR_URL,
+    description: "DPA Help Center DTI calculator"
+  },
+  prephub: {
+    url: PREPHUB_URL,
+    description: "DPA Help Center Prephub"
+  },
+  credit_readiness: {
+    url: CREDIT_READINESS_URL,
+    description: "CreditJump credit-readiness resource"
+  },
+  tax_readiness: {
+    url: TAX_READINESS_URL,
+    description: "tax-readiness resource"
+  },
+  employment_readiness: {
+    url: EMPLOYMENT_READINESS_URL,
+    description: "employment-readiness resource"
+  }
+});
 
 const CALL_SCHEDULER_ENABLED =
   String(process.env.CALL_SCHEDULER_ENABLED || "false").toLowerCase() ===
@@ -86,6 +121,16 @@ const MONDAY_SYNC_DEBOUNCE_MS = Math.max(
   100,
   Number(process.env.MONDAY_SYNC_DEBOUNCE_MS || 750)
 );
+const MONDAY_INBOUND_SYNC_ENABLED =
+  String(process.env.MONDAY_INBOUND_SYNC_ENABLED || "true").toLowerCase() ===
+  "true";
+const MONDAY_WEBHOOK_SECRET = String(
+  process.env.MONDAY_WEBHOOK_SECRET ||
+    createHash("sha256")
+      .update(`${HELUX_API_KEY}:${MONDAY_BOARD_ID}:monday-inbound`)
+      .digest("hex")
+      .slice(0, 32)
+);
 
 const REQUIRED_ENVIRONMENT = {
   DATABASE_URL,
@@ -108,13 +153,13 @@ if (missingEnvironment.length) {
 }
 
 const DOUG_CONFIG = Object.freeze({
-  agentVersion: "doug-2.1.2",
+  agentVersion: "daisy-2.3.0",
   promptVersion: "dpa-readiness-v1",
   toolVersion: "tools-v1",
   knowledgeVersion: "dpa-general-v1",
   routingVersion: "dpa-routing-v1",
   cadenceVersion: "dpa-ready-6-attempt-adaptive-v2",
-  mondayAdapterVersion: "monday-call-control-v1",
+  mondayAdapterVersion: "monday-call-control-v2",
   maxAttempts: 6,
   maxVoicemails: 2,
   minimumGapMinutes: 180,
@@ -203,6 +248,28 @@ function normalizeTimezone(value) {
   }
 }
 
+function formatAssistanceAmount(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+
+  const numericValue = Number(
+    String(value)
+      .replace(/[$,\s]/g, "")
+      .trim()
+  );
+
+  if (!Number.isFinite(numericValue) || numericValue <= 0) {
+    return null;
+  }
+
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0
+  }).format(numericValue);
+}
+
 function authenticateHelux(req, res, next) {
   const provided = req.headers["x-helux-key"];
   if (!provided || Array.isArray(provided) || provided !== HELUX_API_KEY) {
@@ -254,11 +321,9 @@ function stopOutcome(outcome) {
     "qualified",
     "hot_transfer",
     "specialist_handoff",
-    "specialist_callback",
     "application_link_sent",
     "dti_calculator_sent",
     "needs_review",
-    "nurture",
     "not_interested",
     "wrong_number",
     "opt_out"
@@ -283,7 +348,8 @@ function buildAgentInstructions(call) {
   const creditScore = lead.credit_score ?? "not provided";
   const income = lead.household_income ?? lead.income ?? "not provided";
   const homePrice = lead.home_price ?? "not provided";
-  const estimatedDpa = lead.estimated_dpa ?? "not provided";
+  const estimatedDpaRaw = lead.estimated_dpa;
+  const estimatedDpa = formatAssistanceAmount(estimatedDpaRaw);
   const employment =
     cleanText(lead.employment || lead.employment_history, 150) ||
     "not provided";
@@ -292,16 +358,43 @@ function buildAgentInstructions(call) {
     "not provided";
   const readinessScore = lead.readiness_score ?? "not provided";
   const currentState = cleanText(call.current_state, 80) || "greeting";
+  const previousConcern =
+    cleanText(
+      result.primary_concern ||
+        result.hold_reason ||
+        result.callback_reason,
+      1200
+    ) || "not provided";
+  const previousSummary =
+    cleanText(
+      call.summary ||
+        result.discussion_summary ||
+        result.summary,
+      4000
+    ) || "not provided";
+  const isFollowUp = Boolean(
+    call.callback_requested ||
+      result.callback_at ||
+      ["follow_up_scheduled", "specialist_callback"].includes(
+        String(call.outcome || "").toLowerCase()
+      )
+  );
+
+  const assistanceOpening = estimatedDpa
+    ? `You were recently looking for up to ${estimatedDpa} in down payment assistance to help purchase a home. Is that correct?`
+    : "You were recently looking into down payment assistance to help purchase a home. Is that correct?";
 
   return `
-You are Doug, the AI workforce readiness specialist for DPA Help Center.
+You are Daisy, Doug's assistant with the DPA Help Center.
 You are calling ${firstName}, who completed a homebuyer readiness process.
 
 IDENTITY
-- Your name is Doug.
-- Clearly disclose that you are an AI assistant for DPA Help Center.
+- Your name is Daisy.
+- Introduce yourself as Doug's assistant with the DPA Help Center.
+- Do not volunteer technical details about automation in the opening.
+- Never claim or imply that you are human.
+- If directly asked whether you are AI, automated, a bot, or a real person, answer truthfully: "Yes, I'm Doug's virtual assistant with the DPA Help Center."
 - You are not a lender and you do not approve loans.
-- Never claim to be human.
 
 VOICE STANDARD
 - Sound warm, premium, calm, confident, and conversational.
@@ -325,25 +418,48 @@ KNOWN LEAD CONTEXT
 - Tax history submitted: ${taxes}
 - Target home price: ${homePrice}
 - Readiness score: ${readinessScore}
-- Estimated assistance shown: ${estimatedDpa}
+- Estimated assistance shown: ${estimatedDpa || "not provided"}
 - Current conversation state: ${currentState}
+- This is a scheduled follow-up: ${isFollowUp ? "yes" : "no"}
+- Previous concern or hold reason: ${previousConcern}
+- Previous call summary: ${previousSummary}
 - Previously saved call information: ${JSON.stringify(result)}
 
 LEAD INTELLIGENCE RULE
 - Never ask for information already known unless you are confirming that it is still accurate, it is missing, or the customer says it changed.
 - Confirm known information instead of restarting the website intake.
+- On a follow-up call, use the previous concern, summary, and agreed next step. Do not restart the original intake.
 
 STATE MACHINE
 1. Greeting: ask for ${firstName} without revealing private information.
-2. Identity verification: confirm the person, disclose that you are an AI assistant, and ask whether now is a good time.
+2. Identity verification: confirm the person, introduce yourself as Doug's assistant, and use the correct first-call or follow-up opening.
 3. Readiness confirmation: confirm that the submitted credit, income, employment, and tax information remains current.
 4. Application status: determine whether they only completed the readiness form, received an application link, started an application, submitted one, or are already preapproved.
 5. Qualification: confirm buying timeline, target area, Realtor status, and lender status.
 6. DTI snapshot when needed: collect gross monthly household income and recurring monthly credit obligations, then call calculate_preliminary_dti.
 7. Program guidance: explain broadly that state, county, city, and lender-based options may exist and a specialist must verify the best fit.
-8. Routing: select the correct action—application link, DTI calculator, specialist handoff, live transfer, callback, review, or nurture.
+8. Routing: select the correct action—application link, Prephub, DTI calculator, readiness resource, specialist handoff, live transfer, callback, review, or nurture.
 9. Closing: confirm exactly what happened and what happens next.
 10. Follow-up scheduling: collect date, time, timezone, and reason; repeat the appointment before calling schedule_callback.
+
+UNDECIDED AND FOLLOW-UP WORKFLOW
+- "Undecided" means the call attempt is complete, but the lead sequence is not complete.
+- Ask what specific concern, question, or uncertainty is putting the decision on hold.
+- Ask one gentle follow-up question to understand why that concern matters.
+- Address the concern briefly and accurately without pressure.
+- Ask for a specific date, time, and timezone to reconnect.
+- Repeat the callback appointment and obtain confirmation.
+- Ask whether you may text a confirmation.
+- Call schedule_callback with the primary_concern, hold_reason, discussion_summary, callback time, timezone, reason, and sms_confirmation_consent.
+- Then call complete_call with outcome follow_up_scheduled, stop_sequence false, and pause_sequence false.
+- Never mark the parent sequence completed when a future callback exists.
+- If the customer remains undecided but refuses to choose a date, use outcome nurture, keep the sequence active, and save the concern and recommended next action.
+
+FOLLOW-UP CALL MODE
+- If this is a scheduled follow-up, first verify identity.
+- Then say you are following up as agreed and naturally reference the previous concern.
+- Example: "When we last spoke, you mentioned that ${previousConcern}. We agreed I would follow up. Have you had any additional thoughts or questions since then?"
+- Do not repeat the entire original opening or ask questions already answered.
 
 EMOTIONAL INTELLIGENCE
 - Detect frustration, confusion, skepticism, urgency, excitement, hesitation, fear, or disappointment.
@@ -370,7 +486,10 @@ TOOLS
 - Use save_call_progress as meaningful information is confirmed.
 - Use calculate_preliminary_dti for DTI math.
 - Use send_resource_link only after the customer agrees to receive the link.
+- Approved resources are: application, dti_calculator, prephub, credit_readiness, tax_readiness, and employment_readiness.
+- Use credit, tax, or employment readiness links only when that deficiency is relevant or the customer specifically requests that resource.
 - Use schedule_callback only after repeating and confirming the callback time.
+- Before texting a callback confirmation, ask permission and pass sms_confirmation_consent accurately.
 - Use create_specialist_handoff when a human should follow up.
 - Use transfer_to_specialist only after the customer explicitly agrees to a live transfer.
 - Use mark_contact_restriction immediately for wrong number, invalid number, opt-out, or not interested.
@@ -379,7 +498,8 @@ TOOLS
 
 OPENING
 First ask: "Hi, may I speak with ${firstName}?"
-After identity is confirmed, say: "Hi ${firstName}, this is Doug, an AI assistant with DPA Help Center. You recently completed our homebuyer readiness process. Did I catch you at an okay time for a quick call?"
+If this is the first call, after identity is confirmed say: "Hi ${firstName}, this is Daisy, Doug's assistant with the DPA Help Center. ${assistanceOpening}"
+If this is a scheduled follow-up, after identity is confirmed say: "Hi ${firstName}, this is Daisy, Doug's assistant with the DPA Help Center. I'm following up like we agreed. When we last spoke, you mentioned that ${previousConcern}. Have you had any additional thoughts or questions since then?"
 `.trim();
 }
 
@@ -435,13 +555,20 @@ const DOUG_TOOLS = [
     type: "function",
     name: "send_resource_link",
     description:
-      "Send the approved DPA application link or DTI calculator link by SMS after customer confirmation.",
+      "Send an approved DPA Help Center readiness resource by SMS after customer confirmation.",
     parameters: {
       type: "object",
       properties: {
         resource_type: {
           type: "string",
-          enum: ["application", "dti_calculator"]
+          enum: [
+            "application",
+            "dti_calculator",
+            "prephub",
+            "credit_readiness",
+            "tax_readiness",
+            "employment_readiness"
+          ]
         },
         consent_confirmed: { type: "boolean" }
       },
@@ -463,21 +590,27 @@ const DOUG_TOOLS = [
         },
         timezone: { type: "string" },
         reason: { type: "string" },
+        primary_concern: { type: "string" },
+        hold_reason: { type: "string" },
+        discussion_summary: { type: "string" },
         preferred_contact_method: {
           type: "string",
           enum: ["phone", "sms", "email"]
         },
+        sms_confirmation_consent: { type: "boolean" },
         prospect_confirmed: { type: "boolean" }
       },
       required: [
         "callback_at",
         "timezone",
         "reason",
+        "sms_confirmation_consent",
         "prospect_confirmed"
       ],
       additionalProperties: false
     }
   },
+
   {
     type: "function",
     name: "create_specialist_handoff",
@@ -563,6 +696,7 @@ const DOUG_TOOLS = [
             "hot_transfer",
             "specialist_handoff",
             "specialist_callback",
+            "follow_up_scheduled",
             "application_link_sent",
             "dti_calculator_sent",
             "needs_review",
@@ -749,6 +883,17 @@ async function initializeDatabase() {
     );
   }
 
+  await runMigrationStep(
+    "create integration_state",
+    `
+      CREATE TABLE IF NOT EXISTS integration_state (
+        state_key VARCHAR(150) PRIMARY KEY,
+        state_value JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `
+  );
+
   const indexSteps = [
     [
       "idx_ai_calls_case_id",
@@ -817,6 +962,34 @@ async function getAttemptById(attemptId) {
     [attemptId]
   );
   return result.rows[0] || null;
+}
+
+async function getCallByMondayItemId(itemId) {
+  const result = await pool.query(
+    "SELECT * FROM ai_calls WHERE monday_item_id = $1 LIMIT 1",
+    [String(itemId)]
+  );
+  return result.rows[0] || null;
+}
+
+async function getIntegrationState(stateKey) {
+  const result = await pool.query(
+    "SELECT state_value FROM integration_state WHERE state_key = $1 LIMIT 1",
+    [stateKey]
+  );
+  return result.rows[0]?.state_value || null;
+}
+
+async function setIntegrationState(stateKey, stateValue) {
+  await pool.query(
+    `
+      INSERT INTO integration_state (state_key, state_value, updated_at)
+      VALUES ($1, $2::jsonb, NOW())
+      ON CONFLICT (state_key)
+      DO UPDATE SET state_value = EXCLUDED.state_value, updated_at = NOW()
+    `,
+    [stateKey, JSON.stringify(stateValue || {})]
+  );
 }
 
 async function getAttemptsForCall(callId) {
@@ -1000,6 +1173,7 @@ async function mondayRequest(query, variables = {}, options = {}) {
 
         throw error;
       }
+
       if (Array.isArray(body.errors) && body.errors.length) {
         const message = body.errors
           .map((entry) => entry.message || "Unknown monday.com error")
@@ -1030,7 +1204,6 @@ async function mondayRequest(query, variables = {}, options = {}) {
 
   throw new Error("monday.com request failed after retries.");
 }
-
 function buildMondayBoardMetadata(board) {
   const columns = Array.isArray(board.columns) ? board.columns : [];
   const groups = Array.isArray(board.groups) ? board.groups : [];
@@ -1285,6 +1458,7 @@ function businessOutcomeLabel(outcome) {
     hot_transfer: "Hot Transfer",
     specialist_handoff: "Specialist Handoff",
     specialist_callback: "Specialist Callback",
+    follow_up_scheduled: "Follow-Up Scheduled",
     application_link_sent: "Application Sent",
     dti_calculator_sent: "DTI Sent",
     needs_review: "Needs Review",
@@ -1323,22 +1497,34 @@ function answeredByLabel(answeredBy) {
 }
 
 function targetMondayGroupTitle(call) {
-  if (call.do_not_call || call.wrong_number || call.invalid_number) {
-    return "Closed or Suppressed";
+  const outcome = String(call.outcome || "").toLowerCase();
+
+  if (
+    call.do_not_call ||
+    call.wrong_number ||
+    call.invalid_number ||
+    ["not_interested", "wrong_number", "opt_out"].includes(outcome)
+  ) {
+    return ["Do Not Call List", "Closed or Suppressed"];
   }
 
   const status = String(call.sequence_status || "").toLowerCase();
-  if (status === "ready") return "Ready to Call";
-  if (["scheduled", "calling", "waiting_retry", "paused"].includes(status)) {
-    return "Active Sequences";
+  if (
+    ["ready", "scheduled", "calling", "waiting_retry", "paused"].includes(
+      status
+    )
+  ) {
+    return ["New Leads", "Active Sequences", "Ready to Call"];
   }
-  if (status === "callback_scheduled") return "Callbacks";
+  if (status === "callback_scheduled") return ["Callbacks"];
   if (["human_action", "exhausted"].includes(status)) {
-    return "Human Action Needed";
+    return ["Agent Needed", "Human Action Needed"];
   }
-  if (status === "completed") return "Completed";
-  if (status === "suppressed") return "Closed or Suppressed";
-  return "Active Sequences";
+  if (status === "completed") return ["Completed"];
+  if (status === "suppressed") {
+    return ["Do Not Call List", "Closed or Suppressed"];
+  }
+  return ["New Leads", "Active Sequences", "Ready to Call"];
 }
 
 function leadDisplayName(call) {
@@ -1367,7 +1553,7 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
   assignMondayValue(values, board, ["Case ID"], call.case_id);
   assignMondayValue(values, board, ["Phone"], call.phone);
   assignMondayValue(values, board, ["Time Zone", "Timezone"], call.timezone);
-  assignMondayValue(values, board, ["AI Agent", "Agent"], "Doug");
+  assignMondayValue(values, board, ["AI Agent", "Agent"], "Daisy");
   assignMondayValue(
     values,
     board,
@@ -1500,6 +1686,7 @@ async function changeMondayValuesResilient(
   } catch (batchError) {
     const failed = [];
     let updated = 0;
+
     for (const [columnId, value] of entries) {
       try {
         await mondayRequest(
@@ -1605,7 +1792,6 @@ async function ensureMondayMainItem(call, metadata) {
 
   return String(itemId);
 }
-
 async function ensureMondayAttemptSubitem(attempt, parentItemId) {
   if (attempt.monday_subitem_id) return String(attempt.monday_subitem_id);
 
@@ -1805,6 +1991,480 @@ function queueMondaySync(callId, reason = "state_change") {
   }, MONDAY_SYNC_DEBOUNCE_MS);
 
   mondaySyncTimers.set(callId, timer);
+}
+
+function mondayWebhookUrl() {
+  const url = new URL(`${PUBLIC_BASE_URL}/api/v1/monday/webhook`);
+  url.searchParams.set("secret", MONDAY_WEBHOOK_SECRET);
+  return url.toString();
+}
+
+function mondayEventStatusLabel(value) {
+  if (!value) return null;
+  return cleanText(
+    value.label?.text ||
+      value.label?.label ||
+      value.label ||
+      value.text ||
+      value.name,
+    100
+  );
+}
+
+function mondayEventBoolean(value) {
+  if (value === true || value === false) return value;
+  const checked = value?.checked ?? value?.check ?? value;
+  return normalizeBoolean(checked);
+}
+
+function mondayEventDateToUtc(value, timeZone) {
+  if (!value || !value.date) return null;
+  const [year, month, day] = String(value.date).split("-").map(Number);
+  const [hour, minute, second] = String(value.time || "09:00:00")
+    .split(":")
+    .map(Number);
+
+  if (![year, month, day, hour, minute].every(Number.isFinite)) return null;
+
+  return zonedDateTimeToUtc(
+    {
+      year,
+      month,
+      day,
+      hour,
+      minute,
+      second: Number.isFinite(second) ? second : 0
+    },
+    normalizeTimezone(timeZone)
+  );
+}
+
+async function ensureMondayWebhook(eventName, stateKey) {
+  const currentState = await getIntegrationState(stateKey);
+  const currentId = currentState?.webhook_id
+    ? String(currentState.webhook_id)
+    : null;
+
+  if (currentId) {
+    const data = await mondayRequest(
+      `query HeluxWebhooks($boardId: ID!) {
+        webhooks(board_id: $boardId) { id event board_id config }
+      }`,
+      { boardId: MONDAY_BOARD_ID },
+      { maxRetries: 1 }
+    );
+
+    const exists = (data.webhooks || []).some(
+      (webhook) =>
+        String(webhook.id) === currentId && webhook.event === eventName
+    );
+
+    if (exists) return currentId;
+  }
+
+  const mutation = `
+    mutation HeluxCreateWebhook($boardId: ID!, $url: String!) {
+      create_webhook(
+        board_id: $boardId,
+        url: $url,
+        event: ${eventName}
+      ) { id board_id }
+    }
+  `;
+
+  const data = await mondayRequest(
+    mutation,
+    { boardId: MONDAY_BOARD_ID, url: mondayWebhookUrl() },
+    { idempotencyKey: `create-webhook:${eventName}:${MONDAY_BOARD_ID}` }
+  );
+
+  const webhookId = data.create_webhook?.id;
+  if (!webhookId) {
+    throw new Error(`monday.com did not return a ${eventName} webhook ID.`);
+  }
+
+  await setIntegrationState(stateKey, {
+    webhook_id: String(webhookId),
+    event: eventName,
+    board_id: MONDAY_BOARD_ID,
+    url: mondayWebhookUrl(),
+    created_at: new Date().toISOString()
+  });
+
+  return String(webhookId);
+}
+
+async function ensureMondayInboundWebhooks() {
+  if (!MONDAY_SYNC_ENABLED || !MONDAY_INBOUND_SYNC_ENABLED) return [];
+
+  const results = [];
+  results.push(
+    await ensureMondayWebhook(
+      "change_column_value",
+      "monday_webhook_change_column_value"
+    )
+  );
+  results.push(
+    await ensureMondayWebhook(
+      "item_moved_to_any_group",
+      "monday_webhook_item_moved_to_any_group"
+    )
+  );
+  return results;
+}
+
+function mondayDatesMatch(first, second, toleranceMs = 60000) {
+  if (!first || !second) return false;
+  const firstDate = first instanceof Date ? first : new Date(first);
+  const secondDate = second instanceof Date ? second : new Date(second);
+  if (Number.isNaN(firstDate.getTime()) || Number.isNaN(secondDate.getTime())) {
+    return false;
+  }
+  return Math.abs(firstDate.getTime() - secondDate.getTime()) <= toleranceMs;
+}
+
+async function applyMondayGroupControl(call, event) {
+  const groupName = cleanText(event.groupName || event.groupTitle, 150);
+  if (!groupName) return false;
+
+  const normalized = normalizeMondayKey(groupName);
+  const expectedGroups = targetMondayGroupTitle(call).map(normalizeMondayKey);
+
+  // Ignore the webhook generated by HELUX moving the item to its expected group.
+  if (expectedGroups.includes(normalized)) return false;
+
+  if (["newleads", "activesequences", "readytocall"].includes(normalized)) {
+    if (call.do_not_call || call.wrong_number || call.invalid_number) return false;
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET
+          sequence_status = 'scheduled',
+          next_attempt_at = COALESCE(next_attempt_at, NOW()),
+          updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [call.call_id]
+    );
+    return true;
+  }
+
+  if (normalized === "callbacks") {
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET
+          sequence_status = 'callback_scheduled',
+          callback_requested = TRUE,
+          next_attempt_at = COALESCE(callback_at, next_attempt_at, NOW()),
+          updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [call.call_id]
+    );
+    return true;
+  }
+
+  if (["agentneeded", "humanactionneeded"].includes(normalized)) {
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET sequence_status = 'human_action', next_attempt_at = NULL,
+            updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [call.call_id]
+    );
+    return true;
+  }
+
+  if (normalized === "completed") {
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET sequence_status = 'completed', next_attempt_at = NULL,
+            updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [call.call_id]
+    );
+    return true;
+  }
+
+  if (["donotcalllist", "closedorsuppressed"].includes(normalized)) {
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET
+          do_not_call = TRUE,
+          sequence_status = 'suppressed',
+          outcome = COALESCE(outcome, 'opt_out'),
+          next_attempt_at = NULL,
+          updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [call.call_id]
+    );
+    return true;
+  }
+
+  return false;
+}
+
+async function applyMondayColumnControl(call, event) {
+  const title = normalizeMondayKey(event.columnTitle || event.columnId);
+  const value = event.value;
+
+  if (title === "nextcall") {
+    const nextCall = mondayEventDateToUtc(value, call.timezone);
+
+    if (nextCall && mondayDatesMatch(nextCall, call.next_attempt_at)) {
+      return false;
+    }
+
+    if (!nextCall && !call.next_attempt_at) return false;
+
+    if (!nextCall) {
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET sequence_status = 'paused', next_attempt_at = NULL,
+              updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [call.call_id]
+      );
+      return true;
+    }
+
+    const callbackMode =
+      call.callback_requested || call.sequence_status === "callback_scheduled";
+
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET
+          sequence_status = $2,
+          next_attempt_at = $3,
+          callback_at = CASE WHEN $4 THEN $3 ELSE callback_at END,
+          updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [
+        call.call_id,
+        callbackMode ? "callback_scheduled" : "scheduled",
+        nextCall,
+        callbackMode
+      ]
+    );
+    return true;
+  }
+
+  if (title === "callbackat") {
+    const callbackAt = mondayEventDateToUtc(value, call.timezone);
+    if (!callbackAt) return false;
+    if (mondayDatesMatch(callbackAt, call.callback_at)) return false;
+
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET
+          callback_at = $2,
+          callback_requested = TRUE,
+          sequence_status = 'callback_scheduled',
+          next_attempt_at = $2,
+          updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [call.call_id, callbackAt]
+    );
+    return true;
+  }
+
+  if (title === "sequencestatus") {
+    const label = normalizeMondayKey(mondayEventStatusLabel(value));
+    const expectedLabel = normalizeMondayKey(sequenceStatusLabel(call));
+
+    // Ignore status changes written by HELUX itself.
+    if (label && label === expectedLabel) return false;
+
+    if (["ready", "callnow"].includes(label)) {
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET sequence_status = 'scheduled', next_attempt_at = NOW(),
+              updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [call.call_id]
+      );
+      return true;
+    }
+
+    if (label === "scheduled") {
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET sequence_status = 'scheduled',
+              next_attempt_at = COALESCE(next_attempt_at, NOW()),
+              updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [call.call_id]
+      );
+      return true;
+    }
+
+    if (label === "waitingretry") {
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET sequence_status = 'waiting_retry',
+              next_attempt_at = COALESCE(next_attempt_at, NOW()),
+              updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [call.call_id]
+      );
+      return true;
+    }
+
+    if (label === "callbackscheduled") {
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET
+            sequence_status = 'callback_scheduled',
+            callback_requested = TRUE,
+            next_attempt_at = COALESCE(callback_at, next_attempt_at, NOW()),
+            updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [call.call_id]
+      );
+      return true;
+    }
+
+    if (label === "paused") {
+      await pool.query(
+        `UPDATE ai_calls SET sequence_status = 'paused', next_attempt_at = NULL,
+         updated_at = NOW() WHERE call_id = $1`,
+        [call.call_id]
+      );
+      return true;
+    }
+
+    if (["humanaction", "agentneeded", "exhausted"].includes(label)) {
+      await pool.query(
+        `UPDATE ai_calls SET sequence_status = 'human_action',
+         next_attempt_at = NULL, updated_at = NOW() WHERE call_id = $1`,
+        [call.call_id]
+      );
+      return true;
+    }
+
+    if (label === "completed") {
+      await pool.query(
+        `UPDATE ai_calls SET sequence_status = 'completed',
+         next_attempt_at = NULL, updated_at = NOW() WHERE call_id = $1`,
+        [call.call_id]
+      );
+      return true;
+    }
+
+    if (["donotcall", "wrongnumber", "invalidnumber"].includes(label)) {
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET
+            do_not_call = do_not_call OR $2,
+            wrong_number = wrong_number OR $3,
+            invalid_number = invalid_number OR $4,
+            sequence_status = 'suppressed',
+            next_attempt_at = NULL,
+            updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [
+          call.call_id,
+          label === "donotcall",
+          label === "wrongnumber",
+          label === "invalidnumber"
+        ]
+      );
+      return true;
+    }
+  }
+
+  if (title === "donotcall") {
+    const checked = mondayEventBoolean(value);
+    if (checked !== true || call.do_not_call) return false;
+
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET do_not_call = TRUE, sequence_status = 'suppressed',
+            outcome = COALESCE(outcome, 'opt_out'), next_attempt_at = NULL,
+            updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [call.call_id]
+    );
+    return true;
+  }
+
+  if (title === "priority") {
+    const label = cleanText(mondayEventStatusLabel(value), 30);
+    if (!label || label.toLowerCase() === String(call.priority || "").toLowerCase()) {
+      return false;
+    }
+    await pool.query(
+      `UPDATE ai_calls SET priority = $2, updated_at = NOW() WHERE call_id = $1`,
+      [call.call_id, label.toLowerCase()]
+    );
+    return true;
+  }
+
+  if (title === "owner") {
+    const ownerId = value?.personsAndTeams?.[0]?.id || value?.persons?.[0]?.id;
+    if (!ownerId || String(ownerId) === String(call.human_owner_id || "")) {
+      return false;
+    }
+    await pool.query(
+      `UPDATE ai_calls SET human_owner_id = $2, updated_at = NOW()
+       WHERE call_id = $1`,
+      [call.call_id, String(ownerId)]
+    );
+    return true;
+  }
+
+  return false;
+}
+async function processMondayInboundEvent(event) {
+  if (!event || String(event.boardId) !== String(MONDAY_BOARD_ID)) return;
+
+  const itemId = event.pulseId || event.itemId;
+  if (!itemId) return;
+
+  const call = await getCallByMondayItemId(itemId);
+  if (!call) return;
+
+  const changed = event.columnId
+    ? await applyMondayColumnControl(call, event)
+    : await applyMondayGroupControl(call, event);
+
+  if (!changed) return;
+
+  await appendAction(call.call_id, {
+    action: "monday_manual_control",
+    success: true,
+    column_title: cleanText(event.columnTitle, 150),
+    group_name: cleanText(event.groupName, 150),
+    changed_at: event.changedAt || event.triggerTime || null,
+    monday_user_id: event.userId || null
+  });
+
+  queueMondaySync(call.call_id, "monday_manual_control");
 }
 
 async function updateCallStatus(callId, status, extra = {}) {
@@ -2047,29 +2707,23 @@ function parseClock(value) {
 
 function validCallingDay(parts) {
   const day = localDayOfWeek(parts);
-
-  return (
-    day !== 0 ||
-    DOUG_CONFIG.operatingWindow.sundayEnabled
-  );
+  return day !== 0 || DOUG_CONFIG.operatingWindow.sundayEnabled;
 }
 
 function operatingWindowForParts(parts) {
   const day = localDayOfWeek(parts);
+
   if (day === 0) {
-  if (!DOUG_CONFIG.operatingWindow.sundayEnabled) {
-    return null;
+    if (!DOUG_CONFIG.operatingWindow.sundayEnabled) {
+      return null;
+    }
+
+    return {
+      start: parseClock(DOUG_CONFIG.operatingWindow.weekdayStart),
+      end: parseClock(DOUG_CONFIG.operatingWindow.weekdayEnd)
+    };
   }
 
-  return {
-    start: parseClock(
-      DOUG_CONFIG.operatingWindow.weekdayStart
-    ),
-    end: parseClock(
-      DOUG_CONFIG.operatingWindow.weekdayEnd
-    )
-  };
-}
   if (day === 6) {
     return {
       start: parseClock(DOUG_CONFIG.operatingWindow.saturdayStart),
@@ -2205,6 +2859,33 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
     ? call.transcript.length
     : 0;
   const outcome = String(call.outcome || "").toLowerCase();
+  const callbackAt = call.callback_at ? new Date(call.callback_at) : null;
+  const hasFutureCallback = Boolean(
+    callbackAt &&
+      !Number.isNaN(callbackAt.getTime()) &&
+      callbackAt > new Date()
+  );
+
+  if (
+    call.sequence_status === "callback_scheduled" &&
+    hasFutureCallback
+  ) {
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET
+          sequence_status = 'callback_scheduled',
+          next_attempt_at = $2,
+          completed_at = NULL,
+          updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [callId, callbackAt]
+    );
+
+    queueMondaySync(callId, "cadence_callback_preserved");
+    return;
+  }
 
   if (call.do_not_call || call.wrong_number || call.invalid_number) {
     await pool.query(
@@ -2370,7 +3051,6 @@ async function placeTwilioCall(call, options = {}) {
     `,
     [refreshedCall.call_id, attemptId]
   );
-
   queueMondaySync(refreshedCall.call_id, "attempt_created");
 
   try {
@@ -2446,6 +3126,22 @@ async function placeTwilioCall(call, options = {}) {
   }
 }
 
+function formatCustomerCallbackTime(value, timeZone) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: normalizeTimezone(timeZone),
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short"
+  }).format(date);
+}
+
 async function executeDougTool(call, name, args) {
   const safeArgs = args && typeof args === "object" ? args : {};
 
@@ -2519,6 +3215,7 @@ async function executeDougTool(call, name, args) {
 
     await mergeCallResult(call.call_id, result);
     await appendAction(call.call_id, { action: name, success: true, ...result });
+
     return {
       success: true,
       ...result,
@@ -2535,36 +3232,30 @@ async function executeDougTool(call, name, args) {
     }
 
     const resourceType = cleanText(safeArgs.resource_type, 50);
-    if (!["application", "dti_calculator"].includes(resourceType)) {
+    const resource = DAISY_RESOURCE_LIBRARY[resourceType];
+    if (!resource) {
       return { success: false, error: "Unsupported resource type." };
     }
-
-    const resourceUrl =
-      resourceType === "dti_calculator"
-        ? DTI_CALCULATOR_URL
-        : DPA_APPLICATION_URL;
-    const description =
-      resourceType === "dti_calculator"
-        ? "DPA Help Center DTI calculator"
-        : "DPA Help Center application";
 
     try {
       const message = await twilioClient.messages.create({
         to: call.phone,
         from: TWILIO_FROM_NUMBER,
-        body: `Here is the ${description} Doug mentioned: ${resourceUrl}`
+        body: `Here is the ${resource.description} Daisy mentioned: ${resource.url}`
       });
 
-      const patch =
-        resourceType === "dti_calculator"
-          ? { dti_calculator_sent: true }
-          : { application_link_sent: true };
+      const patch = {
+        [`${resourceType}_sent`]: true,
+        last_resource_sent: resourceType,
+        last_resource_url: resource.url
+      };
 
       await mergeCallResult(call.call_id, patch);
       await appendAction(call.call_id, {
         action: name,
         success: true,
         resource_type: resourceType,
+        resource_url: resource.url,
         message_sid: message.sid
       });
 
@@ -2584,6 +3275,7 @@ async function executeDougTool(call, name, args) {
       return {
         success: true,
         resource_type: resourceType,
+        resource_url: resource.url,
         destination: call.phone.replace(/.(?=.{4})/g, "*"),
         message_sid: message.sid
       };
@@ -2617,6 +3309,16 @@ async function executeDougTool(call, name, args) {
     const timezone = normalizeTimezone(safeArgs.timezone || call.timezone);
     const reason =
       cleanText(safeArgs.reason, 1000) || "Customer requested callback";
+    const primaryConcern = cleanText(safeArgs.primary_concern, 1200);
+    const holdReason = cleanText(safeArgs.hold_reason, 2000);
+    const discussionSummary = cleanText(
+      safeArgs.discussion_summary,
+      4000
+    );
+    const callbackOutcome =
+      primaryConcern || holdReason
+        ? "follow_up_scheduled"
+        : "specialist_callback";
 
     await pool.query(
       `
@@ -2627,17 +3329,30 @@ async function executeDougTool(call, name, args) {
           callback_requested = TRUE,
           next_attempt_at = $2,
           sequence_status = 'callback_scheduled',
+          outcome = $5,
           next_action = $4,
+          summary = COALESCE($6, summary),
           updated_at = NOW()
         WHERE call_id = $1
       `,
-      [call.call_id, callbackAt, timezone, reason]
+      [
+        call.call_id,
+        callbackAt,
+        timezone,
+        reason,
+        callbackOutcome,
+        discussionSummary
+      ]
     );
 
     await mergeCallResult(call.call_id, {
       callback_at: callbackAt.toISOString(),
       callback_timezone: timezone,
       callback_reason: reason,
+      primary_concern: primaryConcern,
+      hold_reason: holdReason,
+      discussion_summary: discussionSummary,
+      follow_up_outcome: callbackOutcome,
       preferred_contact_method:
         cleanText(safeArgs.preferred_contact_method, 30) || "phone"
     });
@@ -2647,7 +3362,52 @@ async function executeDougTool(call, name, args) {
       success: true,
       callback_at: callbackAt.toISOString(),
       timezone,
-      reason
+      reason,
+      primary_concern: primaryConcern,
+      hold_reason: holdReason,
+      outcome: callbackOutcome
+    });
+
+    let confirmationSmsSent = false;
+    let confirmationMessageSid = null;
+    let confirmationSmsError = null;
+
+    if (safeArgs.sms_confirmation_consent === true) {
+      try {
+        const formattedCallback = formatCustomerCallbackTime(
+          callbackAt,
+          timezone
+        );
+        const confirmation = await twilioClient.messages.create({
+          to: call.phone,
+          from: TWILIO_FROM_NUMBER,
+          body: `Your follow-up call with Daisy is scheduled for ${formattedCallback}. Reply STOP to opt out.`
+        });
+        confirmationSmsSent = true;
+        confirmationMessageSid = confirmation.sid;
+      } catch (error) {
+        confirmationSmsError = cleanText(error.message, 1000);
+        console.error(
+          `Callback confirmation SMS failed for ${call.call_id}:`,
+          confirmationSmsError
+        );
+      }
+    }
+
+    await mergeCallResult(call.call_id, {
+      callback_confirmation_sms_sent: confirmationSmsSent,
+      callback_confirmation_message_sid: confirmationMessageSid,
+      callback_confirmation_sms_error: confirmationSmsError
+    });
+
+    await appendAction(call.call_id, {
+      action: "callback_confirmation_sms",
+      success:
+        confirmationSmsSent || safeArgs.sms_confirmation_consent !== true,
+      skipped: safeArgs.sms_confirmation_consent !== true,
+      consent_confirmed: safeArgs.sms_confirmation_consent === true,
+      message_sid: confirmationMessageSid,
+      error: confirmationSmsError
     });
 
     queueMondaySync(call.call_id, "callback_scheduled");
@@ -2656,7 +3416,9 @@ async function executeDougTool(call, name, args) {
       success: true,
       callback_at: callbackAt.toISOString(),
       timezone,
-      sequence_status: "callback_scheduled"
+      outcome: callbackOutcome,
+      sequence_status: "callback_scheduled",
+      confirmation_sms_sent: confirmationSmsSent
     };
   }
 
@@ -2850,7 +3612,6 @@ async function executeDougTool(call, name, args) {
         wrongNumber || invalidNumber || doNotCall || notInterested
     };
   }
-
   if (name === "complete_call") {
     const outcome = cleanText(safeArgs.outcome, 80) || "disconnected";
     const nextAction = cleanText(safeArgs.next_action, 2000);
@@ -2859,16 +3620,51 @@ async function executeDougTool(call, name, args) {
     const pauseSequence = safeArgs.pause_sequence === true;
     const requestedNext = cleanText(safeArgs.requested_next_call_at, 100);
 
+    const hardTerminalOutcome = [
+      "qualified",
+      "hot_transfer",
+      "specialist_handoff",
+      "application_link_sent",
+      "dti_calculator_sent",
+      "not_interested",
+      "wrong_number",
+      "opt_out"
+    ].includes(outcome);
+
+    let callbackAt = call.callback_at ? new Date(call.callback_at) : null;
+    if (callbackAt && Number.isNaN(callbackAt.getTime())) {
+      callbackAt = null;
+    }
+
     let nextAttemptAt = null;
     let sequenceStatus = stopSequence ? "completed" : "waiting_retry";
-    if (pauseSequence) sequenceStatus = "paused";
+
+    if (pauseSequence) {
+      sequenceStatus = "paused";
+    }
 
     if (requestedNext) {
       const parsed = new Date(requestedNext);
       if (!Number.isNaN(parsed.getTime()) && parsed > new Date()) {
         nextAttemptAt = parsed;
-        sequenceStatus = "scheduled";
+        callbackAt = parsed;
+        sequenceStatus = [
+          "follow_up_scheduled",
+          "specialist_callback",
+          "nurture"
+        ].includes(outcome)
+          ? "callback_scheduled"
+          : "scheduled";
       }
+    }
+
+    const hasFutureCallback = Boolean(
+      callbackAt && callbackAt > new Date()
+    );
+
+    if (hasFutureCallback && !hardTerminalOutcome) {
+      nextAttemptAt = callbackAt;
+      sequenceStatus = "callback_scheduled";
     }
 
     await pool.query(
@@ -2880,6 +3676,16 @@ async function executeDougTool(call, name, args) {
           summary = $4,
           sequence_status = $5,
           next_attempt_at = $6,
+          callback_at = CASE
+            WHEN $8::BOOLEAN THEN NULL
+            WHEN $7::TIMESTAMPTZ IS NOT NULL THEN $7::TIMESTAMPTZ
+            ELSE callback_at
+          END,
+          callback_requested = CASE
+            WHEN $8::BOOLEAN THEN FALSE
+            WHEN $5 = 'callback_scheduled' THEN TRUE
+            ELSE callback_requested
+          END,
           updated_at = NOW()
         WHERE call_id = $1
       `,
@@ -2889,7 +3695,9 @@ async function executeDougTool(call, name, args) {
         nextAction,
         summary,
         sequenceStatus,
-        nextAttemptAt
+        nextAttemptAt,
+        callbackAt,
+        hardTerminalOutcome
       ]
     );
 
@@ -2908,8 +3716,10 @@ async function executeDougTool(call, name, args) {
       final_outcome: outcome,
       next_action: nextAction,
       summary,
-      stop_sequence: stopSequence,
-      pause_sequence: pauseSequence,
+      stop_sequence_requested: stopSequence,
+      pause_sequence_requested: pauseSequence,
+      actual_sequence_status: sequenceStatus,
+      callback_preserved: sequenceStatus === "callback_scheduled",
       requested_next_call_at: nextAttemptAt
         ? nextAttemptAt.toISOString()
         : null
@@ -2919,8 +3729,9 @@ async function executeDougTool(call, name, args) {
       action: name,
       success: true,
       outcome,
-      stop_sequence: stopSequence,
-      pause_sequence: pauseSequence,
+      stop_sequence_requested: stopSequence,
+      pause_sequence_requested: pauseSequence,
+      actual_sequence_status: sequenceStatus,
       next_attempt_at: nextAttemptAt ? nextAttemptAt.toISOString() : null
     });
 
@@ -2930,6 +3741,7 @@ async function executeDougTool(call, name, args) {
       success: true,
       outcome,
       sequence_status: sequenceStatus,
+      callback_preserved: sequenceStatus === "callback_scheduled",
       next_attempt_at: nextAttemptAt ? nextAttemptAt.toISOString() : null
     };
   }
@@ -2941,7 +3753,7 @@ app.get("/", (req, res) => {
   res.json({
     message: "HELUX AI Workforce is online.",
     version: DOUG_CONFIG.agentVersion,
-    worker: "DPA outbound caller",
+    worker: "Daisy — Doug's DPA assistant",
     realtime_model: OPENAI_REALTIME_MODEL,
     voice: OPENAI_VOICE,
     cadence: DOUG_CONFIG.cadenceVersion,
@@ -2973,7 +3785,8 @@ app.get("/health", async (req, res) => {
         board_id: MONDAY_BOARD_ID,
         subitem_board_id: MONDAY_SUBITEM_BOARD_ID,
         api_version: MONDAY_API_VERSION,
-        metadata_cached: Boolean(mondayMetadataCache)
+        metadata_cached: Boolean(mondayMetadataCache),
+        inbound_sync_enabled: MONDAY_INBOUND_SYNC_ENABLED
       }
     });
   } catch (error) {
@@ -3024,6 +3837,42 @@ app.get(
             type: column.type
           }))
         }
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post("/api/v1/monday/webhook", (req, res) => {
+  if (String(req.query.secret || "") !== MONDAY_WEBHOOK_SECRET) {
+    return res.status(401).json({ success: false, error: "Unauthorized." });
+  }
+
+  if (req.body && req.body.challenge) {
+    return res.status(200).json({ challenge: req.body.challenge });
+  }
+
+  const event = req.body?.event || null;
+  res.status(200).json({ success: true });
+
+  if (MONDAY_INBOUND_SYNC_ENABLED && event) {
+    void processMondayInboundEvent(event).catch((error) => {
+      console.error("monday.com inbound event failed:", error);
+    });
+  }
+});
+
+app.post(
+  "/api/v1/monday/register-webhooks",
+  authenticateHelux,
+  async (req, res, next) => {
+    try {
+      const webhookIds = await ensureMondayInboundWebhooks();
+      res.json({
+        success: true,
+        inbound_sync_enabled: MONDAY_INBOUND_SYNC_ENABLED,
+        webhook_ids: webhookIds
       });
     } catch (error) {
       next(error);
@@ -3402,7 +4251,6 @@ app.post("/api/v1/twilio/status", async (req, res, next) => {
     next(error);
   }
 });
-
 mediaServer.on("connection", (twilioSocket) => {
   let openaiSocket = null;
   let call = null;
@@ -3484,7 +4332,7 @@ mediaServer.on("connection", (twilioSocket) => {
       const refreshed = await getCallById(call.call_id);
       output = await executeDougTool(refreshed || call, name, args);
     } catch (error) {
-      console.error(`Doug tool ${name} failed for ${call.call_id}:`, error);
+      console.error(`Daisy tool ${name} failed for ${call.call_id}:`, error);
       output = {
         success: false,
         error: "The action could not be completed. Use a safe fallback."
@@ -3958,6 +4806,11 @@ async function start() {
       console.log(
         `monday.com sync: ${MONDAY_SYNC_ENABLED ? "enabled" : "disabled"}`
       );
+      console.log(
+        `monday.com inbound controls: ${
+          MONDAY_INBOUND_SYNC_ENABLED ? "enabled" : "disabled"
+        }`
+      );
       if (MONDAY_SYNC_REQUESTED && !MONDAY_SYNC_ENABLED) {
         console.warn(
           "monday.com sync was requested but MONDAY_API_TOKEN, MONDAY_BOARD_ID, or MONDAY_SUBITEM_BOARD_ID is missing. The caller remains online."
@@ -3974,10 +4827,24 @@ async function start() {
 
     if (MONDAY_SYNC_ENABLED) {
       void loadMondayMetadata({ force: true })
-        .then((metadata) => {
+        .then(async (metadata) => {
           console.log(
             `monday.com connected: ${metadata.main.name} (${metadata.main.id})`
           );
+
+          if (MONDAY_INBOUND_SYNC_ENABLED) {
+            try {
+              const webhookIds = await ensureMondayInboundWebhooks();
+              console.log(
+                `monday.com inbound controls connected: ${webhookIds.join(", ")}`
+              );
+            } catch (error) {
+              console.error(
+                "monday.com inbound controls could not be registered. Outbound sync and calling remain online:",
+                error.message
+              );
+            }
+          }
         })
         .catch((error) => {
           console.error(
