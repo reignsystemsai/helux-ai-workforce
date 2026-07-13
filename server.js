@@ -176,11 +176,12 @@ const DOUG_CONFIG = Object.freeze({
   maxVoicemails: 2,
   minimumGapMinutes: 180,
   operatingWindow: {
-    weekdayStart: "09:00",
+    alwaysOpen: true,
+    weekdayStart: "00:00",
     weekdayEnd: "23:59",
-    saturdayStart: "09:00",
+    saturdayStart: "00:00",
     saturdayEnd: "23:59",
-    sundayStart: "09:00",
+    sundayStart: "00:00",
     sundayEnd: "23:59",
     sundayEnabled: true
   },
@@ -1013,6 +1014,9 @@ async function initializeDatabase() {
     ["monday_subitem_id", "VARCHAR(100)"],
     ["monday_last_sync_at", "TIMESTAMPTZ"],
     ["monday_last_error", "TEXT"],
+    ["attempt_type", "VARCHAR(50) NOT NULL DEFAULT 'cadence'"],
+    ["idempotency_key", "VARCHAR(255)"],
+    ["cancellation_reason", "TEXT"],
     ["created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"],
     ["updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"]
   ];
@@ -1023,6 +1027,22 @@ async function initializeDatabase() {
       `ALTER TABLE call_attempts ADD COLUMN IF NOT EXISTS ${columnName} ${definition}`
     );
   }
+
+  await runMigrationStep(
+    "classify legacy explicit attempts",
+    `UPDATE call_attempts ca
+     SET attempt_type = CASE
+       WHEN ac.payload->>'call_type' = 'dpa_agent_notification' THEN 'specialist_notification'
+       WHEN ac.current_state IN ('reconnect_pending', 'reconnect_in_progress') THEN 'disconnect_reconnect'
+       WHEN ac.current_state = 'application_checkpoint' THEN 'application_checkpoint'
+       WHEN ac.callback_requested AND ca.scheduled_at = ac.callback_at THEN 'customer_callback'
+       ELSE ca.attempt_type
+     END
+     FROM ai_calls ac
+     WHERE ac.call_id = ca.call_id AND ca.attempt_type = 'cadence'
+       AND ca.completed_at IS NULL
+       AND ca.technical_status IN ('pending', 'scheduled', 'created')`
+  );
 
   await runMigrationStep(
     "create integration_state",
@@ -1089,6 +1109,10 @@ async function initializeDatabase() {
       "CREATE INDEX IF NOT EXISTS idx_call_attempts_monday_subitem ON call_attempts(monday_subitem_id)"
     ],
     [
+      "idx_call_attempts_idempotency_key",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_call_attempts_idempotency_key ON call_attempts(idempotency_key) WHERE idempotency_key IS NOT NULL"
+    ],
+    [
       "idx_sms_deliveries_call_id",
       "CREATE INDEX IF NOT EXISTS idx_sms_deliveries_call_id ON sms_deliveries(call_id, message_type)"
     ]
@@ -1097,6 +1121,16 @@ async function initializeDatabase() {
   for (const [name, sql] of indexSteps) {
     await runMigrationStep(name, sql, { optional: true });
   }
+
+  await cleanupPreResultDuplicateAttempts();
+  await runMigrationStep(
+    "idx_call_attempts_one_pending_cadence",
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_call_attempts_one_pending_cadence
+     ON call_attempts(call_id)
+     WHERE attempt_type = 'cadence'
+       AND technical_status IN ('pending', 'scheduled', 'created')
+       AND completed_at IS NULL`
+  );
 
   console.log("HELUX AI Workforce database initialized.");
 }
@@ -1123,6 +1157,242 @@ async function getAttemptById(attemptId) {
     [attemptId]
   );
   return result.rows[0] || null;
+}
+
+function pendingAttemptStatus(status) {
+  return ["pending", "scheduled", "created"].includes(
+    String(status || "").toLowerCase()
+  );
+}
+
+function attemptTypeForCall(call, requestedType = null) {
+  if (requestedType) return requestedType;
+  if (call.payload?.call_type === "dpa_agent_notification") {
+    return "specialist_notification";
+  }
+  if (call.current_state === "application_checkpoint") {
+    return "application_checkpoint";
+  }
+  if (["reconnect_pending", "reconnect_in_progress"].includes(call.current_state)) {
+    return "disconnect_reconnect";
+  }
+  if (call.callback_requested || call.sequence_status === "callback_scheduled") {
+    return "customer_callback";
+  }
+  return "cadence";
+}
+
+async function ensurePendingAttempt(callId, options = {}) {
+  const client = options.client || pool;
+  const callResult = await client.query(
+    "SELECT * FROM ai_calls WHERE call_id = $1 LIMIT 1",
+    [callId]
+  );
+  const call = callResult.rows[0];
+  if (!call) throw new Error("Call sequence not found.");
+
+  const attemptType = attemptTypeForCall(call, options.attemptType);
+  const scheduledAt = options.scheduledAt || call.next_attempt_at || new Date();
+  const attemptNumber = Number(call.attempts || 0) + 1;
+  const idempotencyKey =
+    options.idempotencyKey || `${attemptType}:${call.call_id}:${attemptNumber}`;
+  const attemptId = createPublicId("ATTEMPT");
+  const inserted = await client.query(
+    `
+      INSERT INTO call_attempts (
+        attempt_id, call_id, attempt_number, call_leg, scheduled_at,
+        technical_status, attempt_type, idempotency_key
+      )
+      VALUES ($1, $2, $3, 1, $4, 'pending', $5, $6)
+      ON CONFLICT DO NOTHING
+      RETURNING *
+    `,
+    [attemptId, call.call_id, attemptNumber, scheduledAt, attemptType, idempotencyKey]
+  );
+
+  if (inserted.rows[0]) return inserted.rows[0];
+  const existing = await client.query(
+    `
+      SELECT * FROM call_attempts
+      WHERE call_id = $1 AND completed_at IS NULL
+        AND technical_status IN ('pending', 'scheduled', 'created')
+        AND (idempotency_key = $2 OR ($3 = 'cadence' AND attempt_type = 'cadence'))
+      ORDER BY scheduled_at ASC NULLS FIRST, id ASC
+      LIMIT 1
+    `,
+    [call.call_id, idempotencyKey, attemptType]
+  );
+  return existing.rows[0] || null;
+}
+
+async function sequenceHasUnresolvedWork(callId, client = pool) {
+  const result = await client.query(
+    `
+      SELECT EXISTS (
+        SELECT 1 FROM ai_calls
+        WHERE call_id = $1 AND (
+          sequence_status = 'human_action'
+          OR next_attempt_at IS NOT NULL
+          OR (callback_requested AND callback_at > NOW())
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM call_attempts
+        WHERE call_id = $1 AND completed_at IS NULL
+          AND technical_status NOT IN ('completed', 'busy', 'failed', 'no-answer', 'canceled')
+      ) OR EXISTS (
+        SELECT 1 FROM sms_deliveries
+        WHERE call_id = $1 AND LOWER(status) IN ('accepted', 'queued', 'sending')
+      ) AS unresolved
+    `,
+    [callId]
+  );
+  return Boolean(result.rows[0]?.unresolved);
+}
+
+async function reconcileScheduledAttempts() {
+  const scheduled = await pool.query(
+    `SELECT * FROM ai_calls
+     WHERE sequence_status IN ('ready', 'active', 'scheduled', 'waiting_retry', 'callback_scheduled')
+       AND next_attempt_at IS NOT NULL
+       AND do_not_call = FALSE AND wrong_number = FALSE AND invalid_number = FALSE`
+  );
+  for (const call of scheduled.rows) {
+    const attemptType = attemptTypeForCall(call);
+    if (attemptType !== "cadence") {
+      const cancelled = await pool.query(
+        `UPDATE call_attempts SET technical_status = 'canceled', completed_at = NOW(),
+         cancellation_reason = 'ordinary_cadence_paused_for_explicit_action', updated_at = NOW()
+         WHERE call_id = $1 AND attempt_type = 'cadence' AND completed_at IS NULL
+           AND technical_status IN ('pending', 'scheduled', 'created')
+         RETURNING *`,
+        [call.call_id]
+      );
+      for (const attempt of cancelled.rows) {
+        logSchedulingDecision(
+          call,
+          attempt,
+          "cancel",
+          "ordinary_cadence_paused_for_explicit_action"
+        );
+      }
+    }
+    await ensurePendingAttempt(call.call_id, {
+      attemptType,
+      scheduledAt: call.next_attempt_at,
+      idempotencyKey:
+        attemptType === "cadence"
+          ? `cadence:${call.call_id}:${Number(call.attempts || 0) + 1}`
+          : `${attemptType}:${call.call_id}:${new Date(call.next_attempt_at).toISOString()}`
+    });
+  }
+}
+
+async function cleanupPreResultDuplicateAttempts() {
+  const cancelled = await pool.query(
+    `
+      WITH ranked AS (
+        SELECT ca.id,
+          ROW_NUMBER() OVER (
+            PARTITION BY ca.call_id
+            ORDER BY ca.scheduled_at ASC NULLS FIRST, ca.id ASC
+          ) AS pending_rank
+        FROM call_attempts ca
+        WHERE ca.attempt_type = 'cadence'
+          AND ca.completed_at IS NULL
+          AND ca.dialed_at IS NULL
+          AND ca.technical_status IN ('pending', 'scheduled', 'created')
+          AND NOT EXISTS (
+            SELECT 1 FROM call_attempts result_attempt
+            WHERE result_attempt.call_id = ca.call_id
+              AND (
+                result_attempt.completed_at IS NOT NULL
+                OR result_attempt.dialed_at IS NOT NULL
+                OR result_attempt.business_outcome IS NOT NULL
+              )
+          )
+      )
+      UPDATE call_attempts ca
+      SET technical_status = 'canceled', completed_at = NOW(),
+          cancellation_reason = 'pre_result_duplicate_cadence_cleanup',
+          updated_at = NOW()
+      FROM ranked
+      WHERE ca.id = ranked.id AND ranked.pending_rank > 1
+      RETURNING ca.call_id, ca.attempt_id, ca.attempt_type,
+                ca.scheduled_at, ca.technical_status
+    `
+  );
+
+  const remainingDuplicates = await pool.query(
+    `
+      WITH ranked AS (
+        SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY call_id ORDER BY scheduled_at ASC NULLS FIRST, id ASC
+        ) AS pending_rank
+        FROM call_attempts
+        WHERE attempt_type = 'cadence' AND completed_at IS NULL
+          AND technical_status IN ('pending', 'scheduled', 'created')
+      )
+      UPDATE call_attempts ca
+      SET technical_status = 'canceled', completed_at = NOW(),
+          cancellation_reason = 'concurrent_duplicate_cadence_cleanup',
+          updated_at = NOW()
+      FROM ranked
+      WHERE ca.id = ranked.id AND ranked.pending_rank > 1
+      RETURNING ca.call_id, ca.attempt_id, ca.attempt_type,
+                ca.scheduled_at, ca.technical_status
+    `
+  );
+
+  const due = await pool.query(
+    `
+      WITH earliest AS (
+        SELECT DISTINCT ON (call_id) call_id, attempt_id
+        FROM call_attempts
+        WHERE attempt_type = 'cadence' AND completed_at IS NULL
+          AND technical_status IN ('pending', 'scheduled', 'created')
+        ORDER BY call_id, scheduled_at ASC NULLS FIRST, id ASC
+      ), made_due AS (
+        UPDATE call_attempts ca
+        SET scheduled_at = NOW(), updated_at = NOW()
+        FROM earliest
+        WHERE ca.attempt_id = earliest.attempt_id AND ca.scheduled_at < NOW()
+        RETURNING ca.call_id, ca.scheduled_at
+      )
+      UPDATE ai_calls ac
+      SET next_attempt_at = made_due.scheduled_at,
+          sequence_status = CASE WHEN ac.sequence_status = 'completed' THEN 'scheduled' ELSE ac.sequence_status END,
+          completed_at = NULL, updated_at = NOW()
+      FROM made_due
+      WHERE ac.call_id = made_due.call_id
+      RETURNING ac.call_id
+    `
+  );
+  for (const attempt of cancelled.rows) {
+    const call = await getCallById(attempt.call_id);
+    logSchedulingDecision(
+      call,
+      attempt,
+      "cancel",
+      "pre_result_duplicate_cadence_cleanup"
+    );
+  }
+  for (const attempt of remainingDuplicates.rows) {
+    const call = await getCallById(attempt.call_id);
+    logSchedulingDecision(
+      call,
+      attempt,
+      "cancel",
+      "concurrent_duplicate_cadence_cleanup"
+    );
+  }
+
+  console.log(JSON.stringify({
+    event: "scheduler_cleanup",
+    decision: "cancel",
+    reason: "pre_result_duplicate_cadence_cleanup",
+    cancelled_attempts: cancelled.rowCount + remainingDuplicates.rowCount,
+    overdue_attempts_made_due: due.rowCount
+  }));
 }
 
 async function getCallByMondayItemId(itemId) {
@@ -2427,8 +2697,16 @@ async function createDpaAgentNotification(itemId, statusLabel) {
     ]
   );
   const notificationCall = inserted.rows[0];
+  const notificationAttempt = await ensurePendingAttempt(notificationCall.call_id, {
+    attemptType: "specialist_notification",
+    scheduledAt: new Date(),
+    idempotencyKey: `specialist_notification:${notificationCall.call_id}:1`
+  });
   if (insideOperatingWindow(new Date(), notificationCall.timezone)) {
-    await placeTwilioCall(notificationCall, { force: true });
+    await placeTwilioCall(notificationCall, {
+      force: true,
+      attemptId: notificationAttempt.attempt_id
+    });
   } else {
     const nextAttemptAt = nextValidWindow(
       notificationCall.timezone,
@@ -2617,6 +2895,7 @@ async function applyMondayGroupControl(call, event) {
   }
 
   if (normalized === "completed") {
+    if (await sequenceHasUnresolvedWork(call.call_id)) return false;
     await pool.query(
       `
         UPDATE ai_calls
@@ -2821,6 +3100,7 @@ async function applyMondayColumnControl(call, event) {
     }
 
     if (label === "completed") {
+      if (await sequenceHasUnresolvedWork(call.call_id)) return false;
       await pool.query(
         `UPDATE ai_calls SET sequence_status = 'completed',
          next_attempt_at = NULL, updated_at = NOW() WHERE call_id = $1`,
@@ -3199,6 +3479,7 @@ function minutesOfDay(parts) {
 }
 
 function insideOperatingWindow(date, timeZone) {
+  if (DOUG_CONFIG.operatingWindow.alwaysOpen) return true;
   const parts = zonedParts(date, timeZone);
   const window = operatingWindowForParts(parts);
   if (!window) return false;
@@ -3223,6 +3504,7 @@ function nextValidWindow(timeZone, afterDate, preferredClock, minimumGapMinutes)
   const minimumDate = new Date(
     afterDate.getTime() + Math.max(0, minimumGapMinutes || 0) * 60000
   );
+  if (DOUG_CONFIG.operatingWindow.alwaysOpen) return minimumDate;
   const base = zonedParts(afterDate, timeZone);
 
   for (let dayOffset = 0; dayOffset < 21; dayOffset += 1) {
@@ -3238,75 +3520,19 @@ function nextValidWindow(timeZone, afterDate, preferredClock, minimumGapMinutes)
 }
 
 function calculateNextAttemptAt(call) {
-  const timeZone = call.timezone || DEFAULT_TIMEZONE;
   const now = new Date();
   const attempt = Number(call.attempts || 0);
-  const localNow = zonedParts(now, timeZone);
-
-  if (attempt <= 1) {
-    if (localNow.hour < 13) {
-      const sameDayAfternoon = zonedDateTimeToUtc(
-        candidateLocalDate(
-          localNow,
-          0,
-          DOUG_CONFIG.preferredWindows.lateAfternoon
-        ),
-        timeZone
-      );
-
-      if (
-        sameDayAfternoon.getTime() - now.getTime() >=
-          DOUG_CONFIG.minimumGapMinutes * 60000 &&
-        insideOperatingWindow(sameDayAfternoon, timeZone)
-      ) {
-        return sameDayAfternoon;
-      }
-    }
-
-    return nextValidWindow(
-      timeZone,
-      now,
-      DOUG_CONFIG.preferredWindows.morning,
-      DOUG_CONFIG.minimumGapMinutes
-    );
-  }
-
-  if (attempt === 2) {
-    const lastWasAfternoon = localNow.hour >= 14;
-    return nextValidWindow(
-      timeZone,
-      new Date(now.getTime() + 12 * 60 * 60 * 1000),
-      lastWasAfternoon
-        ? DOUG_CONFIG.preferredWindows.morning
-        : DOUG_CONFIG.preferredWindows.lateAfternoon,
-      0
-    );
-  }
-
-  if (attempt === 3) {
-    return nextValidWindow(
-      timeZone,
-      new Date(now.getTime() + 36 * 60 * 60 * 1000),
-      DOUG_CONFIG.preferredWindows.lateAfternoon,
-      0
-    );
-  }
-
-  if (attempt === 4) {
-    return nextValidWindow(
-      timeZone,
-      new Date(now.getTime() + 60 * 60 * 60 * 1000),
-      DOUG_CONFIG.preferredWindows.morning,
-      0
-    );
-  }
-
-  return nextValidWindow(
-    timeZone,
-    new Date(now.getTime() + 72 * 60 * 60 * 1000),
-    DOUG_CONFIG.preferredWindows.lateAfternoon,
-    0
-  );
+  const delayHours =
+    attempt <= 1
+      ? 3
+      : attempt === 2
+        ? 12
+        : attempt === 3
+          ? 36
+          : attempt === 4
+            ? 60
+            : 72;
+  return new Date(now.getTime() + delayHours * 60 * 60 * 1000);
 }
 
 async function scheduleUnexpectedReconnect(callId) {
@@ -3357,6 +3583,11 @@ async function scheduleUnexpectedReconnect(callId) {
     ]
   );
   if (!updated.rowCount) return false;
+  await ensurePendingAttempt(callId, {
+    attemptType: "disconnect_reconnect",
+    scheduledAt: reconnectAt,
+    idempotencyKey: `disconnect_reconnect:${callId}:${reconnectAt.toISOString()}`
+  });
   await appendAction(callId, {
     action: "unexpected_disconnect_reconnect_scheduled",
     success: true,
@@ -3457,6 +3688,18 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
   }
 
   if (stopOutcome(outcome)) {
+    if (await sequenceHasUnresolvedWork(callId)) {
+      await pool.query(
+        `UPDATE ai_calls SET sequence_status = CASE
+           WHEN callback_requested THEN 'callback_scheduled'
+           WHEN sequence_status = 'human_action' THEN 'human_action'
+           ELSE 'scheduled' END,
+         completed_at = NULL, updated_at = NOW() WHERE call_id = $1`,
+        [callId]
+      );
+      queueMondaySync(callId, "cadence_completion_blocked_unresolved_work");
+      return;
+    }
     await pool.query(
       `
         UPDATE ai_calls
@@ -3521,6 +3764,12 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
     [callId, nextAttemptAt]
   );
 
+  await ensurePendingAttempt(callId, {
+    attemptType: "cadence",
+    scheduledAt: nextAttemptAt,
+    idempotencyKey: `cadence:${callId}:${Number(call.attempts || 0) + 1}`
+  });
+
   if (call.last_attempt_id) {
     await pool.query(
       `
@@ -3536,7 +3785,7 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
 }
 
 async function placeTwilioCall(call, options = {}) {
-  const refreshedCall = await getCallById(call.call_id);
+  let refreshedCall = await getCallById(call.call_id);
   if (!refreshedCall) throw new Error("Call sequence not found.");
 
   if (
@@ -3556,71 +3805,93 @@ async function placeTwilioCall(call, options = {}) {
   }
 
   if (
+    attemptTypeForCall(refreshedCall, options.attemptType) === "cadence" &&
     Number(refreshedCall.attempts || 0) >=
     Number(refreshedCall.max_attempts || DOUG_CONFIG.maxAttempts)
   ) {
     throw new HttpError(409, "Maximum call attempts have been reached.");
   }
 
+  let pendingAttempt = options.attemptId
+    ? await getAttemptById(options.attemptId)
+    : await ensurePendingAttempt(refreshedCall.call_id, {
+        attemptType: options.attemptType,
+        scheduledAt: refreshedCall.next_attempt_at || new Date()
+      });
+  if (!pendingAttempt) throw new HttpError(409, "No pending attempt is available.");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const lockedCallResult = await client.query(
+      "SELECT * FROM ai_calls WHERE call_id = $1 FOR UPDATE",
+      [refreshedCall.call_id]
+    );
+    const lockedAttemptResult = await client.query(
+      "SELECT * FROM call_attempts WHERE attempt_id = $1 FOR UPDATE",
+      [pendingAttempt.attempt_id]
+    );
+    refreshedCall = lockedCallResult.rows[0];
+    pendingAttempt = lockedAttemptResult.rows[0];
+    if (!refreshedCall || !pendingAttempt || !pendingAttemptStatus(pendingAttempt.technical_status)) {
+      throw new HttpError(409, "Pending attempt was already claimed.");
+    }
+    if (
+      refreshedCall.sequence_status === "calling" &&
+      refreshedCall.last_attempt_id !== pendingAttempt.attempt_id
+    ) {
+      throw new HttpError(409, "Another attempt is already dialing.");
+    }
+
+    if (refreshedCall.current_state === "reconnect_pending") {
+      await client.query(
+        `UPDATE ai_calls SET current_state = 'reconnect_in_progress',
+         result = result || $2::jsonb, updated_at = NOW() WHERE call_id = $1`,
+        [
+          refreshedCall.call_id,
+          JSON.stringify({ unexpected_disconnect_reconnect_attempted: true })
+        ]
+      );
+    }
+    await client.query(
+      `UPDATE call_attempts SET technical_status = 'placing',
+       dialed_at = NOW(), scheduled_at = COALESCE(scheduled_at, NOW()),
+       updated_at = NOW() WHERE attempt_id = $1`,
+      [pendingAttempt.attempt_id]
+    );
+    await client.query(
+      `UPDATE ai_calls SET status = 'placing', sequence_status = 'calling',
+       attempts = attempts + 1, last_attempt_id = $2, last_attempt_at = NOW(),
+       next_attempt_at = NULL, last_error = NULL, completed_at = NULL,
+       callback_requested = CASE WHEN $3::BOOLEAN THEN FALSE ELSE callback_requested END,
+       callback_at = CASE WHEN $3::BOOLEAN THEN NULL ELSE callback_at END,
+       updated_at = NOW() WHERE call_id = $1`,
+      [
+        refreshedCall.call_id,
+        pendingAttempt.attempt_id,
+        [
+          "customer_callback",
+          "application_checkpoint",
+          "disconnect_reconnect"
+        ].includes(pendingAttempt.attempt_type)
+      ]
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  const attemptId = pendingAttempt.attempt_id;
+  const attemptNumber = Number(pendingAttempt.attempt_number);
   const voiceUrl = new URL(`${PUBLIC_BASE_URL}/api/v1/twilio/voice`);
   voiceUrl.searchParams.set("call_id", refreshedCall.call_id);
   voiceUrl.searchParams.set("token", refreshedCall.stream_token);
-
   const statusUrl = new URL(`${PUBLIC_BASE_URL}/api/v1/twilio/status`);
   statusUrl.searchParams.set("call_id", refreshedCall.call_id);
   statusUrl.searchParams.set("token", refreshedCall.stream_token);
-
-  const attemptNumber = Number(refreshedCall.attempts || 0) + 1;
-  const attemptId = createPublicId("ATTEMPT");
-
-  if (refreshedCall.current_state === "reconnect_pending") {
-    await pool.query(
-      `
-        UPDATE ai_calls
-        SET current_state = 'reconnect_in_progress',
-            result = result || $2::jsonb, updated_at = NOW()
-        WHERE call_id = $1
-      `,
-      [
-        refreshedCall.call_id,
-        JSON.stringify({ unexpected_disconnect_reconnect_attempted: true })
-      ]
-    );
-  }
-
-  await pool.query(
-    `
-      INSERT INTO call_attempts (
-        attempt_id, call_id, attempt_number, call_leg,
-        scheduled_at, dialed_at, technical_status
-      )
-      VALUES ($1, $2, $3, 1, COALESCE($4, NOW()), NOW(), 'placing')
-    `,
-    [
-      attemptId,
-      refreshedCall.call_id,
-      attemptNumber,
-      refreshedCall.next_attempt_at
-    ]
-  );
-
-  await pool.query(
-    `
-      UPDATE ai_calls
-      SET
-        status = 'placing',
-        sequence_status = 'calling',
-        attempts = attempts + 1,
-        last_attempt_id = $2,
-        last_attempt_at = NOW(),
-        next_attempt_at = NULL,
-        last_error = NULL,
-        completed_at = NULL,
-        updated_at = NOW()
-      WHERE call_id = $1
-    `,
-    [refreshedCall.call_id, attemptId]
-  );
   queueMondaySync(refreshedCall.call_id, "attempt_created");
 
   try {
@@ -3657,8 +3928,10 @@ async function placeTwilioCall(call, options = {}) {
       `
         UPDATE call_attempts
         SET
-          technical_status = 'failed',
-          completed_at = NOW(),
+          technical_status = 'pending',
+          scheduled_at = NOW() + INTERVAL '15 minutes',
+          dialed_at = NULL,
+          completed_at = NULL,
           last_error = $2,
           updated_at = NOW()
         WHERE attempt_id = $1
@@ -4053,6 +4326,24 @@ async function executeDougTool(call, name, args) {
       );
     }
 
+    const callbackAttemptType = isApplicationCheckpoint
+      ? "application_checkpoint"
+      : "customer_callback";
+    await pool.query(
+      `UPDATE call_attempts SET technical_status = 'canceled', completed_at = NOW(),
+       cancellation_reason = 'explicit_callback_rescheduled', updated_at = NOW()
+       WHERE call_id = $1 AND attempt_type = $2 AND completed_at IS NULL
+         AND technical_status IN ('pending', 'scheduled', 'created')
+         AND scheduled_at IS DISTINCT FROM $3`,
+      [call.call_id, callbackAttemptType, callbackAt]
+    );
+
+    await ensurePendingAttempt(call.call_id, {
+      attemptType: callbackAttemptType,
+      scheduledAt: callbackAt,
+      idempotencyKey: `${callbackAttemptType}:${call.call_id}:${callbackAt.toISOString()}`
+    });
+
     await appendAction(call.call_id, {
       action: name,
       success: true,
@@ -4202,7 +4493,7 @@ async function executeDougTool(call, name, args) {
           UPDATE ai_calls
           SET
             outcome = 'hot_transfer',
-            sequence_status = 'completed',
+            sequence_status = 'active',
             priority = $2,
             next_action = 'Live specialist transfer',
             next_attempt_at = NULL,
@@ -4266,7 +4557,7 @@ async function executeDougTool(call, name, args) {
           outcome = $5,
           sequence_status = CASE
             WHEN $2 OR $3 OR $4 THEN 'suppressed'
-            ELSE 'completed'
+            ELSE 'active'
           END,
           next_attempt_at = NULL,
           next_action = $6,
@@ -4358,10 +4649,17 @@ async function executeDougTool(call, name, args) {
       callbackAt && callbackAt > new Date()
     );
 
-    if (hasFutureCallback && !hardTerminalOutcome) {
+    if (hasFutureCallback) {
       nextAttemptAt = callbackAt;
       sequenceStatus = "callback_scheduled";
     }
+
+    if (sequenceStatus === "completed" && (await sequenceHasUnresolvedWork(call.call_id))) {
+      sequenceStatus = "active";
+      nextAttemptAt = null;
+    }
+
+    const clearCallback = hardTerminalOutcome && !hasFutureCallback;
 
     await pool.query(
       `
@@ -4393,7 +4691,7 @@ async function executeDougTool(call, name, args) {
         sequenceStatus,
         nextAttemptAt,
         callbackAt,
-        hardTerminalOutcome
+        clearCallback
       ]
     );
 
@@ -4693,27 +4991,26 @@ app.post(
 
       const now = new Date();
       const shouldDialNow = forceCallNow || insideOperatingWindow(now, timezone);
+      const nextAttemptAt = shouldDialNow
+        ? now
+        : nextValidWindow(
+            timezone,
+            now,
+            DOUG_CONFIG.preferredWindows.morning,
+            0
+          );
+      await pool.query(
+        `UPDATE ai_calls SET sequence_status = 'scheduled', next_attempt_at = $2,
+         completed_at = NULL, updated_at = NOW() WHERE call_id = $1`,
+        [call.call_id, nextAttemptAt]
+      );
+      const firstAttempt = await ensurePendingAttempt(call.call_id, {
+        attemptType: "cadence",
+        scheduledAt: nextAttemptAt,
+        idempotencyKey: `cadence:${call.call_id}:1`
+      });
 
       if (!shouldDialNow) {
-        const nextAttemptAt = nextValidWindow(
-          timezone,
-          now,
-          DOUG_CONFIG.preferredWindows.morning,
-          0
-        );
-
-        await pool.query(
-          `
-            UPDATE ai_calls
-            SET
-              sequence_status = 'scheduled',
-              next_attempt_at = $2,
-              updated_at = NOW()
-            WHERE call_id = $1
-          `,
-          [call.call_id, nextAttemptAt]
-        );
-
         queueMondaySync(call.call_id, "sequence_scheduled");
 
         return res.status(202).json({
@@ -4727,7 +5024,10 @@ app.post(
         });
       }
 
-      const twilioCall = await placeTwilioCall(call, { force: forceCallNow });
+      const twilioCall = await placeTwilioCall(call, {
+        force: forceCallNow,
+        attemptId: firstAttempt.attempt_id
+      });
 
       res.status(201).json({
         success: true,
@@ -5530,76 +5830,91 @@ server.on("upgrade", (request, socket, head) => {
   }
 });
 
+function logSchedulingDecision(call, attempt, decision, reason, currentTime = new Date()) {
+  console.log(JSON.stringify({
+    event: "scheduler_decision",
+    sequence_id: call?.call_id || null,
+    attempt_id: attempt?.attempt_id || null,
+    attempt_type: attempt?.attempt_type || null,
+    scheduled_at: attempt?.scheduled_at || call?.next_attempt_at || null,
+    current_time: currentTime.toISOString(),
+    stored_timezone: call?.timezone || null,
+    sequence_status: call?.sequence_status || null,
+    attempt_status: attempt?.technical_status || null,
+    decision,
+    reason
+  }));
+}
+
 async function runScheduler() {
   if (!CALL_SCHEDULER_ENABLED || schedulerRunning) return;
   schedulerRunning = true;
 
   try {
+    await reconcileScheduledAttempts();
     const due = await pool.query(
       `
-        SELECT call_id
-        FROM ai_calls
+        SELECT ca.attempt_id, ca.call_id
+        FROM call_attempts ca
+        JOIN ai_calls ac ON ac.call_id = ca.call_id
         WHERE
-          sequence_status IN (
+          ac.sequence_status IN (
+            'ready',
+            'active',
             'scheduled',
             'waiting_retry',
             'callback_scheduled'
           )
-          AND next_attempt_at IS NOT NULL
-          AND next_attempt_at <= NOW()
-          AND attempts < max_attempts
-          AND do_not_call = FALSE
-          AND wrong_number = FALSE
-          AND invalid_number = FALSE
-        ORDER BY next_attempt_at ASC
+          AND ca.technical_status IN ('pending', 'scheduled', 'created')
+          AND ca.completed_at IS NULL
+          AND ca.scheduled_at IS NOT NULL
+          AND ca.scheduled_at <= NOW()
+          AND (ca.attempt_type <> 'cadence' OR ac.attempts < ac.max_attempts)
+        ORDER BY ca.scheduled_at ASC
         LIMIT 10
       `
     );
 
     for (const row of due.rows) {
-      const claim = await pool.query(
-        `
-          UPDATE ai_calls
-          SET sequence_status = 'calling', updated_at = NOW()
-          WHERE
-            call_id = $1
-            AND sequence_status IN (
-              'scheduled',
-              'waiting_retry',
-              'callback_scheduled'
-            )
-            AND next_attempt_at <= NOW()
-          RETURNING *
-        `,
-        [row.call_id]
-      );
-
-      if (!claim.rows[0]) continue;
-
       try {
-        const call = claim.rows[0];
-        queueMondaySync(call.call_id, "scheduler_claimed");
+        const call = await getCallById(row.call_id);
+        const attempt = await getAttemptById(row.attempt_id);
+        const currentTime = new Date();
+        if (!call || !attempt || !pendingAttemptStatus(attempt.technical_status)) {
+          logSchedulingDecision(call, attempt, "skip", "attempt_missing_or_already_claimed", currentTime);
+          continue;
+        }
 
-        if (!insideOperatingWindow(new Date(), call.timezone || DEFAULT_TIMEZONE)) {
+        if (call.do_not_call || call.wrong_number || call.invalid_number) {
+          logSchedulingDecision(call, attempt, "skip", "contact_suppressed", currentTime);
+          continue;
+        }
+        if (ENFORCE_CALL_CONSENT && call.consent_status !== "confirmed") {
+          logSchedulingDecision(call, attempt, "skip", "consent_not_confirmed", currentTime);
+          continue;
+        }
+
+        if (!insideOperatingWindow(currentTime, call.timezone || DEFAULT_TIMEZONE)) {
           const nextAttemptAt = nextValidWindow(
             call.timezone || DEFAULT_TIMEZONE,
-            new Date(),
+            currentTime,
             DOUG_CONFIG.preferredWindows.morning,
             0
           );
 
           await pool.query(
             `
-              UPDATE ai_calls
-              SET
-                sequence_status = 'scheduled',
-                next_attempt_at = $2,
-                updated_at = NOW()
-              WHERE call_id = $1
+              UPDATE call_attempts SET scheduled_at = $2, updated_at = NOW()
+              WHERE attempt_id = $1 AND technical_status IN ('pending', 'scheduled', 'created')
             `,
+            [attempt.attempt_id, nextAttemptAt]
+          );
+          await pool.query(
+            `UPDATE ai_calls SET sequence_status = 'scheduled', next_attempt_at = $2,
+             updated_at = NOW() WHERE call_id = $1`,
             [call.call_id, nextAttemptAt]
           );
-
+          logSchedulingDecision(call, attempt, "defer", "outside_operating_window", currentTime);
           queueMondaySync(call.call_id, "scheduler_rescheduled_window");
           continue;
         }
@@ -5619,8 +5934,15 @@ async function runScheduler() {
         );
 
         const refreshed = await getCallById(call.call_id);
-        await placeTwilioCall(refreshed);
+        logSchedulingDecision(refreshed, attempt, "dispatch", "due_attempt_dispatched_immediately", currentTime);
+        await placeTwilioCall(refreshed, { attemptId: attempt.attempt_id });
       } catch (error) {
+        if (error instanceof HttpError && error.statusCode === 409) {
+          const call = await getCallById(row.call_id);
+          const attempt = await getAttemptById(row.attempt_id);
+          logSchedulingDecision(call, attempt, "skip", "concurrent_worker_already_claimed");
+          continue;
+        }
         console.error(`Scheduler failed for ${row.call_id}:`, error.message);
 
         await pool.query(
@@ -5634,6 +5956,13 @@ async function runScheduler() {
             WHERE call_id = $1
           `,
           [row.call_id, cleanText(error.message, 4000)]
+        );
+
+        await pool.query(
+          `UPDATE call_attempts SET technical_status = 'pending',
+           scheduled_at = NOW() + INTERVAL '15 minutes', completed_at = NULL,
+           updated_at = NOW() WHERE attempt_id = $1 AND completed_at IS NULL`,
+          [row.attempt_id]
         );
 
         queueMondaySync(row.call_id, "scheduler_failure");
