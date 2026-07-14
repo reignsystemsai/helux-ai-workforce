@@ -5,9 +5,18 @@ const { Pool } = require("pg");
 const twilio = require("twilio");
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
+const { buildAgentInstructions: buildAgentInstructionsV3 } = require("./src/conversation/conversation-controller");
+const { REALTIME_TOOLS } = require("./src/intents/intent-types");
+const { routeIntent } = require("./src/intents/intent-router");
+const { guardAssistantOutput } = require("./src/compliance/compliance-guardrails");
+const { isInterestRateQuestion, interestRateResponse } = require("./src/compliance/interest-rate-policy");
+const { isListeningAcknowledgement } = require("./src/realtime/interruption-manager");
+const { semanticTurnDelay } = require("./src/realtime/turn-manager");
+const { DEFAULTS: REALTIME_DEFAULTS } = require("./src/realtime/latency-manager");
+const { buildRealtimeSession } = require("./src/realtime/openai-session");
 
 /*
- * HELUX AI WORKFORCE — DAISY 2.5.0
+ * HELUX AI WORKFORCE - DAISY 3.0.0
  * Daisy, Doug's assistant: calling, callbacks, resources, and two-way monday.com control.
  * monday.com failures never block or terminate a customer call.
  */
@@ -165,13 +174,13 @@ if (missingEnvironment.length) {
 }
 
 const DOUG_CONFIG = Object.freeze({
-  agentVersion: "daisy-2.5.0",
-  promptVersion: "dpa-conversation-workflow-v2.5",
-  toolVersion: "tools-v2.5",
+  agentVersion: "daisy-3.0.0",
+  promptVersion: "dpa-modular-conversation-v3.0",
+  toolVersion: "intent-actions-v3.0",
   knowledgeVersion: "dpa-general-v1",
   routingVersion: "dpa-routing-v1",
   cadenceVersion: "dpa-ready-6-attempt-adaptive-v2",
-  mondayAdapterVersion: "monday-call-control-v2.5",
+  mondayAdapterVersion: "monday-call-control-v2.5-compatible",
   maxAttempts: 6,
   maxVoicemails: 2,
   minimumGapMinutes: 180,
@@ -265,8 +274,11 @@ function normalizeTimeFrame(value) {
   if (["6090", "6090days", "60to90", "60days90days"].includes(normalized)) {
     return "60 - 90";
   }
-  if (["justlooking", "looking", "nurture"].includes(normalized)) {
-    return "Just looking";
+  if (["withinsixmonths", "within6months", "36months", "3to6months"].includes(normalized)) {
+    return "Within six months";
+  }
+  if (["morethansixmonths", "morethan6months", "over6months", "justlooking", "looking", "nurture"].includes(normalized)) {
+    return "More than six months";
   }
   return null;
 }
@@ -275,7 +287,8 @@ function interestForTimeFrame(value) {
   const timeFrame = normalizeTimeFrame(value);
   if (timeFrame === "30 - 60") return "High";
   if (timeFrame === "60 - 90") return "Medium";
-  if (timeFrame === "Just looking") return "Nurture";
+  if (timeFrame === "Within six months") return "Medium";
+  if (timeFrame === "More than six months") return "Nurture";
   return null;
 }
 
@@ -4265,7 +4278,14 @@ async function executeDougTool(call, name, args) {
         sentiment,
         JSON.stringify({
           ...answers,
-          progress_notes: cleanText(safeArgs.notes, 2000)
+          progress_notes: cleanText(safeArgs.notes, 2000),
+          conversation_state: {
+            current_stage: currentState,
+            current_objective: cleanText(safeArgs.current_objective, 1000),
+            last_confirmed_fact: cleanText(safeArgs.last_confirmed_fact, 2000),
+            pending_question: cleanText(safeArgs.pending_question, 1000),
+            next_best_action: cleanText(safeArgs.next_best_action, 1000) || nextState
+          }
         })
       ]
     );
@@ -5616,20 +5636,13 @@ mediaServer.on("connection", (twilioSocket) => {
   let activeResponseWaitingPromptKind = null;
   let lastWaitingPromptKind = null;
   let suspendedQuestionState = null;
+  let complianceRecoveryActive = false;
   const handledToolCalls = new Set();
   const handledUserTurns = new Set();
   const pendingMarkNames = new Set();
 
   function briefListeningAcknowledgement(value) {
-    const normalized = String(value || "")
-      .toLowerCase()
-      .replace(/[^a-z\s-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    return [
-      "mm hmm", "mmm hmm", "mhm", "uh huh", "right", "okay", "ok",
-      "yeah", "i see", "got it"
-    ].includes(normalized);
+    return isListeningAcknowledgement(value);
   }
 
   function sendToOpenAI(event) {
@@ -5812,6 +5825,22 @@ mediaServer.on("connection", (twilioSocket) => {
 
     if (assistantResponseActive) await stopAssistantForCustomer();
 
+    if (isInterestRateQuestion(transcript)) {
+      const returnToQuestion = awaitingCustomerResponse && pendingQuestionText
+        ? ` Then ask this still-pending question once and stop: ${JSON.stringify(pendingQuestionText)}`
+        : "";
+      requestAssistantResponse({
+        queueIfBusy: true,
+        allowWhileAwaiting: true,
+        preservePendingQuestion: awaitingCustomerResponse,
+        response: {
+          output_modalities: ["audio"],
+          instructions: `Say exactly: ${JSON.stringify(interestRateResponse())}.${returnToQuestion}`
+        }
+      });
+      return;
+    }
+
     if (!awaitingCustomerResponse) {
       requestAssistantResponse({ queueIfBusy: true });
       return;
@@ -5926,12 +5955,20 @@ mediaServer.on("connection", (twilioSocket) => {
     let output;
     try {
       const refreshed = await getCallById(call.call_id);
-      output = await executeDougTool(refreshed || call, name, args);
+      output = await routeIntent({
+        toolName: name,
+        args,
+        call: refreshed || call,
+        execute: executeDougTool
+      });
     } catch (error) {
       console.error(`Daisy tool ${name} failed for ${call.call_id}:`, error);
       output = {
         success: false,
-        error: "The action could not be completed. Use a safe fallback."
+        intent: "UNKNOWN_INTENT",
+        customer_safe_message: null,
+        data: {},
+        error: { code: "ACTION_FAILED", retryable: true }
       };
     }
 
@@ -5959,48 +5996,15 @@ mediaServer.on("connection", (twilioSocket) => {
     });
 
     openaiSocket.on("open", () => {
-      const inputAudio = {
-  format: { type: "audio/pcmu" },
-
-  noise_reduction: {
-    type: "near_field"
-  },
-
-  turn_detection: {
-    type: "server_vad",
-    threshold: 0.65,
-    prefix_padding_ms: 250,
-    silence_duration_ms: 600,
-    create_response: false,
-    interrupt_response: false,
-    idle_timeout_ms: 12000
-  }
-};
-
-      if (OPENAI_TRANSCRIPTION_MODEL) {
-        inputAudio.transcription = {
-          model: OPENAI_TRANSCRIPTION_MODEL,
-          language: "en"
-        };
-      }
-
       sendToOpenAI({
         type: "session.update",
-        session: {
-          type: "realtime",
+        session: buildRealtimeSession({
           model: OPENAI_REALTIME_MODEL,
-          output_modalities: ["audio"],
-          instructions: buildAgentInstructions(call),
-          tools: DOUG_TOOLS,
-          tool_choice: "auto",
-          audio: {
-            input: inputAudio,
-            output: {
-              format: { type: "audio/pcmu" },
-              voice: OPENAI_VOICE
-            }
-          }
-        }
+          voice: OPENAI_VOICE,
+          transcriptionModel: OPENAI_TRANSCRIPTION_MODEL,
+          instructions: buildAgentInstructionsV3(call),
+          tools: REALTIME_TOOLS
+        })
       });
 
       for (const audio of pendingAudio) {
@@ -6051,6 +6055,27 @@ mediaServer.on("connection", (twilioSocket) => {
 
         if (event.type === "response.output_audio_transcript.delta") {
           assistantTranscriptBuffer += event.delta || "";
+          const compliance = guardAssistantOutput(assistantTranscriptBuffer);
+          if (!compliance.allowed && !complianceRecoveryActive) {
+            complianceRecoveryActive = true;
+            sendToOpenAI({ type: "response.cancel" });
+            if (streamSid) sendToTwilio({ event: "clear", streamSid });
+            pendingMarkNames.clear();
+            queuedResponseOptions = null;
+            requestAssistantResponse({
+              queueIfBusy: true,
+              response: {
+                output_modalities: ["audio"],
+                instructions: `Say exactly: ${JSON.stringify(compliance.replacement)} Say nothing else.`
+              }
+            });
+            await appendAction(call.call_id, {
+              action: "compliance_output_intercepted",
+              success: true,
+              policy_code: compliance.code
+            });
+            return;
+          }
           if (
             !activeResponsePreservesQuestion &&
             !questionCapturedForResponse
@@ -6117,7 +6142,7 @@ mediaServer.on("connection", (twilioSocket) => {
           if (sustainedSpeechTimer) clearTimeout(sustainedSpeechTimer);
           sustainedSpeechTimer = setTimeout(() => {
             void stopAssistantForCustomer();
-          }, 850);
+          }, REALTIME_DEFAULTS.meaningfulInterruptionMs);
           return;
         }
 
@@ -6178,7 +6203,7 @@ mediaServer.on("connection", (twilioSocket) => {
                 console.error("Daisy completed transcript handling failed:", error);
               }
             );
-          }, 450);
+          }, semanticTurnDelay(event.transcript));
           return;
         }
 
@@ -6239,6 +6264,7 @@ mediaServer.on("connection", (twilioSocket) => {
             queuedResponseOptions = null;
             requestAssistantResponse(options);
           }
+          complianceRecoveryActive = false;
           scheduleSilenceReminder();
           return;
         }
