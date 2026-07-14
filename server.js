@@ -2066,6 +2066,12 @@ function customerRequestedMoreTime(value) {
   );
 }
 
+function customerExplicitlyInterrupted(value) {
+  return /\b(wait|stop|hold on|hang on|excuse me|one moment)\b/i.test(
+    String(value || "")
+  );
+}
+
 function directYesNoQuestion(value) {
   const text = String(value || "").trim();
 
@@ -6286,6 +6292,33 @@ mediaServer.on("connection", (twilioSocket) => {
       return;
     }
 
+    const overlappedAssistant =
+      beganWhileAssistantSpeaking ||
+      assistantResponseActive ||
+      responseCreatePending;
+
+    if (
+      overlappedAssistant &&
+      !customerExplicitlyInterrupted(transcript)
+    ) {
+      console.log(
+        JSON.stringify({
+          event: "non_explicit_overlap_ignored",
+          call_id: call.call_id,
+          transcript: cleanText(transcript, 200)
+        })
+      );
+
+      return;
+    }
+
+    if (
+      assistantResponseActive &&
+      customerExplicitlyInterrupted(transcript)
+    ) {
+      await stopAssistantForCustomer();
+    }
+
     const pendingQuestionAcceptsAffirmative =
       directYesNoQuestion(pendingQuestionText) ||
       [
@@ -6293,19 +6326,6 @@ mediaServer.on("connection", (twilioSocket) => {
         "confirmation",
         "application_link_permission"
       ].includes(String(pendingQuestionType || ""));
-
-    if (
-      (beganWhileAssistantSpeaking ||
-        assistantResponseActive ||
-        responseCreatePending) &&
-      briefListeningAcknowledgement(transcript) &&
-      !(
-        pendingQuestionAcceptsAffirmative &&
-        affirmativeCustomerResponse(transcript)
-      )
-    ) return;
-
-    if (assistantResponseActive) await stopAssistantForCustomer();
 
     if (isInterestRateQuestion(transcript)) {
       const returnToQuestion = awaitingCustomerResponse && pendingQuestionText
@@ -6487,15 +6507,27 @@ mediaServer.on("connection", (twilioSocket) => {
     });
 
     openaiSocket.on("open", () => {
+      const realtimeSession = buildRealtimeSession({
+        model: OPENAI_REALTIME_MODEL,
+        voice: OPENAI_VOICE,
+        transcriptionModel: OPENAI_TRANSCRIPTION_MODEL,
+        instructions: buildDouglasDaisyInstructions(call),
+        tools: REALTIME_TOOLS
+      });
+
+      realtimeSession.audio.input.turn_detection = {
+        ...(realtimeSession.audio.input.turn_detection || {}),
+        type: "server_vad",
+        threshold: 0.75,
+        prefix_padding_ms: 300,
+        silence_duration_ms: 700,
+        create_response: false,
+        interrupt_response: false
+      };
+
       sendToOpenAI({
         type: "session.update",
-        session: buildRealtimeSession({
-          model: OPENAI_REALTIME_MODEL,
-          voice: OPENAI_VOICE,
-          transcriptionModel: OPENAI_TRANSCRIPTION_MODEL,
-          instructions: buildDouglasDaisyInstructions(call),
-          tools: REALTIME_TOOLS
-        })
+        session: realtimeSession
       });
 
       for (const audio of pendingAudio) {
@@ -6566,27 +6598,6 @@ mediaServer.on("connection", (twilioSocket) => {
               policy_code: compliance.code
             });
             return;
-          }
-          if (
-            !activeResponsePreservesQuestion &&
-            !questionCapturedForResponse
-          ) {
-            const question = extractPrimaryQuestion(assistantTranscriptBuffer);
-            if (question) {
-              questionCapturedForResponse = true;
-              sendToOpenAI({ type: "response.cancel" });
-              const state = await setAwaitingCustomerResponse(
-                call.call_id,
-                question
-              );
-              awaitingCustomerResponse = true;
-              pendingQuestionType = state.pending_question_type;
-              pendingQuestionText = state.pending_question_text;
-              questionAskedAt = state.question_asked_at;
-              responseReminderCount = 0;
-              queuedResponseOptions = null;
-              scheduleSilenceReminder();
-            }
           }
           return;
         }
@@ -6660,9 +6671,6 @@ mediaServer.on("connection", (twilioSocket) => {
               customer_speech_detected: true
             });
 
-            if (speechCandidateWhileAssistantSpeaking) {
-              void stopAssistantForCustomer();
-            }
           }, Math.max(
             DAISY_SPEECH_CONFIRM_MS,
             Number(
