@@ -509,6 +509,18 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - After scheduling a callback, ask permission before sending a text confirmation.
 - Never claim a text, callback, handoff, or other action succeeded until the tool confirms success.
 - Before ending a connected call, save the outcome, confirm the next step, use complete_call, give one brief closing, and end normally.
+
+When the current call has no remaining question or action, Daisy says:
+"If there's nothing else, thank you for your time, {customer_name}. Have a great day."
+
+Then:
+- Use complete_call.
+- Allow the full closing audio to play.
+- Disconnect the telephone line.
+- Do not wait silently on the line.
+- Do not restart the conversation.
+- Do not trigger reconnect.
+
 - A normal goodbye is not an unexpected disconnect.
 
 Runtime mode: {call_mode}
@@ -4933,6 +4945,17 @@ async function executeDougTool(call, name, args) {
 
       await trackSmsMessage(call.call_id, message, resourceType);
 
+      console.log(
+        JSON.stringify({
+          event: "outbound_sms_accepted",
+          call_id: call.call_id,
+          message_type: resourceType,
+          message_sid: message.sid,
+          message_status: message.status || "accepted",
+          destination_last_four: String(call.phone || "").slice(-4)
+        })
+      );
+
       const patch = normalizeDaisyAnswers({
         [`${resourceType}_sent`]: true,
         last_resource_sent: resourceType,
@@ -4988,7 +5011,8 @@ async function executeDougTool(call, name, args) {
         resource_type: resourceType,
         resource_url: resource.url,
         destination: call.phone.replace(/.(?=.{4})/g, "*"),
-        message_sid: message.sid
+        message_sid: message.sid,
+        message_status: cleanText(message.status, 50) || "accepted"
       };
     } catch (error) {
       await appendAction(call.call_id, {
@@ -5128,8 +5152,24 @@ async function executeDougTool(call, name, args) {
         const confirmation = await twilioClient.messages.create({
           to: call.phone,
           from: TWILIO_FROM_NUMBER,
-          body: `Your follow-up call with Daisy is scheduled for ${formattedCallback}. Reply STOP to opt out.`
+          body: `Your follow-up call with Daisy is scheduled for ${formattedCallback}. Reply STOP to opt out.`,
+          statusCallback: smsStatusCallbackUrl(call)
         });
+        await trackSmsMessage(
+          call.call_id,
+          confirmation,
+          "callback_confirmation"
+        );
+        console.log(
+          JSON.stringify({
+            event: "outbound_sms_accepted",
+            call_id: call.call_id,
+            message_type: "callback_confirmation",
+            message_sid: confirmation.sid,
+            message_status: confirmation.status || "accepted",
+            destination_last_four: String(call.phone || "").slice(-4)
+          })
+        );
         confirmationSmsSent = true;
         confirmationMessageSid = confirmation.sid;
       } catch (error) {
@@ -6016,6 +6056,18 @@ app.post("/api/v1/twilio/sms-status", async (req, res, next) => {
         : "unknown");
     const failed = ["failed", "undelivered"].includes(status.toLowerCase());
 
+    console.log(
+      JSON.stringify({
+        event: "outbound_sms_status",
+        call_id: call.call_id,
+        message_type: messageType,
+        message_sid: messageSid,
+        message_status: status,
+        error_code: errorCode,
+        error_message: errorMessage
+      })
+    );
+
     await mergeCallResult(call.call_id, {
       [`${messageType}_sms_status`]: status,
       [`${messageType}_sms_error_code`]: errorCode,
@@ -6034,26 +6086,25 @@ app.post("/api/v1/twilio/sms-status", async (req, res, next) => {
       error: errorMessage
     });
 
-    if (messageType === "application" && failed) {
+    if (failed) {
+      const humanReviewNote = messageType === "application"
+        ? "Human must send the DPA application link manually"
+        : `Human review required for failed ${messageType} text delivery`;
       await pool.query(
         `
           UPDATE ai_calls
-          SET sequence_status = 'human_action',
-              outcome = 'needs_review',
-              next_action = 'Human must send the DPA application link manually',
-              callback_requested = FALSE,
-              callback_at = NULL,
-              next_attempt_at = NULL,
-              last_error = $2,
+          SET next_action = $2,
+              last_error = $3,
               updated_at = NOW()
           WHERE call_id = $1
         `,
         [
           call.call_id,
-          `Application SMS ${status}${errorCode ? ` (${errorCode})` : ""}`
+          humanReviewNote,
+          `${messageType} SMS ${status}${errorCode ? ` (${errorCode})` : ""}`
         ]
       );
-      queueMondaySync(call.call_id, `application_sms_${status}`);
+      queueMondaySync(call.call_id, `${messageType}_sms_${status}`);
     }
 
     res.status(204).end();
@@ -6131,6 +6182,9 @@ mediaServer.on("connection", (twilioSocket) => {
   let pendingResponsePreservesQuestion = false;
   let activeResponsePreservesQuestion = false;
   let assistantResponseFinished = true;
+  let hangupAfterPlaybackRequested = false;
+  let hangupInProgress = false;
+  let hangupCompleted = false;
   let sustainedSpeechTimer = null;
   let speechCandidateStartedAt = 0;
   let speechCandidateConfirmed = false;
@@ -6500,6 +6554,88 @@ mediaServer.on("connection", (twilioSocket) => {
     await handleInterruption();
   }
 
+  async function hangupTwilioCallAfterPlayback() {
+    if (
+      !hangupAfterPlaybackRequested ||
+      hangupInProgress ||
+      hangupCompleted ||
+      !assistantResponseFinished ||
+      pendingMarkNames.size > 0 ||
+      !call
+    ) {
+      return false;
+    }
+
+    hangupInProgress = true;
+
+    try {
+      const refreshedCall =
+        (await getCallById(call.call_id)) || call;
+
+      if (refreshedCall.awaiting_customer_response === true) {
+        return false;
+      }
+
+      const twilioCallSid =
+        refreshedCall.twilio_call_sid ||
+        call.twilio_call_sid;
+
+      if (!twilioCallSid) {
+        throw new Error(
+          "Twilio Call SID is unavailable for final hangup."
+        );
+      }
+
+      await twilioClient.calls(twilioCallSid).update({
+        status: "completed"
+      });
+
+      hangupCompleted = true;
+
+      await appendAction(call.call_id, {
+        action: "twilio_call_hangup",
+        success: true,
+        reason: "completed_call_after_final_audio"
+      });
+
+      console.log(
+        JSON.stringify({
+          event: "twilio_call_hangup",
+          call_id: call.call_id,
+          twilio_call_sid: twilioCallSid,
+          success: true,
+          reason: "completed_call_after_final_audio"
+        })
+      );
+
+      return true;
+    } catch (error) {
+      const safeError =
+        cleanText(error.message, 1000) ||
+        "Twilio call hangup failed.";
+
+      await appendAction(call.call_id, {
+        action: "twilio_call_hangup",
+        success: false,
+        reason: "completed_call_after_final_audio",
+        error: safeError
+      });
+
+      console.error(
+        JSON.stringify({
+          event: "twilio_call_hangup",
+          call_id: call.call_id,
+          success: false,
+          error: safeError
+        })
+      );
+
+      return false;
+    } finally {
+      hangupInProgress = false;
+    }
+  }
+
   async function handleToolCall(name, toolCallId, argumentText) {
     if (!call || !toolCallId || handledToolCalls.has(toolCallId)) return;
     handledToolCalls.add(toolCallId);
@@ -6529,6 +6665,16 @@ mediaServer.on("connection", (twilioSocket) => {
         data: {},
         error: { code: "ACTION_FAILED", retryable: true }
       };
+    }
+
+    const completeCallSucceeded =
+      name === "complete_call" &&
+      output?.success === true &&
+      output?.intent === "complete_call" &&
+      output?.error === null;
+
+    if (completeCallSucceeded) {
+      hangupAfterPlaybackRequested = true;
     }
 
     sendToOpenAI({
@@ -6879,6 +7025,7 @@ mediaServer.on("connection", (twilioSocket) => {
           }
           complianceRecoveryActive = false;
           scheduleSilenceReminder();
+          void hangupTwilioCallAfterPlayback();
           return;
         }
 
@@ -6974,7 +7121,10 @@ mediaServer.on("connection", (twilioSocket) => {
       if (message.event === "mark") {
         const name = cleanText(message.mark?.name, 100);
         if (name) pendingMarkNames.delete(name);
-        if (!pendingMarkNames.size) scheduleSilenceReminder();
+        if (!pendingMarkNames.size) {
+          scheduleSilenceReminder();
+          void hangupTwilioCallAfterPlayback();
+        }
         return;
       }
 
