@@ -5,9 +5,18 @@ const { Pool } = require("pg");
 const twilio = require("twilio");
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
+const { buildAgentInstructions: buildAgentInstructionsV3 } = require("./src/conversation/conversation-controller");
+const { REALTIME_TOOLS } = require("./src/intents/intent-types");
+const { routeIntent } = require("./src/intents/intent-router");
+const { guardAssistantOutput } = require("./src/compliance/compliance-guardrails");
+const { isInterestRateQuestion, interestRateResponse } = require("./src/compliance/interest-rate-policy");
+const { isListeningAcknowledgement } = require("./src/realtime/interruption-manager");
+const { semanticTurnDelay } = require("./src/realtime/turn-manager");
+const { DEFAULTS: REALTIME_DEFAULTS } = require("./src/realtime/latency-manager");
+const { buildRealtimeSession } = require("./src/realtime/openai-session");
 
 /*
- * HELUX AI WORKFORCE — DAISY 2.5.0
+ * HELUX AI WORKFORCE - DAISY 3.0.0
  * Daisy, Doug's assistant: calling, callbacks, resources, and two-way monday.com control.
  * monday.com failures never block or terminate a customer call.
  */
@@ -165,13 +174,13 @@ if (missingEnvironment.length) {
 }
 
 const DOUG_CONFIG = Object.freeze({
-  agentVersion: "daisy-2.5.0",
-  promptVersion: "dpa-conversation-workflow-v2.5",
-  toolVersion: "tools-v2.5",
+  agentVersion: "daisy-3.0.0",
+  promptVersion: "dpa-modular-conversation-v3.0",
+  toolVersion: "intent-actions-v3.0",
   knowledgeVersion: "dpa-general-v1",
   routingVersion: "dpa-routing-v1",
   cadenceVersion: "dpa-ready-6-attempt-adaptive-v2",
-  mondayAdapterVersion: "monday-call-control-v2.5",
+  mondayAdapterVersion: "monday-call-control-v2.5-compatible",
   maxAttempts: 6,
   maxVoicemails: 2,
   minimumGapMinutes: 180,
@@ -265,8 +274,11 @@ function normalizeTimeFrame(value) {
   if (["6090", "6090days", "60to90", "60days90days"].includes(normalized)) {
     return "60 - 90";
   }
-  if (["justlooking", "looking", "nurture"].includes(normalized)) {
-    return "Just looking";
+  if (["withinsixmonths", "within6months", "36months", "3to6months"].includes(normalized)) {
+    return "Within six months";
+  }
+  if (["morethansixmonths", "morethan6months", "over6months", "justlooking", "looking", "nurture"].includes(normalized)) {
+    return "More than six months";
   }
   return null;
 }
@@ -275,7 +287,8 @@ function interestForTimeFrame(value) {
   const timeFrame = normalizeTimeFrame(value);
   if (timeFrame === "30 - 60") return "High";
   if (timeFrame === "60 - 90") return "Medium";
-  if (timeFrame === "Just looking") return "Nurture";
+  if (timeFrame === "Within six months") return "Medium";
+  if (timeFrame === "More than six months") return "Nurture";
   return null;
 }
 
@@ -467,11 +480,23 @@ function buildAgentInstructions(call) {
   const assistanceOpening = estimatedDpa
     ? `You were recently looking for up to ${estimatedDpa} in down payment assistance to help purchase a home. Is that correct?`
     : "You were recently looking into down payment assistance to help purchase a home. Is that correct?";
+  const customerResponseRules = `
+CUSTOMER RESPONSE WAITING RULES
+- Ask exactly one primary question at a time. Never stack questions.
+- Do not use rhetorical questions in statements or explanations.
+- After asking any question, stop speaking and wait for a meaningful completed customer answer.
+- Do not advance to another objective, call a workflow tool, or answer from stored intake data while waiting.
+- Silence is not an answer. Never infer, manufacture, or prefill a customer answer.
+- Only save a structured answer after an explicit answer, clear confirmation, or unambiguous statement.
+- If the customer asks a separate question, answer it briefly, then return naturally to the pending question.
+- If a short acknowledgement after a yes-or-no question is ambiguous, ask: "Was that a yes?"
+`.trim();
 
   if (lead.call_type === "dpa_agent_notification") {
     const agentName = cleanText(lead.agent_name, 120) || "the assigned specialist";
     const customerName = cleanText(lead.customer_name, 160) || "the customer";
-    return `
+    return `${customerResponseRules}
+
 You are Daisy, Doug's assistant with the DPA Help Center, making a brief internal notification call.
 First ask: "Hi, may I speak with ${agentName}?"
 After identity confirmation say: "Great—this is Daisy, Doug's assistant with DPA Help Center. I'm calling to let you know that ${customerName} has started the DPA application."
@@ -481,7 +506,8 @@ Keep the entire call under one minute. After confirmation, call complete_call wi
   }
 
   if (call.current_state === "application_checkpoint") {
-    return `
+    return `${customerResponseRules}
+
 You are Daisy with DPA Help Center. First verify identity using: "${identityRequest}"
 After identity confirmation say exactly: "Great, this is Daisy with DPA Help Center. We spoke yesterday about your interest in receiving down payment assistance. I'm calling to see if you had a chance to start the application."
 If yes, call record_application_checkpoint with started true and a concise summary. Do not continue customer cadence.
@@ -491,14 +517,16 @@ Do not repeat intake questions.
   }
 
   if (["reconnect_pending", "reconnect_in_progress"].includes(call.current_state)) {
-    return `
+    return `${customerResponseRules}
+
 You are Daisy with DPA Help Center reconnecting after an unexpected disconnect. First verify identity using: "${identityRequest}"
 After identity confirmation say exactly: "Great, this is Daisy with DPA Help Center. I think we got disconnected. Is now still a good time?"
 Resume from this saved summary: ${previousSummary}. Resume the saved next action: ${cleanText(call.next_action, 1200) || "continue the prior conversation"}. Do not restart the intake and do not repeat already confirmed answers. Use complete_call before ending.
 `.trim();
   }
 
-  return `
+  return `${customerResponseRules}
+
 You are Daisy, Doug's assistant with the DPA Help Center.
 You are calling ${customerReference}, who completed a homebuyer readiness process.
 
@@ -947,7 +975,12 @@ async function initializeDatabase() {
     ["human_owner_id", "VARCHAR(100)"],
     ["priority", "VARCHAR(30) NOT NULL DEFAULT 'normal'"],
     ["last_attempt_at", "TIMESTAMPTZ"],
-    ["callback_requested", "BOOLEAN NOT NULL DEFAULT FALSE"]
+    ["callback_requested", "BOOLEAN NOT NULL DEFAULT FALSE"],
+    ["awaiting_customer_response", "BOOLEAN NOT NULL DEFAULT FALSE"],
+    ["pending_question_type", "VARCHAR(100)"],
+    ["pending_question_text", "TEXT"],
+    ["question_asked_at", "TIMESTAMPTZ"],
+    ["response_reminder_count", "INTEGER NOT NULL DEFAULT 0"]
   ];
 
   for (const [columnName, definition] of aiCallColumns) {
@@ -1232,6 +1265,7 @@ async function sequenceHasUnresolvedWork(callId, client = pool) {
         SELECT 1 FROM ai_calls
         WHERE call_id = $1 AND (
           sequence_status = 'human_action'
+          OR awaiting_customer_response = TRUE
           OR next_attempt_at IS NOT NULL
           OR (callback_requested AND callback_at > NOW())
         )
@@ -1509,6 +1543,182 @@ async function mergeCallResult(callId, patch) {
     `,
     [callId, JSON.stringify(patch || {})]
   );
+}
+
+function extractPrimaryQuestion(value) {
+  const text = cleanText(value, 8000);
+  if (!text) return null;
+  const questions = text.match(/[^?]+\?/g) || [];
+  const rawQuestion = questions.at(-1) || "";
+  const lastPeriod = rawQuestion.lastIndexOf(". ");
+  const lastExclamation = rawQuestion.lastIndexOf("! ");
+  const boundary = Math.max(lastPeriod, lastExclamation);
+  const question = cleanText(
+    boundary >= 0 ? rawQuestion.slice(boundary + 2) : rawQuestion,
+    2000
+  );
+  if (!question) return null;
+  return { text: question, count: questions.length };
+}
+
+function pendingQuestionType(value) {
+  const text = normalizeMondayKey(value);
+  if (/speakwith|isthis/.test(text)) return "identity_confirmation";
+  if (/realtor|realestateagent/.test(text)) return "has_realtor";
+  if (/lender|preapproved|preapproval/.test(text)) return "applied_with_lender";
+  if (/start.*application|application.*start/.test(text)) {
+    return "application_started";
+  }
+  if (/send.*link|text.*link|want.*link|receive.*link/.test(text)) {
+    return "application_link_permission";
+  }
+  if (/when|whatday|whattime|timezone|followup|callback/.test(text)) {
+    return "callback_time";
+  }
+  if (/correct|isthatright|stillaccurate|confirm/.test(text)) {
+    return "confirmation";
+  }
+  if (/timeframe|timeline|purchase|buy|income|credit|employment|tax/.test(text)) {
+    return "qualification";
+  }
+  return "general_question";
+}
+
+function isMeaningfulCustomerTranscript(value) {
+  const normalized = String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return Boolean(
+    normalized &&
+      !["um", "uh", "hmm", "mm", "silence", "inaudible"].includes(normalized)
+  );
+}
+
+function customerAskedSeparateQuestion(value) {
+  const text = String(value || "").trim();
+  return (
+    /\?\s*$/.test(text) ||
+    /^(what|why|when|where|who|how|can|could|would|will|do|does|did|is|are)\b/i.test(
+      text
+    )
+  );
+}
+
+function customerRequestedMoreTime(value) {
+  return /\b(give me (a |one )?(minute|moment|second)|one moment|hold on|let me (think|check)|need (a |one )?(minute|moment|second)|more time)\b/i.test(
+    String(value || "")
+  );
+}
+
+function directYesNoQuestion(value) {
+  const text = String(value || "").trim();
+  return /^(is|are|am|was|were|do|does|did|have|has|had|can|could|would|will|should)\b/i.test(
+    text
+  ) || /\b(correct|right)\?$/i.test(text);
+}
+
+function presenceOnlyResponse(value) {
+  const normalized = String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z\s']/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return [
+    "yes", "yeah", "yep", "i am", "i'm here", "im here", "still here",
+    "yes i am", "yeah i'm here", "yeah im here"
+  ].includes(normalized);
+}
+
+function logCustomerResponseState(callId, details = {}) {
+  console.log(JSON.stringify({
+    event: "customer_response_wait_state",
+    call_id: callId,
+    pending_question_type: details.pending_question_type || null,
+    awaiting_customer_response: details.awaiting_customer_response === true,
+    question_asked_at: details.question_asked_at || null,
+    customer_speech_detected: details.customer_speech_detected === true,
+    completed_transcript_received:
+      details.completed_transcript_received === true,
+    response_reminder_count: Number(details.response_reminder_count || 0),
+    waiting_state_end_reason: details.waiting_state_end_reason || null
+  }));
+}
+
+async function setAwaitingCustomerResponse(callId, question) {
+  const askedAt = new Date();
+  const questionType = pendingQuestionType(question.text);
+  await pool.query(
+    `
+      UPDATE ai_calls
+      SET awaiting_customer_response = TRUE,
+          pending_question_type = $2,
+          pending_question_text = $3,
+          question_asked_at = $4,
+          response_reminder_count = 0,
+          updated_at = NOW()
+      WHERE call_id = $1
+    `,
+    [callId, questionType, question.text, askedAt]
+  );
+  logCustomerResponseState(callId, {
+    pending_question_type: questionType,
+    awaiting_customer_response: true,
+    question_asked_at: askedAt.toISOString(),
+    response_reminder_count: 0
+  });
+  if (question.count > 1) {
+    console.warn(JSON.stringify({
+      event: "stacked_question_detected",
+      call_id: callId,
+      question_count: question.count,
+      pending_question_text: question.text
+    }));
+  }
+  return {
+    pending_question_type: questionType,
+    pending_question_text: question.text,
+    question_asked_at: askedAt.toISOString(),
+    response_reminder_count: 0
+  };
+}
+
+async function clearAwaitingCustomerResponse(callId, reason) {
+  const previous = await getCallById(callId);
+  await pool.query(
+    `
+      UPDATE ai_calls
+      SET awaiting_customer_response = FALSE,
+          pending_question_type = NULL,
+          pending_question_text = NULL,
+          question_asked_at = NULL,
+          response_reminder_count = 0,
+          updated_at = NOW()
+      WHERE call_id = $1
+    `,
+    [callId]
+  );
+  logCustomerResponseState(callId, {
+    pending_question_type: previous?.pending_question_type,
+    question_asked_at: previous?.question_asked_at,
+    awaiting_customer_response: false,
+    response_reminder_count: 0,
+    waiting_state_end_reason: reason
+  });
+}
+
+async function setResponseReminderCount(callId, count, questionState) {
+  await pool.query(
+    `UPDATE ai_calls SET response_reminder_count = $2, updated_at = NOW()
+     WHERE call_id = $1`,
+    [callId, count]
+  );
+  logCustomerResponseState(callId, {
+    ...questionState,
+    awaiting_customer_response: true,
+    response_reminder_count: count
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -3308,6 +3518,11 @@ async function notifyHelux(call) {
         callback_at: call.callback_at,
         outcome: call.outcome,
         sentiment: call.sentiment,
+        awaiting_customer_response: call.awaiting_customer_response,
+        pending_question_type: call.pending_question_type,
+        pending_question_text: call.pending_question_text,
+        question_asked_at: call.question_asked_at,
+        response_reminder_count: call.response_reminder_count,
         next_action: call.next_action,
         summary: call.summary,
         transcript: call.transcript || [],
@@ -4014,6 +4229,30 @@ async function trackSmsMessage(callId, message, messageType) {
 
 async function executeDougTool(call, name, args) {
   const safeArgs = args && typeof args === "object" ? args : {};
+  const permittedWaitingEnd =
+    name === "mark_contact_restriction" ||
+    (name === "complete_call" &&
+      ["opt_out", "wrong_number", "disconnected", "technical_failure"].includes(
+        cleanText(safeArgs.outcome, 80)
+      ));
+  if (call.awaiting_customer_response && !permittedWaitingEnd) {
+    return {
+      success: false,
+      awaiting_customer_response: true,
+      pending_question_type: call.pending_question_type,
+      pending_question_text: call.pending_question_text,
+      error:
+        "Wait for a meaningful completed customer answer before advancing the workflow or saving structured fields."
+    };
+  }
+  if (call.awaiting_customer_response && permittedWaitingEnd) {
+    await clearAwaitingCustomerResponse(
+      call.call_id,
+      name === "mark_contact_restriction"
+        ? "call_ended_contact_restriction"
+        : `call_ended_${cleanText(safeArgs.outcome, 80) || "complete_call"}`
+    );
+  }
 
   if (name === "save_call_progress") {
     const currentState = cleanText(safeArgs.current_state, 80) || "unknown";
@@ -4039,7 +4278,14 @@ async function executeDougTool(call, name, args) {
         sentiment,
         JSON.stringify({
           ...answers,
-          progress_notes: cleanText(safeArgs.notes, 2000)
+          progress_notes: cleanText(safeArgs.notes, 2000),
+          conversation_state: {
+            current_stage: currentState,
+            current_objective: cleanText(safeArgs.current_objective, 1000),
+            last_confirmed_fact: cleanText(safeArgs.last_confirmed_fact, 2000),
+            pending_question: cleanText(safeArgs.pending_question, 1000),
+            next_best_action: cleanText(safeArgs.next_best_action, 1000) || nextState
+          }
         })
       ]
     );
@@ -4561,6 +4807,11 @@ async function executeDougTool(call, name, args) {
           END,
           next_attempt_at = NULL,
           next_action = $6,
+          awaiting_customer_response = FALSE,
+          pending_question_type = NULL,
+          pending_question_text = NULL,
+          question_asked_at = NULL,
+          response_reminder_count = 0,
           updated_at = NOW()
         WHERE call_id = $1
       `,
@@ -4680,6 +4931,11 @@ async function executeDougTool(call, name, args) {
             WHEN $5 = 'callback_scheduled' THEN TRUE
             ELSE callback_requested
           END,
+          awaiting_customer_response = FALSE,
+          pending_question_type = NULL,
+          pending_question_text = NULL,
+          question_asked_at = NULL,
+          response_reminder_count = 0,
           updated_at = NOW()
         WHERE call_id = $1
       `,
@@ -5163,6 +5419,11 @@ app.get(
           timezone: call.timezone,
           current_state: call.current_state,
           next_state: call.next_state,
+          awaiting_customer_response: call.awaiting_customer_response,
+          pending_question_type: call.pending_question_type,
+          pending_question_text: call.pending_question_text,
+          question_asked_at: call.question_asked_at,
+          response_reminder_count: call.response_reminder_count,
           sentiment: call.sentiment,
           outcome: call.outcome,
           next_action: call.next_action,
@@ -5352,21 +5613,36 @@ mediaServer.on("connection", (twilioSocket) => {
   let closed = false;
   let assistantResponseActive = false;
   let responseCreatePending = false;
-  let responseCreateQueued = false;
+  let queuedResponseOptions = null;
+  let pendingResponsePreservesQuestion = false;
+  let activeResponsePreservesQuestion = false;
+  let assistantResponseFinished = true;
   let sustainedSpeechTimer = null;
+  let silenceReminderTimer = null;
+  let customerTranscriptDebounceTimer = null;
+  let pendingCustomerTranscripts = [];
+  let customerSpeaking = false;
+  let customerTurnBeganWhileAssistantSpeaking = false;
+  let pendingTranscriptWasWhileAssistantSpeaking = false;
+  let awaitingCustomerResponse = false;
+  let pendingQuestionType = null;
+  let pendingQuestionText = null;
+  let questionAskedAt = null;
+  let responseReminderCount = 0;
+  let assistantTranscriptBuffer = "";
+  let assistantTranscriptSaved = false;
+  let questionCapturedForResponse = false;
+  let pendingResponseWaitingPromptKind = null;
+  let activeResponseWaitingPromptKind = null;
+  let lastWaitingPromptKind = null;
+  let suspendedQuestionState = null;
+  let complianceRecoveryActive = false;
   const handledToolCalls = new Set();
   const handledUserTurns = new Set();
+  const pendingMarkNames = new Set();
 
   function briefListeningAcknowledgement(value) {
-    const normalized = String(value || "")
-      .toLowerCase()
-      .replace(/[^a-z\s-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    return [
-      "mm hmm", "mmm hmm", "mhm", "uh huh", "right", "okay", "ok",
-      "yeah", "i see", "got it"
-    ].includes(normalized);
+    return isListeningAcknowledgement(value);
   }
 
   function sendToOpenAI(event) {
@@ -5388,11 +5664,12 @@ mediaServer.on("connection", (twilioSocket) => {
   function sendMark() {
     if (!streamSid) return;
     markCounter += 1;
-    sendToTwilio({
+    const name = `openai-${markCounter}`;
+    if (sendToTwilio({
       event: "mark",
       streamSid,
-      mark: { name: `openai-${markCounter}` }
-    });
+      mark: { name }
+    })) pendingMarkNames.add(name);
   }
 
   async function handleInterruption() {
@@ -5410,6 +5687,7 @@ mediaServer.on("connection", (twilioSocket) => {
     );
 
     sendToTwilio({ event: "clear", streamSid });
+    pendingMarkNames.clear();
     sendToOpenAI({
       type: "conversation.item.truncate",
       item_id: lastAssistantItemId,
@@ -5422,18 +5700,239 @@ mediaServer.on("connection", (twilioSocket) => {
   }
 
   function requestAssistantResponse(options = {}) {
+    if (awaitingCustomerResponse && options.allowWhileAwaiting !== true) {
+      return false;
+    }
     if (assistantResponseActive || responseCreatePending) {
-      if (options.queueIfBusy === true) responseCreateQueued = true;
+      if (options.queueIfBusy === true) queuedResponseOptions = { ...options };
       return false;
     }
     responseCreatePending = true;
+    assistantResponseFinished = false;
+    pendingResponsePreservesQuestion = options.preservePendingQuestion === true;
+    pendingResponseWaitingPromptKind = options.waitingPromptKind || null;
     const event = { type: "response.create" };
     if (options.response) event.response = options.response;
     if (!sendToOpenAI(event)) {
       responseCreatePending = false;
+      assistantResponseFinished = true;
+      pendingResponsePreservesQuestion = false;
+      pendingResponseWaitingPromptKind = null;
       return false;
     }
     return true;
+  }
+
+  function currentQuestionState() {
+    return {
+      pending_question_type: pendingQuestionType,
+      pending_question_text: pendingQuestionText,
+      question_asked_at: questionAskedAt,
+      response_reminder_count: responseReminderCount
+    };
+  }
+
+  function cancelSilenceReminder() {
+    if (silenceReminderTimer) clearTimeout(silenceReminderTimer);
+    silenceReminderTimer = null;
+  }
+
+  function scheduleSilenceReminder() {
+    cancelSilenceReminder();
+    if (
+      !awaitingCustomerResponse ||
+      customerSpeaking ||
+      !assistantResponseFinished ||
+      pendingMarkNames.size ||
+      responseReminderCount >= 2 ||
+      closed
+    ) return;
+
+    silenceReminderTimer = setTimeout(() => {
+      silenceReminderTimer = null;
+      void (async () => {
+        if (!awaitingCustomerResponse || customerSpeaking || closed) return;
+        const nextCount = responseReminderCount + 1;
+        responseReminderCount = nextCount;
+        await setResponseReminderCount(
+          call.call_id,
+          nextCount,
+          currentQuestionState()
+        );
+        const instructions = nextCount === 1
+          ? 'Say exactly: "Are you still with me?" Say nothing else.'
+          : `Repeat this pending question once, using the same meaning and no additional question: ${JSON.stringify(
+              pendingQuestionText
+            )}`;
+        requestAssistantResponse({
+          allowWhileAwaiting: true,
+          preservePendingQuestion: true,
+          waitingPromptKind:
+            nextCount === 1 ? "presence_reminder" : "pending_repeat",
+          response: { output_modalities: ["audio"], instructions }
+        });
+      })().catch((error) => {
+        console.error("Daisy silence reminder failed:", error);
+      });
+    }, 8000);
+  }
+
+  async function captureAssistantQuestion(transcript) {
+    if (activeResponsePreservesQuestion) return;
+    const question = extractPrimaryQuestion(transcript);
+    if (!question) return;
+    const state = await setAwaitingCustomerResponse(call.call_id, question);
+    awaitingCustomerResponse = true;
+    pendingQuestionType = state.pending_question_type;
+    pendingQuestionText = state.pending_question_text;
+    questionAskedAt = state.question_asked_at;
+    responseReminderCount = 0;
+    queuedResponseOptions = null;
+    scheduleSilenceReminder();
+  }
+
+  async function endLocalWaitingState(reason) {
+    cancelSilenceReminder();
+    await clearAwaitingCustomerResponse(call.call_id, reason);
+    awaitingCustomerResponse = false;
+    pendingQuestionType = null;
+    pendingQuestionText = null;
+    questionAskedAt = null;
+    responseReminderCount = 0;
+  }
+
+  async function processCompletedCustomerTranscript(
+    transcript,
+    beganWhileAssistantSpeaking = false
+  ) {
+    logCustomerResponseState(call.call_id, {
+      ...currentQuestionState(),
+      awaiting_customer_response: awaitingCustomerResponse,
+      completed_transcript_received: true
+    });
+
+    if (!isMeaningfulCustomerTranscript(transcript)) {
+      scheduleSilenceReminder();
+      return;
+    }
+
+    if (
+      (beganWhileAssistantSpeaking ||
+        assistantResponseActive ||
+        responseCreatePending) &&
+      briefListeningAcknowledgement(transcript)
+    ) return;
+
+    if (assistantResponseActive) await stopAssistantForCustomer();
+
+    if (isInterestRateQuestion(transcript)) {
+      const returnToQuestion = awaitingCustomerResponse && pendingQuestionText
+        ? ` Then ask this still-pending question once and stop: ${JSON.stringify(pendingQuestionText)}`
+        : "";
+      requestAssistantResponse({
+        queueIfBusy: true,
+        allowWhileAwaiting: true,
+        preservePendingQuestion: awaitingCustomerResponse,
+        response: {
+          output_modalities: ["audio"],
+          instructions: `Say exactly: ${JSON.stringify(interestRateResponse())}.${returnToQuestion}`
+        }
+      });
+      return;
+    }
+
+    if (!awaitingCustomerResponse) {
+      requestAssistantResponse({ queueIfBusy: true });
+      return;
+    }
+
+    if (customerRequestedMoreTime(transcript)) {
+      await endLocalWaitingState("customer_requested_more_time");
+      requestAssistantResponse({
+        queueIfBusy: true,
+        response: {
+          output_modalities: ["audio"],
+          instructions: 'Say exactly: "Of course—take your time." Say nothing else.'
+        }
+      });
+      return;
+    }
+
+
+    if (
+      lastWaitingPromptKind === "presence_reminder" &&
+      presenceOnlyResponse(transcript)
+    ) {
+      const nextCount = 2;
+      responseReminderCount = nextCount;
+      await setResponseReminderCount(
+        call.call_id,
+        nextCount,
+        currentQuestionState()
+      );
+      requestAssistantResponse({
+        queueIfBusy: true,
+        allowWhileAwaiting: true,
+        preservePendingQuestion: true,
+        waitingPromptKind: "pending_repeat",
+        response: {
+          output_modalities: ["audio"],
+          instructions: `Repeat this pending question once, using the same meaning and no additional question: ${JSON.stringify(
+            pendingQuestionText
+          )}`
+        }
+      });
+      return;
+    }
+
+    if (customerAskedSeparateQuestion(transcript)) {
+      requestAssistantResponse({
+        queueIfBusy: true,
+        allowWhileAwaiting: true,
+        preservePendingQuestion: true,
+        response: {
+          output_modalities: ["audio"],
+          instructions: `Answer the customer's separate question briefly and accurately. Then return naturally to this still-pending question, ask it once, and stop: ${JSON.stringify(
+            pendingQuestionText
+          )}`
+        }
+      });
+      return;
+    }
+
+    if (briefListeningAcknowledgement(transcript)) {
+      if (directYesNoQuestion(pendingQuestionText)) {
+        requestAssistantResponse({
+          queueIfBusy: true,
+          allowWhileAwaiting: true,
+          preservePendingQuestion: true,
+          response: {
+            output_modalities: ["audio"],
+            instructions: 'Say exactly: "Was that a yes?" Say nothing else.'
+          }
+        });
+      } else {
+        scheduleSilenceReminder();
+      }
+      return;
+    }
+
+    await endLocalWaitingState("meaningful_completed_customer_answer");
+    if (suspendedQuestionState) {
+      const suspended = suspendedQuestionState;
+      suspendedQuestionState = null;
+      requestAssistantResponse({
+        queueIfBusy: true,
+        response: {
+          output_modalities: ["audio"],
+          instructions: `Continue the identity-confirmed introduction briefly without asking another question. Then return to this previously pending question, ask it once, and stop: ${JSON.stringify(
+            suspended.pending_question_text
+          )}`
+        }
+      });
+    } else {
+      requestAssistantResponse({ queueIfBusy: true });
+    }
   }
 
   async function stopAssistantForCustomer() {
@@ -5456,12 +5955,20 @@ mediaServer.on("connection", (twilioSocket) => {
     let output;
     try {
       const refreshed = await getCallById(call.call_id);
-      output = await executeDougTool(refreshed || call, name, args);
+      output = await routeIntent({
+        toolName: name,
+        args,
+        call: refreshed || call,
+        execute: executeDougTool
+      });
     } catch (error) {
       console.error(`Daisy tool ${name} failed for ${call.call_id}:`, error);
       output = {
         success: false,
-        error: "The action could not be completed. Use a safe fallback."
+        intent: "UNKNOWN_INTENT",
+        customer_safe_message: null,
+        data: {},
+        error: { code: "ACTION_FAILED", retryable: true }
       };
     }
 
@@ -5489,48 +5996,15 @@ mediaServer.on("connection", (twilioSocket) => {
     });
 
     openaiSocket.on("open", () => {
-      const inputAudio = {
-  format: { type: "audio/pcmu" },
-
-  noise_reduction: {
-    type: "near_field"
-  },
-
-  turn_detection: {
-    type: "server_vad",
-    threshold: 0.65,
-    prefix_padding_ms: 250,
-    silence_duration_ms: 600,
-    create_response: false,
-    interrupt_response: false,
-    idle_timeout_ms: 12000
-  }
-};
-
-      if (OPENAI_TRANSCRIPTION_MODEL) {
-        inputAudio.transcription = {
-          model: OPENAI_TRANSCRIPTION_MODEL,
-          language: "en"
-        };
-      }
-
       sendToOpenAI({
         type: "session.update",
-        session: {
-          type: "realtime",
+        session: buildRealtimeSession({
           model: OPENAI_REALTIME_MODEL,
-          output_modalities: ["audio"],
-          instructions: buildAgentInstructions(call),
-          tools: DOUG_TOOLS,
-          tool_choice: "auto",
-          audio: {
-            input: inputAudio,
-            output: {
-              format: { type: "audio/pcmu" },
-              voice: OPENAI_VOICE
-            }
-          }
-        }
+          voice: OPENAI_VOICE,
+          transcriptionModel: OPENAI_TRANSCRIPTION_MODEL,
+          instructions: buildAgentInstructionsV3(call),
+          tools: REALTIME_TOOLS
+        })
       });
 
       for (const audio of pendingAudio) {
@@ -5568,6 +6042,61 @@ mediaServer.on("connection", (twilioSocket) => {
         if (event.type === "response.created") {
           responseCreatePending = false;
           assistantResponseActive = true;
+          assistantResponseFinished = false;
+          activeResponsePreservesQuestion = pendingResponsePreservesQuestion;
+          pendingResponsePreservesQuestion = false;
+          activeResponseWaitingPromptKind = pendingResponseWaitingPromptKind;
+          pendingResponseWaitingPromptKind = null;
+          assistantTranscriptBuffer = "";
+          assistantTranscriptSaved = false;
+          questionCapturedForResponse = false;
+          return;
+        }
+
+        if (event.type === "response.output_audio_transcript.delta") {
+          assistantTranscriptBuffer += event.delta || "";
+          const compliance = guardAssistantOutput(assistantTranscriptBuffer);
+          if (!compliance.allowed && !complianceRecoveryActive) {
+            complianceRecoveryActive = true;
+            sendToOpenAI({ type: "response.cancel" });
+            if (streamSid) sendToTwilio({ event: "clear", streamSid });
+            pendingMarkNames.clear();
+            queuedResponseOptions = null;
+            requestAssistantResponse({
+              queueIfBusy: true,
+              response: {
+                output_modalities: ["audio"],
+                instructions: `Say exactly: ${JSON.stringify(compliance.replacement)} Say nothing else.`
+              }
+            });
+            await appendAction(call.call_id, {
+              action: "compliance_output_intercepted",
+              success: true,
+              policy_code: compliance.code
+            });
+            return;
+          }
+          if (
+            !activeResponsePreservesQuestion &&
+            !questionCapturedForResponse
+          ) {
+            const question = extractPrimaryQuestion(assistantTranscriptBuffer);
+            if (question) {
+              questionCapturedForResponse = true;
+              sendToOpenAI({ type: "response.cancel" });
+              const state = await setAwaitingCustomerResponse(
+                call.call_id,
+                question
+              );
+              awaitingCustomerResponse = true;
+              pendingQuestionType = state.pending_question_type;
+              pendingQuestionText = state.pending_question_text;
+              questionAskedAt = state.question_asked_at;
+              responseReminderCount = 0;
+              queuedResponseOptions = null;
+              scheduleSilenceReminder();
+            }
+          }
           return;
         }
 
@@ -5597,21 +6126,44 @@ mediaServer.on("connection", (twilioSocket) => {
         }
 
         if (event.type === "input_audio_buffer.speech_started") {
+          customerSpeaking = true;
+          customerTurnBeganWhileAssistantSpeaking =
+            assistantResponseActive || responseCreatePending;
+          cancelSilenceReminder();
+          if (customerTranscriptDebounceTimer) {
+            clearTimeout(customerTranscriptDebounceTimer);
+            customerTranscriptDebounceTimer = null;
+          }
+          logCustomerResponseState(call.call_id, {
+            ...currentQuestionState(),
+            awaiting_customer_response: awaitingCustomerResponse,
+            customer_speech_detected: true
+          });
           if (sustainedSpeechTimer) clearTimeout(sustainedSpeechTimer);
           sustainedSpeechTimer = setTimeout(() => {
             void stopAssistantForCustomer();
-          }, 850);
+          }, REALTIME_DEFAULTS.meaningfulInterruptionMs);
           return;
         }
 
         if (event.type === "input_audio_buffer.speech_stopped") {
+          customerSpeaking = false;
           if (sustainedSpeechTimer) clearTimeout(sustainedSpeechTimer);
           sustainedSpeechTimer = null;
           return;
         }
 
         if (event.type === "response.output_audio_transcript.done") {
-          await appendTranscript(call.call_id, "assistant", event.transcript);
+          if (!assistantTranscriptSaved) {
+            await appendTranscript(call.call_id, "assistant", event.transcript);
+            assistantTranscriptSaved = true;
+          }
+          if (!questionCapturedForResponse) {
+            await captureAssistantQuestion(event.transcript);
+            questionCapturedForResponse = Boolean(
+              extractPrimaryQuestion(event.transcript)
+            );
+          }
           return;
         }
 
@@ -5626,13 +6178,32 @@ mediaServer.on("connection", (twilioSocket) => {
           );
           if (handledUserTurns.has(turnKey)) return;
           handledUserTurns.add(turnKey);
-          const acknowledgement = briefListeningAcknowledgement(event.transcript);
-          if (
-            (assistantResponseActive || responseCreatePending) &&
-            acknowledgement
-          ) return;
-          if (assistantResponseActive) await stopAssistantForCustomer();
-          requestAssistantResponse({ queueIfBusy: true });
+          pendingCustomerTranscripts.push(cleanText(event.transcript, 8000));
+          pendingTranscriptWasWhileAssistantSpeaking =
+            pendingTranscriptWasWhileAssistantSpeaking ||
+            customerTurnBeganWhileAssistantSpeaking;
+          customerTurnBeganWhileAssistantSpeaking = false;
+          if (customerTranscriptDebounceTimer) {
+            clearTimeout(customerTranscriptDebounceTimer);
+          }
+          customerTranscriptDebounceTimer = setTimeout(() => {
+            customerTranscriptDebounceTimer = null;
+            const completedTranscript = pendingCustomerTranscripts
+              .filter(Boolean)
+              .join(" ");
+            pendingCustomerTranscripts = [];
+            const beganWhileAssistantSpeaking =
+              pendingTranscriptWasWhileAssistantSpeaking;
+            pendingTranscriptWasWhileAssistantSpeaking = false;
+            void processCompletedCustomerTranscript(
+              completedTranscript,
+              beganWhileAssistantSpeaking
+            ).catch(
+              (error) => {
+                console.error("Daisy completed transcript handling failed:", error);
+              }
+            );
+          }, semanticTurnDelay(event.transcript));
           return;
         }
 
@@ -5661,6 +6232,21 @@ mediaServer.on("connection", (twilioSocket) => {
         if (event.type === "response.done") {
           assistantResponseActive = false;
           responseCreatePending = false;
+          assistantResponseFinished = true;
+          if (!assistantTranscriptSaved && assistantTranscriptBuffer) {
+            await appendTranscript(
+              call.call_id,
+              "assistant",
+              assistantTranscriptBuffer
+            );
+            assistantTranscriptSaved = true;
+          }
+          if (!questionCapturedForResponse && assistantTranscriptBuffer) {
+            await captureAssistantQuestion(assistantTranscriptBuffer);
+            questionCapturedForResponse = Boolean(
+              extractPrimaryQuestion(assistantTranscriptBuffer)
+            );
+          }
           for (const item of event.response?.output || []) {
             if (item && item.type === "function_call") {
               await handleToolCall(
@@ -5670,10 +6256,16 @@ mediaServer.on("connection", (twilioSocket) => {
               );
             }
           }
-          if (responseCreateQueued) {
-            responseCreateQueued = false;
-            requestAssistantResponse();
+          activeResponsePreservesQuestion = false;
+          lastWaitingPromptKind = activeResponseWaitingPromptKind;
+          activeResponseWaitingPromptKind = null;
+          if (queuedResponseOptions) {
+            const options = queuedResponseOptions;
+            queuedResponseOptions = null;
+            requestAssistantResponse(options);
           }
+          complianceRecoveryActive = false;
+          scheduleSilenceReminder();
           return;
         }
 
@@ -5747,7 +6339,29 @@ mediaServer.on("connection", (twilioSocket) => {
           twilio_call_sid: message.start?.callSid
         });
         call = await getCallById(call.call_id);
+        awaitingCustomerResponse = call.awaiting_customer_response === true;
+        pendingQuestionType = call.pending_question_type || null;
+        pendingQuestionText = call.pending_question_text || null;
+        questionAskedAt = call.question_asked_at
+          ? new Date(call.question_asked_at).toISOString()
+          : null;
+        responseReminderCount = Number(call.response_reminder_count || 0);
+        if (awaitingCustomerResponse && pendingQuestionText) {
+          suspendedQuestionState = currentQuestionState();
+          awaitingCustomerResponse = false;
+          pendingQuestionType = null;
+          pendingQuestionText = null;
+          questionAskedAt = null;
+          responseReminderCount = 0;
+        }
         connectToOpenAI();
+        return;
+      }
+
+      if (message.event === "mark") {
+        const name = cleanText(message.mark?.name, 100);
+        if (name) pendingMarkNames.delete(name);
+        if (!pendingMarkNames.size) scheduleSilenceReminder();
         return;
       }
 
@@ -5769,6 +6383,10 @@ mediaServer.on("connection", (twilioSocket) => {
 
       if (message.event === "stop") {
         closed = true;
+        cancelSilenceReminder();
+        if (customerTranscriptDebounceTimer) {
+          clearTimeout(customerTranscriptDebounceTimer);
+        }
         if (call) {
           void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
             console.error("Failed to schedule disconnect reconnect:", error);
@@ -5794,6 +6412,10 @@ mediaServer.on("connection", (twilioSocket) => {
 
   twilioSocket.on("close", () => {
     closed = true;
+    cancelSilenceReminder();
+    if (customerTranscriptDebounceTimer) {
+      clearTimeout(customerTranscriptDebounceTimer);
+    }
     if (sustainedSpeechTimer) clearTimeout(sustainedSpeechTimer);
     if (call) {
       void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
