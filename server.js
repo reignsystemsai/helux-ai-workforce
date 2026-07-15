@@ -91,6 +91,10 @@ const DAISY_RESOURCE_LIBRARY = Object.freeze({
 const CALL_SCHEDULER_ENABLED =
   String(process.env.CALL_SCHEDULER_ENABLED || "false").toLowerCase() ===
   "true";
+const OUTBOUND_CALLS_ENABLED =
+  String(
+    process.env.OUTBOUND_CALLS_ENABLED || "false"
+  ).toLowerCase() === "true";
 const ENFORCE_CALL_CONSENT =
   String(process.env.ENFORCE_CALL_CONSENT || "false").toLowerCase() ===
   "true";
@@ -1777,6 +1781,158 @@ function pendingAttemptStatus(status) {
   );
 }
 
+function callHasSuccessfulCompleteCall(call) {
+  const actions = Array.isArray(call?.actions) ? call.actions : [];
+  return Boolean(
+    actions.some(
+      (action) =>
+        action?.action === "complete_call" && action?.success === true
+    ) ||
+      call?.result?.normal_completion_recorded === true ||
+      call?.result?.completion_reason === "normal_completion"
+  );
+}
+
+function outboundCallSource(attempt, requestedSource) {
+  if (requestedSource) return requestedSource;
+  if (attempt?.attempt_type === "disconnect_reconnect") {
+    return "unexpected_reconnect";
+  }
+  if (
+    ["customer_callback", "application_checkpoint"].includes(
+      attempt?.attempt_type
+    )
+  ) {
+    return "callback";
+  }
+  return "scheduler";
+}
+
+function outboundCallDueAt(call, attempt) {
+  if (
+    ["customer_callback", "application_checkpoint", "disconnect_reconnect"].includes(
+      attempt?.attempt_type
+    )
+  ) {
+    return call?.callback_at || call?.next_attempt_at || null;
+  }
+  return call?.next_attempt_at || null;
+}
+
+function legitimateScheduledAppointment(call, attempt) {
+  if (
+    !["customer_callback", "application_checkpoint"].includes(
+      attempt?.attempt_type
+    ) ||
+    call?.callback_requested !== true
+  ) {
+    return false;
+  }
+  const callbackAt = call.callback_at ? new Date(call.callback_at) : null;
+  const scheduledAt = attempt?.scheduled_at
+    ? new Date(attempt.scheduled_at)
+    : null;
+  return Boolean(
+    callbackAt &&
+      scheduledAt &&
+      !Number.isNaN(callbackAt.getTime()) &&
+      !Number.isNaN(scheduledAt.getTime()) &&
+      callbackAt.getTime() === scheduledAt.getTime() &&
+      attempt.attempt_id !== call.last_attempt_id
+  );
+}
+
+function outboundCallEligibility(call, attempt, currentTime = new Date()) {
+  const dueAtValue = outboundCallDueAt(call, attempt);
+  const dueAt = dueAtValue ? new Date(dueAtValue) : null;
+  const attemptDueAt = attempt?.scheduled_at
+    ? new Date(attempt.scheduled_at)
+    : null;
+  const scheduledAppointment = legitimateScheduledAppointment(call, attempt);
+  const status = String(call?.status || "").toLowerCase();
+  const sequenceStatus = String(call?.sequence_status || "").toLowerCase();
+  const activeStatuses = [
+    "placing",
+    "queued",
+    "initiated",
+    "ringing",
+    "answered",
+    "in-progress"
+  ];
+
+  let reason = "eligible_due_call";
+  if (!call) reason = "call_missing";
+  else if (!attempt) reason = "attempt_missing";
+  else if (!pendingAttemptStatus(attempt.technical_status)) {
+    reason = "attempt_already_claimed_or_cancelled";
+  } else if (
+    callHasSuccessfulCompleteCall(call) &&
+    !scheduledAppointment
+  ) {
+    reason = "complete_call_already_succeeded";
+  } else if (
+    (status === "completed" || sequenceStatus === "completed") &&
+    !scheduledAppointment
+  ) {
+    reason = "call_already_completed";
+  } else if (["canceled", "cancelled"].includes(status)) {
+    reason = "call_cancelled";
+  } else if (call.do_not_call) reason = "do_not_call";
+  else if (call.wrong_number || call.invalid_number) {
+    reason = "contact_suppressed";
+  } else if (sequenceStatus === "paused") reason = "manual_hold";
+  else if (["suppressed", "exhausted", "human_action"].includes(sequenceStatus)) {
+    reason = "sequence_not_callable";
+  } else if (activeStatuses.includes(status) || sequenceStatus === "calling") {
+    reason = "call_already_dialing_or_connected";
+  } else if (
+    call.twilio_call_sid &&
+    !["busy", "failed", "no-answer", "completed"].includes(status)
+  ) {
+    reason = "active_twilio_call_sid_exists";
+  } else if (!dueAtValue) reason = "due_timestamp_missing";
+  else if (!dueAt || Number.isNaN(dueAt.getTime())) {
+    reason = "due_timestamp_invalid";
+  } else if (dueAt > currentTime) reason = "call_not_due_yet";
+  else if (!attempt?.scheduled_at) reason = "attempt_due_timestamp_missing";
+  else if (!attemptDueAt || Number.isNaN(attemptDueAt.getTime())) {
+    reason = "attempt_due_timestamp_invalid";
+  } else if (attemptDueAt > currentTime) reason = "attempt_not_due_yet";
+
+  return {
+    eligible: reason === "eligible_due_call",
+    reason,
+    dueAt: dueAt && !Number.isNaN(dueAt.getTime())
+      ? dueAt.toISOString()
+      : cleanText(dueAtValue, 100),
+    scheduledAppointment
+  };
+}
+
+function logOutboundCallEligibility(call, attempt, source, eligibility) {
+  console.log(JSON.stringify({
+    event: "outbound_call_eligibility",
+    call_id: call?.call_id || null,
+    source,
+    due_at: eligibility?.dueAt || null,
+    eligible: eligibility?.eligible === true,
+    reason: eligibility?.reason || "unknown"
+  }));
+}
+
+function blockDisabledOutboundCall(call, source, dueAt = null) {
+  console.log(JSON.stringify({
+    event: "outbound_call_blocked",
+    call_id: call?.call_id || null,
+    reason: "OUTBOUND_CALLS_ENABLED_is_false"
+  }));
+  logOutboundCallEligibility(call, null, source, {
+    dueAt: dueAt ? cleanText(dueAt, 100) : null,
+    eligible: false,
+    reason: "OUTBOUND_CALLS_ENABLED_is_false"
+  });
+}
+
 function attemptTypeForCall(call, requestedType = null) {
   if (requestedType) return requestedType;
   if (call.payload?.call_type === "dpa_agent_notification") {
@@ -1959,11 +2115,16 @@ async function cleanupPreResultDuplicateAttempts() {
   const due = await pool.query(
     `
       WITH earliest AS (
-        SELECT DISTINCT ON (call_id) call_id, attempt_id
-        FROM call_attempts
-        WHERE attempt_type = 'cadence' AND completed_at IS NULL
-          AND technical_status IN ('pending', 'scheduled', 'created')
-        ORDER BY call_id, scheduled_at ASC NULLS FIRST, id ASC
+        SELECT DISTINCT ON (ca.call_id) ca.call_id, ca.attempt_id
+        FROM call_attempts ca
+        JOIN ai_calls ac ON ac.call_id = ca.call_id
+        WHERE ca.attempt_type = 'cadence' AND ca.completed_at IS NULL
+          AND ca.technical_status IN ('pending', 'scheduled', 'created')
+          AND ac.status <> 'completed'
+          AND ac.sequence_status <> 'completed'
+          AND COALESCE(ac.result->>'normal_completion_recorded', 'false') <> 'true'
+          AND COALESCE(ac.result->>'completion_reason', '') <> 'normal_completion'
+        ORDER BY ca.call_id, ca.scheduled_at ASC NULLS FIRST, ca.id ASC
       ), made_due AS (
         UPDATE call_attempts ca
         SET scheduled_at = NOW(), updated_at = NOW()
@@ -1973,7 +2134,6 @@ async function cleanupPreResultDuplicateAttempts() {
       )
       UPDATE ai_calls ac
       SET next_attempt_at = made_due.scheduled_at,
-          sequence_status = CASE WHEN ac.sequence_status = 'completed' THEN 'scheduled' ELSE ac.sequence_status END,
           completed_at = NULL, updated_at = NOW()
       FROM made_due
       WHERE ac.call_id = made_due.call_id
@@ -3727,15 +3887,22 @@ async function createDpaAgentNotification(itemId, statusLabel) {
     ]
   );
   const notificationCall = inserted.rows[0];
+  const notificationDueAt = new Date();
   const notificationAttempt = await ensurePendingAttempt(notificationCall.call_id, {
     attemptType: "specialist_notification",
-    scheduledAt: new Date(),
+    scheduledAt: notificationDueAt,
     idempotencyKey: `specialist_notification:${notificationCall.call_id}:1`
   });
-  if (insideOperatingWindow(new Date(), notificationCall.timezone)) {
+  if (insideOperatingWindow(notificationDueAt, notificationCall.timezone)) {
+    await pool.query(
+      `UPDATE ai_calls SET sequence_status = 'scheduled', next_attempt_at = $2,
+       updated_at = NOW() WHERE call_id = $1`,
+      [notificationCall.call_id, notificationDueAt]
+    );
     await placeTwilioCall(notificationCall, {
       force: true,
-      attemptId: notificationAttempt.attempt_id
+      attemptId: notificationAttempt.attempt_id,
+      source: "initial"
     });
   } else {
     const nextAttemptAt = nextValidWindow(
@@ -3748,6 +3915,11 @@ async function createDpaAgentNotification(itemId, statusLabel) {
       `UPDATE ai_calls SET sequence_status = 'scheduled', next_attempt_at = $2,
        updated_at = NOW() WHERE call_id = $1`,
       [notificationCall.call_id, nextAttemptAt]
+    );
+    await pool.query(
+      `UPDATE call_attempts SET scheduled_at = $2, updated_at = NOW()
+       WHERE attempt_id = $1 AND technical_status IN ('pending', 'scheduled', 'created')`,
+      [notificationAttempt.attempt_id, nextAttemptAt]
     );
   }
   await setIntegrationState(eventKey, {
@@ -4583,7 +4755,7 @@ async function scheduleUnexpectedReconnect(callId) {
   const intentionallyEnded = actions.some(
     (action) =>
       action &&
-      action.action === "twilio_call_hangup" &&
+      ["twilio_call_hangup", "twilio_final_hangup"].includes(action.action) &&
       action.success &&
       action.completion_reason === "normal_completion"
   );
@@ -4592,6 +4764,7 @@ async function scheduleUnexpectedReconnect(callId) {
     completedByTool ||
     intentionallyEnded ||
     call.result?.normal_completion_recorded === true ||
+    call.result?.final_hangup_requested === true ||
     call.result?.final_hangup_completed === true ||
     call.result?.completion_reason === "normal_completion" ||
     String(call.status || "").toLowerCase() === "completed"
@@ -4600,7 +4773,7 @@ async function scheduleUnexpectedReconnect(callId) {
     console.log(JSON.stringify({
       event: "unexpected_reconnect_skipped",
       call_id: call.call_id,
-      reason: "normal_call_completion"
+      reason: "normal_completion_or_intentional_hangup"
     }));
     return false;
   }
@@ -4632,6 +4805,17 @@ async function scheduleUnexpectedReconnect(callId) {
           completed_at = NULL, result = result || $4::jsonb, updated_at = NOW()
       WHERE call_id = $1
         AND COALESCE(result->>'unexpected_disconnect_reconnect_scheduled', 'false') <> 'true'
+        AND COALESCE(result->>'normal_completion_recorded', 'false') <> 'true'
+        AND COALESCE(result->>'final_hangup_requested', 'false') <> 'true'
+        AND COALESCE(result->>'final_hangup_completed', 'false') <> 'true'
+        AND COALESCE(result->>'completion_reason', '') <> 'normal_completion'
+        AND status <> 'completed'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(actions) AS action
+          WHERE action->>'action' = 'complete_call'
+            AND COALESCE((action->>'success')::BOOLEAN, FALSE) = TRUE
+        )
       RETURNING call_id
     `,
     [
@@ -4850,6 +5034,16 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
 async function placeTwilioCall(call, options = {}) {
   let refreshedCall = await getCallById(call.call_id);
   if (!refreshedCall) throw new Error("Call sequence not found.");
+  let source = outboundCallSource(null, options.source);
+
+  if (!OUTBOUND_CALLS_ENABLED) {
+    blockDisabledOutboundCall(
+      refreshedCall,
+      source,
+      refreshedCall.callback_at || refreshedCall.next_attempt_at
+    );
+    throw new HttpError(409, "Outbound calls are disabled.");
+  }
 
   if (
     refreshedCall.do_not_call ||
@@ -4882,8 +5076,24 @@ async function placeTwilioCall(call, options = {}) {
         scheduledAt: refreshedCall.next_attempt_at || new Date()
       });
   if (!pendingAttempt) throw new HttpError(409, "No pending attempt is available.");
+  source = outboundCallSource(pendingAttempt, options.source);
+
+  const initialEligibility = outboundCallEligibility(
+    refreshedCall,
+    pendingAttempt
+  );
+  if (!initialEligibility.eligible) {
+    logOutboundCallEligibility(
+      refreshedCall,
+      pendingAttempt,
+      source,
+      initialEligibility
+    );
+    throw new HttpError(409, `Outbound call blocked: ${initialEligibility.reason}.`);
+  }
 
   const client = await pool.connect();
+  let claimedDueAt = initialEligibility.dueAt;
   try {
     await client.query("BEGIN");
     const lockedCallResult = await client.query(
@@ -4896,15 +5106,20 @@ async function placeTwilioCall(call, options = {}) {
     );
     refreshedCall = lockedCallResult.rows[0];
     pendingAttempt = lockedAttemptResult.rows[0];
-    if (!refreshedCall || !pendingAttempt || !pendingAttemptStatus(pendingAttempt.technical_status)) {
-      throw new HttpError(409, "Pending attempt was already claimed.");
+    const lockedEligibility = outboundCallEligibility(
+      refreshedCall,
+      pendingAttempt
+    );
+    if (!lockedEligibility.eligible) {
+      logOutboundCallEligibility(
+        refreshedCall,
+        pendingAttempt,
+        source,
+        lockedEligibility
+      );
+      throw new HttpError(409, `Outbound call blocked: ${lockedEligibility.reason}.`);
     }
-    if (
-      refreshedCall.sequence_status === "calling" &&
-      refreshedCall.last_attempt_id !== pendingAttempt.attempt_id
-    ) {
-      throw new HttpError(409, "Another attempt is already dialing.");
-    }
+    claimedDueAt = lockedEligibility.dueAt;
 
     if (refreshedCall.current_state === "reconnect_pending") {
       await client.query(
@@ -4916,19 +5131,51 @@ async function placeTwilioCall(call, options = {}) {
         ]
       );
     }
-    await client.query(
-      `UPDATE call_attempts SET technical_status = 'placing',
-       dialed_at = NOW(), scheduled_at = COALESCE(scheduled_at, NOW()),
-       updated_at = NOW() WHERE attempt_id = $1`,
-      [pendingAttempt.attempt_id]
-    );
-    await client.query(
-      `UPDATE ai_calls SET status = 'placing', sequence_status = 'calling',
-       attempts = attempts + 1, last_attempt_id = $2, last_attempt_at = NOW(),
-       next_attempt_at = NULL, last_error = NULL, completed_at = NULL,
-       callback_requested = CASE WHEN $3::BOOLEAN THEN FALSE ELSE callback_requested END,
-       callback_at = CASE WHEN $3::BOOLEAN THEN NULL ELSE callback_at END,
-       updated_at = NOW() WHERE call_id = $1`,
+    const explicitAppointment = lockedEligibility.scheduledAppointment;
+    const claimedCallResult = await client.query(
+      `UPDATE ai_calls
+       SET status = 'placing', sequence_status = 'calling',
+           stream_token = $4, twilio_call_sid = NULL,
+           attempts = attempts + 1, last_attempt_id = $2, last_attempt_at = NOW(),
+           next_attempt_at = NULL, last_error = NULL, completed_at = NULL,
+           callback_requested = CASE WHEN $3::BOOLEAN THEN FALSE ELSE callback_requested END,
+           callback_at = CASE WHEN $3::BOOLEAN THEN NULL ELSE callback_at END,
+           result = CASE
+             WHEN $5::BOOLEAN THEN result
+               - 'normal_completion_recorded'
+               - 'normal_completion_recorded_at'
+               - 'final_hangup_requested'
+               - 'final_hangup_completed'
+               - 'final_hangup_completed_at'
+               - 'completion_reason'
+               - 'intentional_twilio_hangup'
+             ELSE result
+           END,
+           updated_at = NOW()
+       WHERE call_id = $1
+         AND status = $6
+         AND sequence_status = $7
+         AND twilio_call_sid IS NOT DISTINCT FROM $8::VARCHAR
+         AND do_not_call = FALSE
+         AND wrong_number = FALSE
+         AND invalid_number = FALSE
+         AND status NOT IN ('placing', 'queued', 'initiated', 'ringing', 'answered', 'in-progress', 'canceled', 'cancelled')
+         AND sequence_status IN ('ready', 'active', 'scheduled', 'waiting_retry', 'callback_scheduled')
+         AND ($5::BOOLEAN OR (
+           status <> 'completed'
+           AND sequence_status <> 'completed'
+           AND COALESCE(result->>'normal_completion_recorded', 'false') <> 'true'
+           AND COALESCE(result->>'completion_reason', '') <> 'normal_completion'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM jsonb_array_elements(actions) AS action
+             WHERE action->>'action' = 'complete_call'
+               AND COALESCE((action->>'success')::BOOLEAN, FALSE) = TRUE
+           )
+         ))
+         AND $9::TIMESTAMPTZ <= NOW()
+         AND (next_attempt_at = $9::TIMESTAMPTZ OR callback_at = $9::TIMESTAMPTZ)
+       RETURNING *`,
       [
         refreshedCall.call_id,
         pendingAttempt.attempt_id,
@@ -4936,9 +5183,35 @@ async function placeTwilioCall(call, options = {}) {
           "customer_callback",
           "application_checkpoint",
           "disconnect_reconnect"
-        ].includes(pendingAttempt.attempt_type)
+        ].includes(pendingAttempt.attempt_type),
+        createStreamToken(),
+        explicitAppointment,
+        refreshedCall.status,
+        refreshedCall.sequence_status,
+        refreshedCall.twilio_call_sid || null,
+        claimedDueAt
       ]
     );
+    if (!claimedCallResult.rowCount) {
+      throw new HttpError(409, "Call row was not eligible for atomic claim.");
+    }
+    const claimedAttemptResult = await client.query(
+      `UPDATE call_attempts
+       SET technical_status = 'placing', dialed_at = NOW(), updated_at = NOW()
+       WHERE attempt_id = $1
+         AND call_id = $2
+         AND technical_status IN ('pending', 'scheduled', 'created')
+         AND completed_at IS NULL
+         AND scheduled_at IS NOT NULL
+         AND scheduled_at <= NOW()
+       RETURNING *`,
+      [pendingAttempt.attempt_id, refreshedCall.call_id]
+    );
+    if (!claimedAttemptResult.rowCount) {
+      throw new HttpError(409, "Call attempt was not eligible for atomic claim.");
+    }
+    refreshedCall = claimedCallResult.rows[0];
+    pendingAttempt = claimedAttemptResult.rows[0];
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -4946,6 +5219,41 @@ async function placeTwilioCall(call, options = {}) {
   } finally {
     client.release();
   }
+
+  refreshedCall = await getCallById(refreshedCall.call_id);
+  pendingAttempt = await getAttemptById(pendingAttempt.attempt_id);
+  const claimedEligibility = {
+    dueAt: claimedDueAt,
+    eligible: Boolean(
+      refreshedCall &&
+        pendingAttempt &&
+        refreshedCall.status === "placing" &&
+        refreshedCall.sequence_status === "calling" &&
+        refreshedCall.last_attempt_id === pendingAttempt.attempt_id &&
+        pendingAttempt.technical_status === "placing" &&
+        !refreshedCall.twilio_call_sid &&
+        !refreshedCall.do_not_call &&
+        !refreshedCall.wrong_number &&
+        !refreshedCall.invalid_number
+    ),
+    reason: "atomic_claim_confirmed"
+  };
+  if (!claimedEligibility.eligible) {
+    claimedEligibility.reason = "post_claim_recheck_failed";
+    logOutboundCallEligibility(
+      refreshedCall,
+      pendingAttempt,
+      source,
+      claimedEligibility
+    );
+    throw new HttpError(409, "Outbound call blocked after atomic claim recheck.");
+  }
+  logOutboundCallEligibility(
+    refreshedCall,
+    pendingAttempt,
+    source,
+    claimedEligibility
+  );
 
   const attemptId = pendingAttempt.attempt_id;
   const attemptNumber = Number(pendingAttempt.attempt_number);
@@ -4956,6 +5264,11 @@ async function placeTwilioCall(call, options = {}) {
   statusUrl.searchParams.set("call_id", refreshedCall.call_id);
   statusUrl.searchParams.set("token", refreshedCall.stream_token);
   queueMondaySync(refreshedCall.call_id, "attempt_created");
+
+  if (!OUTBOUND_CALLS_ENABLED) {
+    blockDisabledOutboundCall(refreshedCall, source, claimedDueAt);
+    throw new HttpError(409, "Outbound calls are disabled.");
+  }
 
   try {
     const twilioCall = await twilioClient.calls.create({
@@ -6313,7 +6626,8 @@ app.post(
 
       const twilioCall = await placeTwilioCall(call, {
         force: forceCallNow,
-        attemptId: firstAttempt.attempt_id
+        attemptId: firstAttempt.attempt_id,
+        source: "initial"
       });
 
       res.status(201).json({
@@ -6348,28 +6662,54 @@ app.post(
         );
       }
 
-      const newStreamToken = createStreamToken();
-      await pool.query(
+      if (callHasSuccessfulCompleteCall(call)) {
+        throw new HttpError(409, "A normally completed call cannot be retried.");
+      }
+
+      const retryResult = await pool.query(
         `
           UPDATE ai_calls
           SET
-            stream_token = $2,
-            status = 'created',
             sequence_status = 'ready',
-            twilio_call_sid = NULL,
             last_error = NULL,
             completed_at = NULL,
-            next_attempt_at = NULL,
+            next_attempt_at = NOW(),
             updated_at = NOW()
           WHERE call_id = $1
+            AND status <> 'completed'
+            AND sequence_status NOT IN ('completed', 'suppressed', 'paused')
+            AND do_not_call = FALSE
+            AND wrong_number = FALSE
+            AND invalid_number = FALSE
+          RETURNING *
         `,
-        [call.call_id, newStreamToken]
+        [call.call_id]
       );
+      if (!retryResult.rowCount) {
+        throw new HttpError(409, "Call is not eligible for a manual retry.");
+      }
 
       queueMondaySync(call.call_id, "manual_retry_ready");
-      const refreshed = await getCallById(call.call_id);
+      const refreshed = retryResult.rows[0];
+      const retryAttempt = await ensurePendingAttempt(call.call_id, {
+        attemptType: "cadence",
+        scheduledAt: refreshed.next_attempt_at,
+        idempotencyKey: `manual_retry:${call.call_id}:${Date.now()}`
+      });
+      if (!retryAttempt) {
+        throw new HttpError(409, "No retry attempt is available.");
+      }
+      await pool.query(
+        `UPDATE call_attempts SET scheduled_at = $2, updated_at = NOW()
+         WHERE attempt_id = $1
+           AND completed_at IS NULL
+           AND technical_status IN ('pending', 'scheduled', 'created')`,
+        [retryAttempt.attempt_id, refreshed.next_attempt_at]
+      );
       const twilioCall = await placeTwilioCall(refreshed, {
-        force: req.body && req.body.force === true
+        force: req.body && req.body.force === true,
+        attemptId: retryAttempt.attempt_id,
+        source: "initial"
       });
 
       res.json({
@@ -6665,6 +7005,7 @@ mediaServer.on("connection", (twilioSocket) => {
   let finalHangupInProgress = false;
   let finalHangupCompleted = false;
   let finalHangupFallbackTimer = null;
+  let activeTwilioCallSid = "";
   let assistantAudioQueuedForResponse = false;
   let finalClosingAudioQueued = false;
   let sustainedSpeechTimer = null;
@@ -6782,7 +7123,7 @@ mediaServer.on("connection", (twilioSocket) => {
         finalHangupRequested &&
         !finalHangupCompleted
       ) {
-        void finishAndHangupTwilioCall("final_audio_playback_timeout");
+        void finishAndHangupTwilioCall("final_playback_timeout_fallback");
       }
     }, 8000);
     return true;
@@ -7141,12 +7482,13 @@ mediaServer.on("connection", (twilioSocket) => {
       const refreshedCall =
         (await getCallById(call.call_id)) || call;
       const twilioCallSid =
+        activeTwilioCallSid ||
         refreshedCall.twilio_call_sid ||
         call.twilio_call_sid;
 
       if (!twilioCallSid) {
         throw new Error(
-          "Twilio Call SID is unavailable for final hangup."
+          "Active Twilio Call SID unavailable."
         );
       }
 
@@ -7199,9 +7541,10 @@ mediaServer.on("connection", (twilioSocket) => {
       };
 
       await appendAction(call.call_id, {
-        action: "twilio_call_hangup",
+        action: "twilio_final_hangup",
         success: true,
         reason,
+        twilio_call_sid: twilioCallSid,
         completion_reason: "normal_completion"
       });
 
@@ -7210,7 +7553,7 @@ mediaServer.on("connection", (twilioSocket) => {
           event: "twilio_final_hangup",
           call_id: call.call_id,
           twilio_call_sid: twilioCallSid,
-          reason: "final_audio_playback_complete",
+          reason,
           success: true,
         })
       );
@@ -7222,7 +7565,7 @@ mediaServer.on("connection", (twilioSocket) => {
         "Twilio final hangup failed.";
 
       await appendAction(call.call_id, {
-        action: "twilio_call_hangup",
+        action: "twilio_final_hangup",
         success: false,
         reason,
         completion_reason: "normal_completion",
@@ -7287,8 +7630,47 @@ mediaServer.on("connection", (twilioSocket) => {
       normalCompletionRecorded = true;
       finalHangupRequested = true;
       stopCurrentCallAutomation();
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET
+            next_attempt_at = CASE
+              WHEN callback_requested AND callback_at > NOW() THEN callback_at
+              ELSE NULL
+            END,
+            current_state = CASE
+              WHEN current_state IN ('reconnect_pending', 'reconnect_in_progress')
+                THEN 'completed'
+              ELSE current_state
+            END,
+            last_error = NULL,
+            result = result
+              - 'unexpected_disconnect_reconnect_scheduled'
+              - 'unexpected_disconnect_at'
+              - 'reconnect_at'
+              - 'unexpected_disconnect_reconnect_attempted'
+              - 'unexpected_disconnect_reconnect_completed',
+            updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [call.call_id]
+      );
+      await pool.query(
+        `
+          UPDATE call_attempts
+          SET technical_status = 'canceled', completed_at = NOW(),
+              cancellation_reason = 'normal_call_completion', updated_at = NOW()
+          WHERE call_id = $1
+            AND attempt_id IS DISTINCT FROM $2
+            AND attempt_type IN ('cadence', 'disconnect_reconnect')
+            AND completed_at IS NULL
+            AND technical_status IN ('pending', 'scheduled', 'created')
+        `,
+        [call.call_id, call.last_attempt_id]
+      );
       await mergeCallResult(call.call_id, {
         normal_completion_recorded: true,
+        final_hangup_requested: true,
         completion_reason: "normal_completion",
         normal_completion_recorded_at: new Date().toISOString()
       });
@@ -7732,9 +8114,19 @@ mediaServer.on("connection", (twilioSocket) => {
         }
 
         streamSid = message.start?.streamSid || message.streamSid;
-        await updateCallStatus(call.call_id, "in-progress", {
-          twilio_call_sid: message.start?.callSid
-        });
+        activeTwilioCallSid = cleanText(message?.start?.callSid, 100) || "";
+        console.log(JSON.stringify({
+          event: "active_twilio_call_sid_captured",
+          call_id: call.call_id,
+          twilio_call_sid: activeTwilioCallSid || null
+        }));
+        await updateCallStatus(
+          call.call_id,
+          "in-progress",
+          activeTwilioCallSid
+            ? { twilio_call_sid: activeTwilioCallSid }
+            : {}
+        );
         call = await getCallById(call.call_id);
         awaitingCustomerResponse = call.awaiting_customer_response === true;
         pendingQuestionType = call.pending_question_type || null;
@@ -7789,10 +8181,21 @@ mediaServer.on("connection", (twilioSocket) => {
         if (customerTranscriptDebounceTimer) {
           clearTimeout(customerTranscriptDebounceTimer);
         }
-        if (call) {
+        if (
+          call &&
+          !normalCompletionRecorded &&
+          !finalHangupRequested &&
+          !finalHangupCompleted
+        ) {
           void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
             console.error("Failed to schedule disconnect reconnect:", error);
           });
+        } else if (call) {
+          console.log(JSON.stringify({
+            event: "unexpected_reconnect_skipped",
+            call_id: call.call_id,
+            reason: "normal_completion_or_intentional_hangup"
+          }));
         }
         if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
           openaiSocket.close();
@@ -7819,10 +8222,21 @@ mediaServer.on("connection", (twilioSocket) => {
       clearTimeout(customerTranscriptDebounceTimer);
     }
     if (sustainedSpeechTimer) clearTimeout(sustainedSpeechTimer);
-    if (call) {
+    if (
+      call &&
+      !normalCompletionRecorded &&
+      !finalHangupRequested &&
+      !finalHangupCompleted
+    ) {
       void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
         console.error("Failed to schedule disconnect reconnect:", error);
       });
+    } else if (call) {
+      console.log(JSON.stringify({
+        event: "unexpected_reconnect_skipped",
+        call_id: call.call_id,
+        reason: "normal_completion_or_intentional_hangup"
+      }));
     }
     if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
       openaiSocket.close();
@@ -7893,6 +8307,49 @@ async function runScheduler() {
           AND ca.completed_at IS NULL
           AND ca.scheduled_at IS NOT NULL
           AND ca.scheduled_at <= NOW()
+          AND ac.do_not_call = FALSE
+          AND ac.wrong_number = FALSE
+          AND ac.invalid_number = FALSE
+          AND ac.sequence_status <> 'paused'
+          AND ac.status NOT IN ('placing', 'queued', 'initiated', 'ringing', 'answered', 'in-progress', 'canceled', 'cancelled')
+          AND (
+            ac.twilio_call_sid IS NULL
+            OR ac.status IN ('busy', 'failed', 'no-answer', 'completed')
+          )
+          AND (
+            CASE
+              WHEN ca.attempt_type IN ('customer_callback', 'application_checkpoint')
+                THEN COALESCE(ac.callback_at, ac.next_attempt_at)
+              ELSE ac.next_attempt_at
+            END
+          ) IS NOT NULL
+          AND (
+            CASE
+              WHEN ca.attempt_type IN ('customer_callback', 'application_checkpoint')
+                THEN COALESCE(ac.callback_at, ac.next_attempt_at)
+              ELSE ac.next_attempt_at
+            END
+          ) <= NOW()
+          AND (
+            (
+              ca.attempt_type IN ('customer_callback', 'application_checkpoint')
+              AND ac.callback_requested = TRUE
+              AND ac.callback_at = ca.scheduled_at
+              AND ca.attempt_id IS DISTINCT FROM ac.last_attempt_id
+            )
+            OR (
+              ac.status <> 'completed'
+              AND ac.sequence_status <> 'completed'
+              AND COALESCE(ac.result->>'normal_completion_recorded', 'false') <> 'true'
+              AND COALESCE(ac.result->>'completion_reason', '') <> 'normal_completion'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(ac.actions) AS action
+                WHERE action->>'action' = 'complete_call'
+                  AND COALESCE((action->>'success')::BOOLEAN, FALSE) = TRUE
+              )
+            )
+          )
           AND (ca.attempt_type <> 'cadence' OR ac.attempts < ac.max_attempts)
         ORDER BY ca.scheduled_at ASC
         LIMIT 10
@@ -7943,23 +8400,18 @@ async function runScheduler() {
           continue;
         }
 
-        await pool.query(
-          `
-            UPDATE ai_calls
-            SET
-              stream_token = $2,
-              status = 'created',
-              twilio_call_sid = NULL,
-              completed_at = NULL,
-              updated_at = NOW()
-            WHERE call_id = $1
-          `,
-          [call.call_id, createStreamToken()]
+        await placeTwilioCall(call, {
+          attemptId: attempt.attempt_id,
+          source: outboundCallSource(attempt)
+        });
+        const dispatched = await getCallById(call.call_id);
+        logSchedulingDecision(
+          dispatched,
+          attempt,
+          "dispatch",
+          "due_attempt_dispatched_immediately",
+          currentTime
         );
-
-        const refreshed = await getCallById(call.call_id);
-        logSchedulingDecision(refreshed, attempt, "dispatch", "due_attempt_dispatched_immediately", currentTime);
-        await placeTwilioCall(refreshed, { attemptId: attempt.attempt_id });
       } catch (error) {
         if (error instanceof HttpError && error.statusCode === 409) {
           const call = await getCallById(row.call_id);
