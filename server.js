@@ -5,7 +5,9 @@ const { Pool } = require("pg");
 const twilio = require("twilio");
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
-const { REALTIME_TOOLS } = require("./src/intents/intent-types");
+const {
+  REALTIME_TOOLS: BASE_REALTIME_TOOLS
+} = require("./src/intents/intent-types");
 const { routeIntent } = require("./src/intents/intent-router");
 const { guardAssistantOutput } = require("./src/compliance/compliance-guardrails");
 const { isInterestRateQuestion, interestRateResponse } = require("./src/compliance/interest-rate-policy");
@@ -268,6 +270,103 @@ function normalizeBoolean(value) {
   return null;
 }
 
+function normalizeExplicitYesNo(value) {
+  if (value === true || value === false) return value;
+  const normalized = String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9'\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const negativePatterns = [
+    /\bno\b/,
+    /\bnope\b/,
+    /\bnot yet\b/,
+    /\bdon't\b/,
+    /\bdo not\b/,
+    /\bi don't have\b/,
+    /\bi do not have\b/,
+    /\bnot working with\b/,
+    /\bwithout a lender\b/,
+    /\bwithout a realtor\b/,
+    /\bneed a lender\b/,
+    /\bneed a realtor\b/
+  ];
+  if (negativePatterns.some((pattern) => pattern.test(normalized))) return false;
+
+  const positivePatterns = [
+    /\byes\b/,
+    /\byeah\b/,
+    /\byep\b/,
+    /\byup\b/,
+    /\bcorrect\b/,
+    /\babsolutely\b/,
+    /\bi do\b/,
+    /\bi have one\b/,
+    /\bi already have one\b/,
+    /\bi'm working with\b/,
+    /\bi am working with\b/
+  ];
+  if (positivePatterns.some((pattern) => pattern.test(normalized))) return true;
+  return null;
+}
+
+function wholeNumberToWords(value) {
+  const number = Math.trunc(Number(value));
+  if (!Number.isSafeInteger(number) || number < 0) return null;
+  if (number === 0) return "zero";
+  const ones = [
+    "", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+    "sixteen", "seventeen", "eighteen", "nineteen"
+  ];
+  const tens = [
+    "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+    "eighty", "ninety"
+  ];
+  const underThousand = (amount) => {
+    const parts = [];
+    if (amount >= 100) {
+      parts.push(`${ones[Math.floor(amount / 100)]} hundred`);
+      amount %= 100;
+    }
+    if (amount >= 20) {
+      parts.push(tens[Math.floor(amount / 10)]);
+      amount %= 10;
+    }
+    if (amount > 0) parts.push(ones[amount]);
+    return parts.join(" ");
+  };
+  const scales = [
+    [1_000_000_000, "billion"],
+    [1_000_000, "million"],
+    [1_000, "thousand"]
+  ];
+  let remaining = number;
+  const words = [];
+  for (const [scale, label] of scales) {
+    if (remaining >= scale) {
+      words.push(`${underThousand(Math.floor(remaining / scale))} ${label}`);
+      remaining %= scale;
+    }
+  }
+  if (remaining > 0) words.push(underThousand(remaining));
+  return words.join(" ");
+}
+
+function formatIncomeForDaisy(value) {
+  const numeric = Number(String(value ?? "").replace(/[$,\s]/g, ""));
+  if (!Number.isFinite(numeric) || numeric < 0) return cleanText(value, 160);
+  const wholeDollars = Math.round(numeric);
+  const words = wholeNumberToWords(wholeDollars);
+  const display = new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0
+  }).format(wholeDollars);
+  return words ? `${words} dollars (${display})` : display;
+}
+
 function normalizePhone(value) {
   const original = cleanText(value, 50);
   if (!original) return null;
@@ -345,9 +444,11 @@ function normalizeDaisyAnswers(input) {
     answers.time_frame = timeFrame;
     answers.interest_level = interestForTimeFrame(timeFrame);
   }
-  for (const key of ["has_realtor", "applied_with_lender"]) {
-    const normalized = normalizeBoolean(answers[key]);
-    if (normalized !== null) answers[key] = normalized ? "Yes" : "No";
+  for (const key of ["has_realtor", "applied_with_lender", "has_lender"]) {
+    if (!Object.prototype.hasOwnProperty.call(answers, key)) continue;
+    const normalized = normalizeExplicitYesNo(answers[key]);
+    if (normalized === null) delete answers[key];
+    else answers[key] = normalized ? "Yes" : "No";
   }
   if (answers.app_started_confirmation) {
     answers.app_started_confirmation = cleanText(
@@ -505,6 +606,7 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - Never discuss or quote interest rates.
 - Never guarantee approval, eligibility, a program, an assistance amount, a closing date, or a home price.
 - DTI and homebuying power are preliminary estimates only.
+- Read income and dollar amounts as natural currency. Never read a multi-digit dollar amount one digit at a time.
 - Only send a text link after the customer agrees to receive it.
 - After scheduling a callback, ask permission before sending a text confirmation.
 - Never claim a text, callback, handoff, or other action succeeded until the tool confirms success.
@@ -1038,7 +1140,7 @@ function buildDouglasDaisyInstructions(call) {
     estimated_dpa:
       formatAssistanceAmount(lead.estimated_dpa) || "not provided",
     income_submitted:
-      cleanText(lead.household_income ?? lead.income, 160) ||
+      formatIncomeForDaisy(lead.household_income ?? lead.income) ||
       "not provided",
     work_history_submitted:
       cleanText(
@@ -1197,6 +1299,18 @@ const DOUG_TOOLS = [
           type: "string",
           description: "ISO 8601 datetime including timezone offset."
         },
+        customer_local_date: {
+          type: "string",
+          description: "Customer-confirmed local date or relative date phrase."
+        },
+        customer_local_time: {
+          type: "string",
+          description: "Customer-confirmed local time."
+        },
+        application_local_date: {
+          type: "string",
+          description: "Stated application date when the callback is the following day."
+        },
         timezone: { type: "string" },
         reason: { type: "string" },
         primary_concern: { type: "string" },
@@ -1338,6 +1452,31 @@ const DOUG_TOOLS = [
     }
   }
 ];
+
+const LOCAL_SCHEDULE_CALLBACK_TOOL = DOUG_TOOLS.find(
+  (toolDefinition) => toolDefinition.name === "schedule_callback"
+);
+const REALTIME_TOOLS = Object.freeze(
+  BASE_REALTIME_TOOLS.map((toolDefinition) =>
+    toolDefinition.name === "schedule_callback"
+      ? {
+          ...toolDefinition,
+          parameters: {
+            ...toolDefinition.parameters,
+            properties: {
+              ...toolDefinition.parameters.properties,
+              customer_local_date:
+                LOCAL_SCHEDULE_CALLBACK_TOOL.parameters.properties.customer_local_date,
+              customer_local_time:
+                LOCAL_SCHEDULE_CALLBACK_TOOL.parameters.properties.customer_local_time,
+              application_local_date:
+                LOCAL_SCHEDULE_CALLBACK_TOOL.parameters.properties.application_local_date
+            }
+          }
+        }
+      : toolDefinition
+  )
+);
 
 async function runMigrationStep(name, sql, options = {}) {
   const { optional = false } = options;
@@ -2545,6 +2684,87 @@ function mondayStatusValue(column, desiredLabel) {
   return { index: Number(found.id) };
 }
 
+function mondayStatusLabels(column) {
+  const settings = parseMondaySettings(column?.settings);
+  return Array.isArray(settings.labels)
+    ? settings.labels
+    : Object.entries(settings.labels || {}).map(([id, label]) => ({
+        id,
+        label: typeof label === "object" ? label?.label || label?.name : label
+      }));
+}
+
+function timeFrameMeaning(value) {
+  const normalized = normalizeMondayKey(value);
+  if (!normalized) return null;
+  if (/justlooking|lookingonly/.test(normalized)) {
+    return { normalized, category: "just_looking", months: null };
+  }
+  if (/notsure|unsure|dontknow|donotknow/.test(normalized)) {
+    return { normalized, category: "not_sure", months: null };
+  }
+  if (/3060/.test(normalized)) {
+    return { normalized, category: "timeframe", months: 2 };
+  }
+  if (/6090/.test(normalized)) {
+    return { normalized, category: "timeframe", months: 3 };
+  }
+  const wordMonths = [
+    [/(?:two|2)months?/, 2],
+    [/(?:four|4)months?/, 4],
+    [/(?:six|6)months?/, 6],
+    [/(?:one|1)year|(?:twelve|12)months?/, 12]
+  ];
+  const matched = wordMonths.find(([pattern]) => pattern.test(normalized));
+  if (matched) {
+    return { normalized, category: "timeframe", months: matched[1] };
+  }
+  return null;
+}
+
+function mondayTimeFrameValue(column, customerAnswer, callId) {
+  const answerMeaning = timeFrameMeaning(customerAnswer);
+  const labels = mondayStatusLabels(column);
+  let best = null;
+
+  if (answerMeaning) {
+    for (const label of labels) {
+      const labelText = cleanText(label.label, 160);
+      const labelMeaning = timeFrameMeaning(labelText);
+      if (!labelText || !labelMeaning) continue;
+      let score = 0;
+      if (normalizeMondayKey(labelText) === answerMeaning.normalized) score = 100;
+      else if (
+        answerMeaning.category !== "timeframe" &&
+        answerMeaning.category === labelMeaning.category
+      ) score = 95;
+      else if (
+        answerMeaning.months !== null &&
+        answerMeaning.months === labelMeaning.months
+      ) score = 90;
+      else if (
+        answerMeaning.months !== null &&
+        labelMeaning.months !== null &&
+        /within/.test(normalizeMondayKey(labelText)) &&
+        answerMeaning.months <= labelMeaning.months
+      ) score = Math.max(60, 80 - (labelMeaning.months - answerMeaning.months));
+      if (score > (best?.score || 0)) best = { ...label, label: labelText, score };
+    }
+  }
+
+  const success = Boolean(best && best.score >= 60);
+  console.log(JSON.stringify({
+    event: "monday_time_frame_mapping",
+    call_id: callId,
+    customer_answer: cleanText(customerAnswer, 160),
+    normalized_answer: answerMeaning?.normalized || null,
+    matched_label: success ? best.label : null,
+    matched_index: success ? String(best.id) : null,
+    success
+  }));
+  return success ? { index: Number(best.id) } : null;
+}
+
 function mondayColumnValue(column, value) {
   if (value === undefined || value === null || value === "") return null;
 
@@ -2736,6 +2956,65 @@ function leadDisplayName(call) {
   );
 }
 
+function buildStructuredMondayCallSummary(call) {
+  const result = normalizeDaisyAnswers(call.result || {});
+  const actions = Array.isArray(call.actions) ? call.actions : [];
+  const completed =
+    actions.some((action) => action?.action === "complete_call" && action.success) ||
+    String(call.status || "").toLowerCase() === "completed";
+  const callTwo =
+    ["application_checkpoint", "application_started"].includes(call.current_state) ||
+    result.preliminary_dti_percent !== undefined;
+  const parts = [`Call ${callTwo ? "Two" : "One"} ${completed ? "completed" : "progress"}.`];
+  const add = (label, value) => {
+    const cleaned = cleanText(value, 220);
+    if (cleaned) parts.push(`${label}: ${cleaned}.`);
+  };
+  const lender = normalizeExplicitYesNo(
+    result.applied_with_lender ?? result.has_lender
+  );
+  const realtor = normalizeExplicitYesNo(result.has_realtor);
+  const applicationRaw = cleanText(result.app_started_confirmation, 80);
+  const application = applicationRaw
+    ? /start/i.test(applicationRaw) && !/not/i.test(applicationRaw)
+      ? "Yes"
+      : /not|no/i.test(applicationRaw)
+        ? "No"
+        : applicationRaw
+    : null;
+
+  if (callTwo) {
+    add("Application started", application);
+    if (Number.isFinite(Number(result.preliminary_dti_percent))) {
+      add("Preliminary DTI", `${Number(result.preliminary_dti_percent)}%`);
+    }
+    if (lender !== null) add("Lender needed", lender ? "No" : "Yes");
+    if (realtor !== null) add("Realtor needed", realtor ? "No" : "Yes");
+  } else {
+    add("Timeline", result.purchase_timeline_detail || result.time_frame);
+    if (lender !== null) add("Lender", lender ? "Yes" : "No");
+    if (realtor !== null) add("Realtor", realtor ? "Yes" : "No");
+    add("Purchase area", result.purchase_area);
+    add(
+      "Application",
+      application ? (application === "Yes" ? "Started" : "Not started") : null
+    );
+  }
+
+  const nextCall = call.callback_at || call.next_attempt_at;
+  if (nextCall) {
+    add(
+      "Next call",
+      formatCustomerCallbackTime(
+        nextCall,
+        call.callback_timezone || call.timezone
+      )
+    );
+  }
+  add("Next step", call.next_action || result.conversation_state?.next_best_action);
+  return cleanText(parts.join(" ").replace(/\.\./g, "."), 800);
+}
+
 function buildMainMondayValues(call, latestAttempt, metadata) {
   const values = {};
   const board = metadata.main;
@@ -2792,7 +3071,12 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
   );
   assignMondayValue(values, board, ["Do Not Call"], call.do_not_call === true);
   assignMondayValue(values, board, ["Next Action"], call.next_action);
-  assignMondayValue(values, board, ["Call Summary"], call.summary);
+  assignMondayValue(
+    values,
+    board,
+    ["Call Summary"],
+    buildStructuredMondayCallSummary(call)
+  );
   assignMondayValue(values, board, ["Owner"], call.human_owner_id);
   assignMondayValue(values, board, ["Cadence Version"], call.cadence_version);
   assignMondayValueById(
@@ -2813,12 +3097,22 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
     MONDAY_CALL_CONTROL_COLUMNS.app_started_confirmation,
     result.app_started_confirmation
   );
-  assignMondayValueById(
-    values,
+  const timeFrameColumn = findMondayColumnById(
     board,
-    MONDAY_CALL_CONTROL_COLUMNS.time_frame,
-    result.time_frame
+    MONDAY_CALL_CONTROL_COLUMNS.time_frame
   );
+  const timeFrameAnswer =
+    result.purchase_timeline_detail ||
+    call.result?.time_frame ||
+    result.time_frame;
+  if (timeFrameColumn && timeFrameAnswer) {
+    const timeFrameValue = mondayTimeFrameValue(
+      timeFrameColumn,
+      timeFrameAnswer,
+      call.call_id
+    );
+    if (timeFrameValue) values[timeFrameColumn.id] = timeFrameValue;
+  }
 
   return values;
 }
@@ -4286,8 +4580,36 @@ async function scheduleUnexpectedReconnect(callId) {
   const completedByTool = actions.some(
     (action) => action && action.action === "complete_call" && action.success
   );
+  const intentionallyEnded = actions.some(
+    (action) =>
+      action &&
+      action.action === "twilio_call_hangup" &&
+      action.success &&
+      action.completion_reason === "normal_completion"
+  );
   const alreadyScheduled = call.result?.unexpected_disconnect_reconnect_scheduled;
-  if (transcript.length < 2 || completedByTool || alreadyScheduled) return false;
+  const normalCompletion = Boolean(
+    completedByTool ||
+    intentionallyEnded ||
+    call.result?.normal_completion_recorded === true ||
+    call.result?.final_hangup_completed === true ||
+    call.result?.completion_reason === "normal_completion" ||
+    String(call.status || "").toLowerCase() === "completed"
+  );
+  if (normalCompletion) {
+    console.log(JSON.stringify({
+      event: "unexpected_reconnect_skipped",
+      call_id: call.call_id,
+      reason: "normal_call_completion"
+    }));
+    return false;
+  }
+  const callbackAt = call.callback_at ? new Date(call.callback_at) : null;
+  const hasFutureCallback = Boolean(
+    callbackAt && !Number.isNaN(callbackAt.getTime()) && callbackAt > new Date()
+  );
+  if (hasFutureCallback) return false;
+  if (transcript.length < 2 || alreadyScheduled) return false;
 
   const reconnectAt = new Date(Date.now() + 60 * 1000);
   const savedSummary = cleanText(
@@ -4726,6 +5048,123 @@ function formatCustomerCallbackTime(value, timeZone) {
   }).format(date);
 }
 
+function localDateParts(value, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: normalizeTimezone(timeZone),
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(value instanceof Date ? value : new Date(value));
+  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+}
+
+function addDaysToLocalDateText(dateText, days) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateText || ""));
+  if (!match) return null;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function parseConfirmedLocalDate(value, timeZone, applicationLocalDate = null) {
+  const raw = cleanText(value, 160);
+  if (!raw) return null;
+  const normalized = normalizeCustomerUtterance(raw);
+  const nowParts = localDateParts(new Date(), timeZone);
+  const today = `${nowParts.year}-${nowParts.month}-${nowParts.day}`;
+  if (/\bfollowing day\b/.test(normalized)) {
+    const applicationDate = parseConfirmedLocalDate(
+      applicationLocalDate,
+      timeZone
+    );
+    return applicationDate ? addDaysToLocalDateText(applicationDate, 1) : null;
+  }
+  if (/\btomorrow\b/.test(normalized)) return addDaysToLocalDateText(today, 1);
+  if (/\btoday\b/.test(normalized)) return today;
+  const isoMatch = /\b(\d{4})-(\d{2})-(\d{2})\b/.exec(raw);
+  if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  const parsed = new Date(`${raw} 12:00:00 UTC`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
+}
+
+function parseConfirmedLocalTime(value) {
+  const raw = cleanText(value, 100);
+  if (!raw) return null;
+  const match = /\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b/i.exec(raw);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2] || 0);
+  const meridiem = String(match[3] || "").toLowerCase().replace(/\./g, "");
+  if (minute > 59 || hour > (meridiem ? 12 : 23)) return null;
+  if (meridiem === "pm" && hour < 12) hour += 12;
+  if (meridiem === "am" && hour === 12) hour = 0;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function localDateTimeToUtc(dateText, timeText, timeZone) {
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateText || ""));
+  const timeMatch = /^(\d{2}):(\d{2})$/.exec(String(timeText || ""));
+  if (!dateMatch || !timeMatch) return null;
+  const desired = Date.UTC(
+    Number(dateMatch[1]),
+    Number(dateMatch[2]) - 1,
+    Number(dateMatch[3]),
+    Number(timeMatch[1]),
+    Number(timeMatch[2]),
+    0
+  );
+  let guess = desired;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const actual = localDateParts(new Date(guess), timeZone);
+    const actualAsUtc = Date.UTC(
+      Number(actual.year),
+      Number(actual.month) - 1,
+      Number(actual.day),
+      Number(actual.hour),
+      Number(actual.minute),
+      Number(actual.second)
+    );
+    guess += desired - actualAsUtc;
+  }
+  const result = new Date(guess);
+  const check = localDateParts(result, timeZone);
+  const matches =
+    `${check.year}-${check.month}-${check.day}` === dateText &&
+    `${check.hour}:${check.minute}` === timeText;
+  return matches ? result : null;
+}
+
+function resolveConfirmedCallbackDateTime(args, call) {
+  const timeZone = normalizeTimezone(args.timezone || call.timezone);
+  const rawCallback = cleanText(args.callback_at, 200);
+  const parsedInstant = rawCallback ? new Date(rawCallback) : null;
+  const validInstant = Boolean(
+    parsedInstant && !Number.isNaN(parsedInstant.getTime())
+  );
+  const instantParts = validInstant ? localDateParts(parsedInstant, timeZone) : null;
+  const customerLocalDate = parseConfirmedLocalDate(
+    args.customer_local_date || rawCallback,
+    timeZone,
+    args.application_local_date || call.result?.application_local_date
+  ) || (instantParts ? `${instantParts.year}-${instantParts.month}-${instantParts.day}` : null);
+  const customerLocalTime = parseConfirmedLocalTime(
+    args.customer_local_time || rawCallback
+  ) || (instantParts ? `${instantParts.hour}:${instantParts.minute}` : null);
+  if (!customerLocalDate || !customerLocalTime) return null;
+  const callbackAt = localDateTimeToUtc(
+    customerLocalDate,
+    customerLocalTime,
+    timeZone
+  );
+  return callbackAt
+    ? { callbackAt, customerLocalDate, customerLocalTime, timeZone }
+    : null;
+}
+
 function smsStatusCallbackUrl(call) {
   const url = new URL(`${PUBLIC_BASE_URL}/api/v1/twilio/sms-status`);
   url.searchParams.set("call_id", call.call_id);
@@ -4785,6 +5224,12 @@ async function executeDougTool(call, name, args) {
     const nextState = cleanText(safeArgs.next_state, 80);
     const sentiment = cleanText(safeArgs.sentiment, 50);
     const answers = normalizeDaisyAnswers(safeArgs.answers || {});
+    const existingAnswers = normalizeDaisyAnswers(call.result || {});
+    for (const key of ["has_realtor", "applied_with_lender", "has_lender"]) {
+      if (existingAnswers[key] !== undefined && answers[key] !== undefined) {
+        answers[key] = existingAnswers[key];
+      }
+    }
 
     await pool.query(
       `
@@ -5036,12 +5481,32 @@ async function executeDougTool(call, name, args) {
       };
     }
 
-    const callbackAt = new Date(safeArgs.callback_at);
-    if (Number.isNaN(callbackAt.getTime()) || callbackAt <= new Date()) {
+    const confirmedCallback = resolveConfirmedCallbackDateTime(safeArgs, call);
+    if (!confirmedCallback) {
+      return {
+        success: false,
+        error: "A confirmed local callback date, time, and timezone are required."
+      };
+    }
+    const {
+      callbackAt,
+      customerLocalDate,
+      customerLocalTime,
+      timeZone: timezone
+    } = confirmedCallback;
+    const isFuture = callbackAt > new Date();
+    console.log(JSON.stringify({
+      event: "callback_datetime_confirmed",
+      call_id: call.call_id,
+      customer_local_date: customerLocalDate,
+      customer_local_time: customerLocalTime,
+      timezone,
+      callback_at_utc: callbackAt.toISOString(),
+      is_future: isFuture
+    }));
+    if (!isFuture) {
       return { success: false, error: "The callback time must be in the future." };
     }
-
-    const timezone = normalizeTimezone(safeArgs.timezone || call.timezone);
     const reason =
       cleanText(safeArgs.reason, 1000) || "Customer requested callback";
     const primaryConcern = cleanText(safeArgs.primary_concern, 1200);
@@ -5086,6 +5551,16 @@ async function executeDougTool(call, name, args) {
     await mergeCallResult(call.call_id, {
       callback_at: callbackAt.toISOString(),
       callback_timezone: timezone,
+      callback_local_date: customerLocalDate,
+      callback_local_time: customerLocalTime,
+      ...(safeArgs.application_local_date
+        ? {
+            application_local_date: parseConfirmedLocalDate(
+              safeArgs.application_local_date,
+              timezone
+            )
+          }
+        : {}),
       callback_reason: reason,
       primary_concern: primaryConcern,
       hold_reason: holdReason,
@@ -5132,6 +5607,8 @@ async function executeDougTool(call, name, args) {
       action: name,
       success: true,
       callback_at: callbackAt.toISOString(),
+      customer_local_date: customerLocalDate,
+      customer_local_time: customerLocalTime,
       timezone,
       reason,
       primary_concern: primaryConcern,
@@ -6182,9 +6659,14 @@ mediaServer.on("connection", (twilioSocket) => {
   let pendingResponsePreservesQuestion = false;
   let activeResponsePreservesQuestion = false;
   let assistantResponseFinished = true;
-  let hangupAfterPlaybackRequested = false;
-  let hangupInProgress = false;
-  let hangupCompleted = false;
+  let normalCompletionRecorded = false;
+  let finalHangupRequested = false;
+  let finalHangupMarkName = "";
+  let finalHangupInProgress = false;
+  let finalHangupCompleted = false;
+  let finalHangupFallbackTimer = null;
+  let assistantAudioQueuedForResponse = false;
+  let finalClosingAudioQueued = false;
   let sustainedSpeechTimer = null;
   let speechCandidateStartedAt = 0;
   let speechCandidateConfirmed = false;
@@ -6232,6 +6714,42 @@ mediaServer.on("connection", (twilioSocket) => {
     return false;
   }
 
+  function currentCallIsTerminal() {
+    return (
+      normalCompletionRecorded ||
+      finalHangupCompleted ||
+      String(call?.status || "").toLowerCase() === "completed"
+    );
+  }
+
+  function exactFinalClosingSpoken(value) {
+    const lead = call?.payload || {};
+    const customerName =
+      cleanText(lead.first_name || lead.customer_name || lead.name, 160) ||
+      "the customer";
+    const expected = `If there's nothing else, thank you for your time, ${customerName}. Have a great day.`;
+    return normalizeCustomerUtterance(value) === normalizeCustomerUtterance(expected);
+  }
+
+  function stopCurrentCallAutomation() {
+    cancelSilenceReminder();
+    if (customerTranscriptDebounceTimer) {
+      clearTimeout(customerTranscriptDebounceTimer);
+      customerTranscriptDebounceTimer = null;
+    }
+    if (sustainedSpeechTimer) {
+      clearTimeout(sustainedSpeechTimer);
+      sustainedSpeechTimer = null;
+    }
+    speechCandidateStartedAt = 0;
+    speechCandidateConfirmed = false;
+    speechCandidateWhileAssistantSpeaking = false;
+    customerSpeaking = false;
+    pendingCustomerTranscripts = [];
+    pendingTranscriptWasWhileAssistantSpeaking = false;
+    queuedResponseOptions = null;
+  }
+
   function sendMark() {
     if (!streamSid) return;
     markCounter += 1;
@@ -6241,6 +6759,33 @@ mediaServer.on("connection", (twilioSocket) => {
       streamSid,
       mark: { name }
     })) pendingMarkNames.add(name);
+  }
+
+  function sendFinalHangupMark() {
+    if (
+      !normalCompletionRecorded ||
+      !finalHangupRequested ||
+      finalHangupMarkName ||
+      finalHangupCompleted ||
+      !streamSid
+    ) return false;
+
+    const name = `daisy_final_hangup_${Date.now()}_${randomUUID()}`;
+    if (!sendToTwilio({ event: "mark", streamSid, mark: { name } })) {
+      return false;
+    }
+    finalHangupMarkName = name;
+    pendingMarkNames.add(name);
+    finalHangupFallbackTimer = setTimeout(() => {
+      if (
+        normalCompletionRecorded &&
+        finalHangupRequested &&
+        !finalHangupCompleted
+      ) {
+        void finishAndHangupTwilioCall("final_audio_playback_timeout");
+      }
+    }, 8000);
+    return true;
   }
 
   async function handleInterruption() {
@@ -6271,6 +6816,7 @@ mediaServer.on("connection", (twilioSocket) => {
   }
 
   function requestAssistantResponse(options = {}) {
+    if (currentCallIsTerminal()) return false;
     if (awaitingCustomerResponse && options.allowWhileAwaiting !== true) {
       return false;
     }
@@ -6311,6 +6857,7 @@ mediaServer.on("connection", (twilioSocket) => {
   function scheduleSilenceReminder() {
     cancelSilenceReminder();
     if (
+      currentCallIsTerminal() ||
       !awaitingCustomerResponse ||
       customerSpeaking ||
       !assistantResponseFinished ||
@@ -6376,6 +6923,7 @@ mediaServer.on("connection", (twilioSocket) => {
     transcript,
     beganWhileAssistantSpeaking = false
   ) {
+    if (currentCallIsTerminal()) return;
     logCustomerResponseState(call.call_id, {
       ...currentQuestionState(),
       awaiting_customer_response: awaitingCustomerResponse,
@@ -6448,6 +6996,28 @@ mediaServer.on("connection", (twilioSocket) => {
     if (!awaitingCustomerResponse) {
       requestAssistantResponse({ queueIfBusy: true });
       return;
+    }
+
+    const professionalAnswerKey = ["has_realtor", "applied_with_lender"].includes(
+      String(pendingQuestionType || "")
+    )
+      ? pendingQuestionType
+      : null;
+    if (professionalAnswerKey) {
+      const explicitAnswer = normalizeExplicitYesNo(transcript);
+      if (explicitAnswer !== null) {
+        const storedAnswer = explicitAnswer ? "Yes" : "No";
+        await mergeCallResult(call.call_id, {
+          [professionalAnswerKey]: storedAnswer,
+          ...(professionalAnswerKey === "applied_with_lender"
+            ? { has_lender: storedAnswer }
+            : {})
+        });
+        call = (await getCallById(call.call_id)) || call;
+        await endLocalWaitingState("explicit_professional_yes_no_answer");
+        requestAssistantResponse({ queueIfBusy: true });
+        return;
+      }
     }
 
     if (customerRequestedMoreTime(transcript)) {
@@ -6554,28 +7124,22 @@ mediaServer.on("connection", (twilioSocket) => {
     await handleInterruption();
   }
 
-  async function hangupTwilioCallAfterPlayback() {
+  async function finishAndHangupTwilioCall(reason) {
     if (
-      !hangupAfterPlaybackRequested ||
-      hangupInProgress ||
-      hangupCompleted ||
-      !assistantResponseFinished ||
-      pendingMarkNames.size > 0 ||
+      !normalCompletionRecorded ||
+      !finalHangupRequested ||
+      finalHangupInProgress ||
+      finalHangupCompleted ||
       !call
     ) {
       return false;
     }
 
-    hangupInProgress = true;
+    finalHangupInProgress = true;
 
     try {
       const refreshedCall =
         (await getCallById(call.call_id)) || call;
-
-      if (refreshedCall.awaiting_customer_response === true) {
-        return false;
-      }
-
       const twilioCallSid =
         refreshedCall.twilio_call_sid ||
         call.twilio_call_sid;
@@ -6586,25 +7150,68 @@ mediaServer.on("connection", (twilioSocket) => {
         );
       }
 
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET
+            status = 'completed',
+            sequence_status = CASE
+              WHEN callback_requested AND callback_at > NOW()
+                THEN 'callback_scheduled'
+              ELSE 'completed'
+            END,
+            next_attempt_at = CASE
+              WHEN callback_requested AND callback_at > NOW()
+                THEN callback_at
+              ELSE NULL
+            END,
+            last_error = NULL,
+            result = result || $2::jsonb,
+            updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [
+          call.call_id,
+          JSON.stringify({
+            normal_completion_recorded: true,
+            completion_reason: "normal_completion",
+            intentional_twilio_hangup: true
+          })
+        ]
+      );
+
       await twilioClient.calls(twilioCallSid).update({
         status: "completed"
       });
 
-      hangupCompleted = true;
+      finalHangupCompleted = true;
+      if (finalHangupFallbackTimer) {
+        clearTimeout(finalHangupFallbackTimer);
+        finalHangupFallbackTimer = null;
+      }
+      await mergeCallResult(call.call_id, {
+        final_hangup_completed: true,
+        final_hangup_completed_at: new Date().toISOString()
+      });
+      call = (await getCallById(call.call_id)) || {
+        ...call,
+        status: "completed"
+      };
 
       await appendAction(call.call_id, {
         action: "twilio_call_hangup",
         success: true,
-        reason: "completed_call_after_final_audio"
+        reason,
+        completion_reason: "normal_completion"
       });
 
       console.log(
         JSON.stringify({
-          event: "twilio_call_hangup",
+          event: "twilio_final_hangup",
           call_id: call.call_id,
           twilio_call_sid: twilioCallSid,
+          reason: "final_audio_playback_complete",
           success: true,
-          reason: "completed_call_after_final_audio"
         })
       );
 
@@ -6612,19 +7219,21 @@ mediaServer.on("connection", (twilioSocket) => {
     } catch (error) {
       const safeError =
         cleanText(error.message, 1000) ||
-        "Twilio call hangup failed.";
+        "Twilio final hangup failed.";
 
       await appendAction(call.call_id, {
         action: "twilio_call_hangup",
         success: false,
-        reason: "completed_call_after_final_audio",
+        reason,
+        completion_reason: "normal_completion",
         error: safeError
       });
 
       console.error(
         JSON.stringify({
-          event: "twilio_call_hangup",
+          event: "twilio_final_hangup",
           call_id: call.call_id,
+          reason,
           success: false,
           error: safeError
         })
@@ -6632,12 +7241,13 @@ mediaServer.on("connection", (twilioSocket) => {
 
       return false;
     } finally {
-      hangupInProgress = false;
+      finalHangupInProgress = false;
     }
   }
 
   async function handleToolCall(name, toolCallId, argumentText) {
     if (!call || !toolCallId || handledToolCalls.has(toolCallId)) return;
+    if (currentCallIsTerminal()) return;
     handledToolCalls.add(toolCallId);
 
     let args = {};
@@ -6674,7 +7284,15 @@ mediaServer.on("connection", (twilioSocket) => {
       output?.error === null;
 
     if (completeCallSucceeded) {
-      hangupAfterPlaybackRequested = true;
+      normalCompletionRecorded = true;
+      finalHangupRequested = true;
+      stopCurrentCallAutomation();
+      await mergeCallResult(call.call_id, {
+        normal_completion_recorded: true,
+        completion_reason: "normal_completion",
+        normal_completion_recorded_at: new Date().toISOString()
+      });
+      call = (await getCallById(call.call_id)) || call;
     }
 
     sendToOpenAI({
@@ -6767,6 +7385,7 @@ mediaServer.on("connection", (twilioSocket) => {
           assistantTranscriptBuffer = "";
           assistantTranscriptSaved = false;
           questionCapturedForResponse = false;
+          assistantAudioQueuedForResponse = false;
           return;
         }
 
@@ -6812,6 +7431,7 @@ mediaServer.on("connection", (twilioSocket) => {
           if (responseStartTimestamp === null) {
             responseStartTimestamp = latestMediaTimestamp;
           }
+          assistantAudioQueuedForResponse = true;
           sendToTwilio({
             event: "media",
             streamSid,
@@ -6910,6 +7530,9 @@ mediaServer.on("connection", (twilioSocket) => {
         }
 
         if (event.type === "response.output_audio_transcript.done") {
+          if (!assistantTranscriptBuffer && event.transcript) {
+            assistantTranscriptBuffer = event.transcript;
+          }
           if (!assistantTranscriptSaved) {
             await appendTranscript(call.call_id, "assistant", event.transcript);
             assistantTranscriptSaved = true;
@@ -7006,6 +7629,12 @@ mediaServer.on("connection", (twilioSocket) => {
               extractPrimaryQuestion(assistantTranscriptBuffer)
             );
           }
+          if (
+            assistantAudioQueuedForResponse &&
+            exactFinalClosingSpoken(assistantTranscriptBuffer)
+          ) {
+            finalClosingAudioQueued = true;
+          }
           for (const item of event.response?.output || []) {
             if (item && item.type === "function_call") {
               await handleToolCall(
@@ -7014,6 +7643,15 @@ mediaServer.on("connection", (twilioSocket) => {
                 item.arguments || "{}"
               );
             }
+          }
+          if (
+            normalCompletionRecorded &&
+            finalHangupRequested &&
+            finalClosingAudioQueued &&
+            !finalHangupMarkName &&
+            !finalHangupCompleted
+          ) {
+            sendFinalHangupMark();
           }
           activeResponsePreservesQuestion = false;
           lastWaitingPromptKind = activeResponseWaitingPromptKind;
@@ -7025,7 +7663,6 @@ mediaServer.on("connection", (twilioSocket) => {
           }
           complianceRecoveryActive = false;
           scheduleSilenceReminder();
-          void hangupTwilioCallAfterPlayback();
           return;
         }
 
@@ -7121,9 +7758,11 @@ mediaServer.on("connection", (twilioSocket) => {
       if (message.event === "mark") {
         const name = cleanText(message.mark?.name, 100);
         if (name) pendingMarkNames.delete(name);
+        if (name && name === finalHangupMarkName) {
+          void finishAndHangupTwilioCall("final_audio_playback_complete");
+        }
         if (!pendingMarkNames.size) {
           scheduleSilenceReminder();
-          void hangupTwilioCallAfterPlayback();
         }
         return;
       }
@@ -7131,7 +7770,7 @@ mediaServer.on("connection", (twilioSocket) => {
       if (message.event === "media") {
         const payload = message.media?.payload;
         latestMediaTimestamp = Number(message.media?.timestamp || 0);
-        if (!payload) return;
+        if (!payload || currentCallIsTerminal()) return;
 
         if (
           !sendToOpenAI({
