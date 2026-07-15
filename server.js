@@ -5,7 +5,9 @@ const { Pool } = require("pg");
 const twilio = require("twilio");
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
-const { REALTIME_TOOLS } = require("./src/intents/intent-types");
+const {
+  REALTIME_TOOLS: BASE_REALTIME_TOOLS
+} = require("./src/intents/intent-types");
 const { routeIntent } = require("./src/intents/intent-router");
 const { guardAssistantOutput } = require("./src/compliance/compliance-guardrails");
 const { isInterestRateQuestion, interestRateResponse } = require("./src/compliance/interest-rate-policy");
@@ -132,6 +134,12 @@ const MONDAY_CALL_CONTROL_COLUMNS = Object.freeze({
   app_started_confirmation: "color_mm576a7j",
   time_frame: "color_mm57v24g"
 });
+const MONDAY_EMAIL_COLUMNS = Object.freeze({
+  trigger: cleanText(process.env.MONDAY_EMAIL_TRIGGER_COLUMN_ID, 100),
+  type: cleanText(process.env.MONDAY_EMAIL_TYPE_COLUMN_ID, 100),
+  subject: cleanText(process.env.MONDAY_EMAIL_SUBJECT_COLUMN_ID, 100),
+  body: cleanText(process.env.MONDAY_EMAIL_BODY_COLUMN_ID, 100)
+});
 const DPA_DEPARTMENT_COLUMNS = Object.freeze({
   app_started: "color_mm571hke",
   realtor_name: "text_mm57ngpn",
@@ -254,6 +262,11 @@ function cleanText(value, maximumLength = 255) {
   if (value === undefined || value === null) return null;
   const text = String(value).trim();
   return text ? text.slice(0, maximumLength) : null;
+}
+
+function validEmailAddress(value) {
+  const email = cleanText(value, 320);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 function normalizeBoolean(value) {
@@ -505,26 +518,28 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - Never discuss or quote interest rates.
 - Never guarantee approval, eligibility, a program, an assistance amount, a closing date, or a home price.
 - DTI and homebuying power are preliminary estimates only.
-- Only send a text link after the customer agrees to receive it.
-- After scheduling a callback, ask permission before sending a text confirmation.
-- Never claim a text, callback, handoff, or other action succeeded until the tool confirms success.
+- Only queue an email after the customer agrees to receive it.
+- Use the lead's existing valid email address. Do not ask the customer to repeat it.
+- If the lead's email is unavailable or invalid, ask: "What email address would you like me to use?"
+- Never claim an email, callback, handoff, or other action succeeded until the tool confirms success.
 - Before ending a connected call, save the outcome, confirm the next step, use complete_call, give one brief closing, and end normally.
 
-When the current call has no remaining question or action, Daisy says:
+When there are no remaining questions or required actions, Daisy says exactly:
 "If there's nothing else, thank you for your time, {customer_name}. Have a great day."
 
-Then:
-- Use complete_call.
-- Allow the full closing audio to play.
-- Disconnect the telephone line.
-- Do not wait silently on the line.
-- Do not restart the conversation.
-- Do not trigger reconnect.
+Then Daisy must:
+1. Use complete_call.
+2. Allow the full final audio to play.
+3. Disconnect the Twilio telephone line.
+4. Not wait silently.
+5. Not restart the conversation.
+6. Not trigger reconnect.
 
 - A normal goodbye is not an unexpected disconnect.
 
 Runtime mode: {call_mode}
 Customer: {customer_name}
+Customer email: {customer_email}
 Estimated assistance: {estimated_dpa}
 Submitted income: {income_submitted}
 Submitted work history: {work_history_submitted}
@@ -665,13 +680,15 @@ After collecting the date, time, and timezone, Daisy says:
 WAIT.
 
 Daisy asks:
-"Would you like me to text you a confirmation?"
+"Would you like me to email you a confirmation of our scheduled call?"
 
 WAIT.
 
 After confirmation:
 - Use schedule_callback with reason "Customer requested a better time."
-- Pass the correct sms_confirmation_consent value.
+- If the customer requested the email confirmation, use queue_monday_email with email_type "callback_confirmation".
+- Do not claim the email was delivered. After queue_monday_email succeeds, Daisy may say: "Perfect. I've submitted that email to the address you provided."
+- If queue_monday_email fails, Daisy may say: "I wasn't able to submit the email just now, but I've noted that it needs follow-up."
 - Use complete_call with outcome follow_up_scheduled.
 - Set stop_sequence false.
 - Set pause_sequence false.
@@ -787,7 +804,7 @@ Daisy says:
 WAIT.
 
 After confirmation, Daisy asks:
-"Would you like me to text you a confirmation?"
+"Would you like me to email you a confirmation of our scheduled call?"
 
 WAIT.
 
@@ -796,7 +813,11 @@ Use schedule_callback with:
 - prospect_confirmed: true
 - the correct callback_at
 - the correct timezone
-- the correct sms_confirmation_consent
+
+If the customer requested the email confirmation:
+- Use queue_monday_email with email_type "callback_confirmation".
+- Do not claim the email was delivered. After queue_monday_email succeeds, Daisy may say: "Perfect. I've submitted that email to the address you provided."
+- If queue_monday_email fails, Daisy may say: "I wasn't able to submit the email just now, but I've noted that it needs follow-up."
 
 Then use complete_call with:
 - outcome: follow_up_scheduled
@@ -870,16 +891,18 @@ Do not tell the customer that a specialist will contact them before completing o
 IF THE APPLICATION WAS NOT STARTED
 
 Daisy says:
-"No worries. Would you like me to text you the application link now?"
+"No worries. Would you like me to email you the application link now?"
 
 WAIT.
 
 When the customer agrees:
-- Use send_resource_link.
-- Set resource_type to "application".
-- Set consent_confirmed to true.
+- Use queue_monday_email.
+- Set email_type to "application_link".
+- Use the lead's existing valid email address.
 - Do not ask permission twice.
-- Do not claim the link was sent until the tool returns success.
+- Do not claim the email was delivered.
+- After queue_monday_email succeeds, Daisy may say: "Perfect. I've submitted that email to the address you provided."
+- If queue_monday_email fails, Daisy may say: "I wasn't able to submit the email just now, but I've noted that it needs follow-up."
 
 DTI REVIEW
 
@@ -925,14 +948,16 @@ Daisy says:
 
 IF THE CUSTOMER PREFERS THE CALCULATOR
 
-Ask once whether the customer wants the calculator by text.
+Ask once: "Would you like me to email you our DTI calculator?"
 
 After an affirmative answer:
-- Use send_resource_link.
-- Set resource_type to "dti_calculator".
-- Set consent_confirmed to true.
+- Use queue_monday_email.
+- Set email_type to "dti_calculator".
+- Use the lead's existing valid email address.
 - Do not ask permission twice.
-- Do not claim it was sent until the tool returns success.
+- Do not claim the email was delivered.
+- After queue_monday_email succeeds, Daisy may say: "Perfect. I've submitted that email to the address you provided."
+- If queue_monday_email fails, Daisy may say: "I wasn't able to submit the email just now, but I've noted that it needs follow-up."
 
 PROFESSIONAL CONNECTIONS
 
@@ -961,7 +986,7 @@ Collect:
 - Specific date
 - Specific time
 - Timezone
-- SMS confirmation permission
+- Email confirmation permission
 
 Repeat and confirm the appointment.
 
@@ -1030,6 +1055,9 @@ function buildDouglasDaisyInstructions(call) {
         lead.first_name || lead.customer_name || lead.name,
         160
       ) || "the customer",
+    customer_email:
+      cleanText(lead.email || lead.email_address || lead.customer_email, 320) ||
+      "not provided",
     agent_name:
       cleanText(lead.agent_name || lead.first_name, 160) ||
       "the assigned specialist",
@@ -1162,26 +1190,26 @@ const DOUG_TOOLS = [
   },
   {
     type: "function",
-    name: "send_resource_link",
+    name: "queue_monday_email",
     description:
-      "Send an approved DPA Help Center readiness resource by SMS after customer confirmation.",
+      "Queue a customer-requested follow-up email on the call's existing monday.com item.",
     parameters: {
       type: "object",
       properties: {
-        resource_type: {
+        email_type: {
           type: "string",
           enum: [
-            "application",
+            "application_link",
             "dti_calculator",
-            "prephub",
-            "credit_readiness",
-            "tax_readiness",
-            "employment_readiness"
+            "callback_confirmation"
           ]
         },
-        consent_confirmed: { type: "boolean" }
+        recipient_email: { type: "string" },
+        callback_date: { type: "string" },
+        callback_time: { type: "string" },
+        timezone: { type: "string" }
       },
-      required: ["resource_type", "consent_confirmed"],
+      required: ["email_type", "recipient_email"],
       additionalProperties: false
     }
   },
@@ -1204,16 +1232,14 @@ const DOUG_TOOLS = [
         discussion_summary: { type: "string" },
         preferred_contact_method: {
           type: "string",
-          enum: ["phone", "sms", "email"]
+          enum: ["phone", "email"]
         },
-        sms_confirmation_consent: { type: "boolean" },
         prospect_confirmed: { type: "boolean" }
       },
       required: [
         "callback_at",
         "timezone",
         "reason",
-        "sms_confirmation_consent",
         "prospect_confirmed"
       ],
       additionalProperties: false
@@ -1338,6 +1364,38 @@ const DOUG_TOOLS = [
     }
   }
 ];
+
+const QUEUE_MONDAY_EMAIL_TOOL = DOUG_TOOLS.find(
+  (toolDefinition) => toolDefinition.name === "queue_monday_email"
+);
+const REALTIME_TOOLS = Object.freeze([
+  ...BASE_REALTIME_TOOLS
+    .filter((toolDefinition) => toolDefinition.name !== "send_resource_link")
+    .map((toolDefinition) => {
+      if (toolDefinition.name !== "schedule_callback") return toolDefinition;
+      const {
+        sms_confirmation_consent,
+        ...properties
+      } = toolDefinition.parameters.properties;
+      return {
+        ...toolDefinition,
+        parameters: {
+          ...toolDefinition.parameters,
+          properties: {
+            ...properties,
+            preferred_contact_method: {
+              type: "string",
+              enum: ["phone", "email"]
+            }
+          },
+          required: toolDefinition.parameters.required.filter(
+            (argumentName) => argumentName !== "sms_confirmation_consent"
+          )
+        }
+      };
+    }),
+  QUEUE_MONDAY_EMAIL_TOOL
+]);
 
 async function runMigrationStep(name, sql, options = {}) {
   const { optional = false } = options;
@@ -2009,7 +2067,7 @@ function pendingQuestionType(value) {
   if (/start.*application|application.*start/.test(text)) {
     return "application_started";
   }
-  if (/send.*link|text.*link|want.*link|receive.*link/.test(text)) {
+  if (/email.*link|send.*email|want.*email|receive.*email/.test(text)) {
     return "application_link_permission";
   }
   if (/when|whatday|whattime|timezone|followup|callback/.test(text)) {
@@ -2946,6 +3004,12 @@ async function changeMondayValuesResilient(
 
     return { updated, failed };
   }
+}
+
+function resolveMondayEmailColumn(boardMetadata, configuredId, aliases) {
+  return configuredId
+    ? findMondayColumnById(boardMetadata, configuredId)
+    : findMondayColumn(boardMetadata, aliases);
 }
 
 async function ensureMondayMainItem(call, metadata) {
@@ -4287,7 +4351,13 @@ async function scheduleUnexpectedReconnect(callId) {
     (action) => action && action.action === "complete_call" && action.success
   );
   const alreadyScheduled = call.result?.unexpected_disconnect_reconnect_scheduled;
-  if (transcript.length < 2 || completedByTool || alreadyScheduled) return false;
+  const normallyCompleted = call.result?.normal_call_completed === true;
+  if (
+    transcript.length < 2 ||
+    completedByTool ||
+    alreadyScheduled ||
+    normallyCompleted
+  ) return false;
 
   const reconnectAt = new Date(Date.now() + 60 * 1000);
   const savedSummary = cleanText(
@@ -4921,6 +4991,189 @@ async function executeDougTool(call, name, args) {
     };
   }
 
+  if (name === "queue_monday_email") {
+    const emailType = cleanText(safeArgs.email_type, 50);
+    const allowedEmailTypes = [
+      "application_link",
+      "dti_calculator",
+      "callback_confirmation"
+    ];
+    if (!allowedEmailTypes.includes(emailType)) {
+      return { success: false, error: "Unsupported email request type." };
+    }
+
+    const lead = call.payload || {};
+    const recipientEmail = String(
+      cleanText(
+        safeArgs.recipient_email ||
+          lead.email ||
+          lead.email_address ||
+          lead.customer_email,
+        320
+      ) || ""
+    ).toLowerCase();
+    if (!validEmailAddress(recipientEmail)) {
+      return { success: false, error: "A valid customer email is required." };
+    }
+    if (!MONDAY_SYNC_ENABLED) {
+      return { success: false, error: "monday.com sync is not enabled." };
+    }
+
+    const refreshedCall = (await getCallById(call.call_id)) || call;
+    const mondayItemId = cleanText(refreshedCall.monday_item_id, 100);
+    if (!mondayItemId) {
+      return {
+        success: false,
+        error: "The existing monday.com item for this call is unavailable."
+      };
+    }
+
+    const metadata = await loadMondayMetadata();
+    const emailColumns = {
+      trigger: resolveMondayEmailColumn(
+        metadata.main,
+        MONDAY_EMAIL_COLUMNS.trigger,
+        ["Email Automation Trigger", "Email Trigger", "Send Email", "Email Status"]
+      ),
+      type: resolveMondayEmailColumn(
+        metadata.main,
+        MONDAY_EMAIL_COLUMNS.type,
+        ["Email Request Type", "Email Type"]
+      ),
+      subject: resolveMondayEmailColumn(
+        metadata.main,
+        MONDAY_EMAIL_COLUMNS.subject,
+        ["Email Subject"]
+      ),
+      body: resolveMondayEmailColumn(
+        metadata.main,
+        MONDAY_EMAIL_COLUMNS.body,
+        ["Email Body", "Email Template Data", "Email Content"]
+      )
+    };
+    const missingColumns = Object.entries(emailColumns)
+      .filter(([, column]) => !column)
+      .map(([columnName]) => columnName);
+    if (missingColumns.length) {
+      return {
+        success: false,
+        error: `Required monday.com email columns are unavailable: ${missingColumns.join(", ")}.`
+      };
+    }
+
+    const customerName =
+      cleanText(lead.first_name || lead.customer_name || lead.name, 160) ||
+      "there";
+    let subject;
+    let body;
+    if (emailType === "application_link") {
+      subject = "Your DPA Help Center Application Link";
+      body = `Hi ${customerName},\n\nHere is the DPA Help Center application link you requested:\n\n${DPA_APPLICATION_URL}\n\nComplete the application when you have time, and Daisy will follow up with you as scheduled.\n\nDPA Help Center\n1-866-281-5271`;
+    } else if (emailType === "dti_calculator") {
+      subject = "Your DPA Help Center DTI Calculator";
+      body = `Hi ${customerName},\n\nHere is the debt-to-income calculator Daisy mentioned:\n\nhttps://www.dpahelpcenter.com/dti\n\nThis calculator provides a preliminary estimate. A lender must verify your income, debts, credit, and final homebuying power.\n\nDPA Help Center\n1-866-281-5271`;
+    } else {
+      const callbackTimezone = normalizeTimezone(
+        safeArgs.timezone || refreshedCall.callback_timezone || refreshedCall.timezone
+      );
+      const callbackAt = refreshedCall.callback_at
+        ? new Date(refreshedCall.callback_at)
+        : null;
+      const validCallbackAt = Boolean(
+        callbackAt && !Number.isNaN(callbackAt.getTime())
+      );
+      const callbackDate =
+        cleanText(safeArgs.callback_date, 100) ||
+        (validCallbackAt
+          ? new Intl.DateTimeFormat("en-US", {
+              timeZone: callbackTimezone,
+              weekday: "long",
+              month: "long",
+              day: "numeric",
+              year: "numeric"
+            }).format(callbackAt)
+          : null);
+      const callbackTime =
+        cleanText(safeArgs.callback_time, 100) ||
+        (validCallbackAt
+          ? new Intl.DateTimeFormat("en-US", {
+              timeZone: callbackTimezone,
+              hour: "numeric",
+              minute: "2-digit"
+            }).format(callbackAt)
+          : null);
+      if (!callbackDate || !callbackTime) {
+        return {
+          success: false,
+          error: "A scheduled callback date and time are required."
+        };
+      }
+      subject = "Your Scheduled DPA Help Center Call";
+      body = `Hi ${customerName},\n\nYour follow-up call with Daisy is scheduled for:\n\n${callbackDate}\n${callbackTime}\n${callbackTimezone}\n\nWe look forward to speaking with you.\n\nDPA Help Center\n1-866-281-5271`;
+    }
+
+    const columnValues = {};
+    const requestedValues = {
+      trigger: "Queued",
+      type: emailType,
+      subject,
+      body
+    };
+    const invalidValues = [];
+    for (const [columnName, column] of Object.entries(emailColumns)) {
+      const formatted = mondayColumnValue(column, requestedValues[columnName]);
+      if (formatted === null || formatted === undefined) {
+        invalidValues.push(columnName);
+      } else {
+        columnValues[column.id] = formatted;
+      }
+    }
+    if (invalidValues.length) {
+      return {
+        success: false,
+        error: `monday.com email column values are not configured: ${invalidValues.join(", ")}.`
+      };
+    }
+
+    const updateResult = await changeMondayValuesResilient(
+      MONDAY_BOARD_ID,
+      mondayItemId,
+      columnValues,
+      `queue_email:${call.call_id}:${emailType}`
+    );
+    if (updateResult.failed.length || updateResult.updated !== 4) {
+      return {
+        success: false,
+        error: "monday.com did not queue every required email field."
+      };
+    }
+
+    const queuedAt = new Date().toISOString();
+    await mergeCallResult(call.call_id, {
+      queued_email_type: emailType,
+      queued_email_recipient: recipientEmail,
+      queued_email_subject: subject,
+      queued_email_status: "queued",
+      queued_email_at: queuedAt
+    });
+    await appendAction(call.call_id, {
+      action: name,
+      success: true,
+      email_type: emailType,
+      recipient_email: recipientEmail,
+      monday_item_id: mondayItemId,
+      status: "queued"
+    });
+
+    return {
+      success: true,
+      email_type: emailType,
+      recipient_email: recipientEmail,
+      monday_item_id: mondayItemId,
+      status: "queued"
+    };
+  }
+
   if (name === "send_resource_link") {
     if (safeArgs.consent_confirmed !== true) {
       return {
@@ -5139,64 +5392,6 @@ async function executeDougTool(call, name, args) {
       outcome: callbackOutcome
     });
 
-    let confirmationSmsSent = false;
-    let confirmationMessageSid = null;
-    let confirmationSmsError = null;
-
-    if (safeArgs.sms_confirmation_consent === true) {
-      try {
-        const formattedCallback = formatCustomerCallbackTime(
-          callbackAt,
-          timezone
-        );
-        const confirmation = await twilioClient.messages.create({
-          to: call.phone,
-          from: TWILIO_FROM_NUMBER,
-          body: `Your follow-up call with Daisy is scheduled for ${formattedCallback}. Reply STOP to opt out.`,
-          statusCallback: smsStatusCallbackUrl(call)
-        });
-        await trackSmsMessage(
-          call.call_id,
-          confirmation,
-          "callback_confirmation"
-        );
-        console.log(
-          JSON.stringify({
-            event: "outbound_sms_accepted",
-            call_id: call.call_id,
-            message_type: "callback_confirmation",
-            message_sid: confirmation.sid,
-            message_status: confirmation.status || "accepted",
-            destination_last_four: String(call.phone || "").slice(-4)
-          })
-        );
-        confirmationSmsSent = true;
-        confirmationMessageSid = confirmation.sid;
-      } catch (error) {
-        confirmationSmsError = cleanText(error.message, 1000);
-        console.error(
-          `Callback confirmation SMS failed for ${call.call_id}:`,
-          confirmationSmsError
-        );
-      }
-    }
-
-    await mergeCallResult(call.call_id, {
-      callback_confirmation_sms_sent: confirmationSmsSent,
-      callback_confirmation_message_sid: confirmationMessageSid,
-      callback_confirmation_sms_error: confirmationSmsError
-    });
-
-    await appendAction(call.call_id, {
-      action: "callback_confirmation_sms",
-      success:
-        confirmationSmsSent || safeArgs.sms_confirmation_consent !== true,
-      skipped: safeArgs.sms_confirmation_consent !== true,
-      consent_confirmed: safeArgs.sms_confirmation_consent === true,
-      message_sid: confirmationMessageSid,
-      error: confirmationSmsError
-    });
-
     queueMondaySync(call.call_id, "callback_scheduled");
 
     return {
@@ -5204,8 +5399,7 @@ async function executeDougTool(call, name, args) {
       callback_at: callbackAt.toISOString(),
       timezone,
       outcome: callbackOutcome,
-      sequence_status: "callback_scheduled",
-      confirmation_sms_sent: confirmationSmsSent
+      sequence_status: "callback_scheduled"
     };
   }
 
@@ -6182,9 +6376,14 @@ mediaServer.on("connection", (twilioSocket) => {
   let pendingResponsePreservesQuestion = false;
   let activeResponsePreservesQuestion = false;
   let assistantResponseFinished = true;
-  let hangupAfterPlaybackRequested = false;
-  let hangupInProgress = false;
-  let hangupCompleted = false;
+  let finalHangupRequested = false;
+  let finalHangupMarkName = "";
+  let finalHangupInProgress = false;
+  let finalHangupCompleted = false;
+  let finalHangupFallbackTimer = null;
+  let assistantAudioQueuedForResponse = false;
+  let automaticCompleteCallInProgress = false;
+  let automaticCompleteCallAttempted = false;
   let sustainedSpeechTimer = null;
   let speechCandidateStartedAt = 0;
   let speechCandidateConfirmed = false;
@@ -6241,6 +6440,36 @@ mediaServer.on("connection", (twilioSocket) => {
       streamSid,
       mark: { name }
     })) pendingMarkNames.add(name);
+  }
+
+  function sendFinalHangupMark() {
+    if (
+      !streamSid ||
+      !finalHangupRequested ||
+      finalHangupMarkName ||
+      finalHangupCompleted
+    ) {
+      return false;
+    }
+
+    const name = `daisy_final_hangup_${Date.now()}_${randomUUID()}`;
+    if (!sendToTwilio({
+      event: "mark",
+      streamSid,
+      mark: { name }
+    })) {
+      return false;
+    }
+
+    finalHangupMarkName = name;
+    pendingMarkNames.add(name);
+    finalHangupFallbackTimer = setTimeout(() => {
+      if (finalHangupCompleted || !finalHangupRequested) return;
+      void finishAndHangupTwilioCall(
+        "final_playback_mark_timeout_fallback"
+      );
+    }, 8000);
+    return true;
   }
 
   async function handleInterruption() {
@@ -6554,85 +6783,226 @@ mediaServer.on("connection", (twilioSocket) => {
     await handleInterruption();
   }
 
-  async function hangupTwilioCallAfterPlayback() {
+  async function completeCallWasStored(refreshedCall) {
+    const callActions = Array.isArray(refreshedCall?.actions)
+      ? refreshedCall.actions
+      : [];
+    let attemptActions = [];
+    if (refreshedCall?.last_attempt_id) {
+      const attempt = await getAttemptById(refreshedCall.last_attempt_id);
+      attemptActions = Array.isArray(attempt?.actions) ? attempt.actions : [];
+    }
+    return [...callActions, ...attemptActions].some(
+      (action) => action?.action === "complete_call" && action.success === true
+    );
+  }
+
+  function exactFinalClosingSpoken(value) {
+    const lead = call?.payload || {};
+    const customerName =
+      cleanText(lead.first_name || lead.customer_name || lead.name, 160) ||
+      "the customer";
+    const expected = `If there's nothing else, thank you for your time, ${customerName}. Have a great day.`;
+    return cleanText(value, 8000).replace(/\s+/g, " ").trim().toLowerCase() ===
+      expected.toLowerCase();
+  }
+
+  async function ensureCompleteCallForFinalClosing() {
     if (
-      !hangupAfterPlaybackRequested ||
-      hangupInProgress ||
-      hangupCompleted ||
-      !assistantResponseFinished ||
-      pendingMarkNames.size > 0 ||
+      finalHangupRequested ||
+      automaticCompleteCallInProgress ||
+      automaticCompleteCallAttempted ||
+      awaitingCustomerResponse ||
+      !call
+    ) {
+      return finalHangupRequested;
+    }
+
+    const refreshedCall = (await getCallById(call.call_id)) || call;
+    if (await completeCallWasStored(refreshedCall)) {
+      finalHangupRequested = true;
+      console.log(JSON.stringify({
+        event: "complete_call_succeeded",
+        call_id: call.call_id,
+        final_hangup_requested: true
+      }));
+      return true;
+    }
+    if (["completed", "stopped"].includes(refreshedCall.sequence_status)) {
+      return false;
+    }
+
+    automaticCompleteCallAttempted = true;
+    automaticCompleteCallInProgress = true;
+    try {
+      const allowedOutcomes = new Set([
+        "qualified", "hot_transfer", "specialist_handoff",
+        "specialist_callback", "follow_up_scheduled", "application_link_sent",
+        "dti_calculator_sent", "needs_review", "nurture", "voicemail",
+        "no_answer", "busy", "not_interested", "wrong_number", "opt_out",
+        "disconnected", "technical_failure", "agent_notified"
+      ]);
+      const callbackAt = refreshedCall.callback_at
+        ? new Date(refreshedCall.callback_at)
+        : null;
+      const hasFutureCallback = Boolean(
+        callbackAt && !Number.isNaN(callbackAt.getTime()) && callbackAt > new Date()
+      );
+      const savedOutcome = cleanText(refreshedCall.outcome, 80);
+      const outcome = allowedOutcomes.has(savedOutcome)
+        ? savedOutcome
+        : refreshedCall.payload?.call_type === "dpa_agent_notification"
+          ? "agent_notified"
+          : hasFutureCallback
+            ? "follow_up_scheduled"
+            : "qualified";
+      const completionArgs = {
+        outcome,
+        next_action:
+          cleanText(refreshedCall.next_action, 2000) || "Call completed normally.",
+        summary:
+          cleanText(refreshedCall.summary, 4000) ||
+          "Daisy completed the conversation and delivered the final closing.",
+        stop_sequence: !hasFutureCallback,
+        pause_sequence: false,
+        ...(hasFutureCallback
+          ? { requested_next_call_at: callbackAt.toISOString() }
+          : {})
+      };
+      const output = await routeIntent({
+        toolName: "complete_call",
+        args: completionArgs,
+        call: refreshedCall,
+        execute: executeDougTool
+      });
+      if (
+        output?.success === true &&
+        output?.intent === "complete_call" &&
+        output?.error === null
+      ) {
+        finalHangupRequested = true;
+        console.log(JSON.stringify({
+          event: "complete_call_succeeded",
+          call_id: call.call_id,
+          final_hangup_requested: true
+        }));
+        return true;
+      }
+      return false;
+    } finally {
+      automaticCompleteCallInProgress = false;
+    }
+  }
+
+  async function finishAndHangupTwilioCall(reason) {
+    if (
+      !finalHangupRequested ||
+      finalHangupInProgress ||
+      finalHangupCompleted ||
       !call
     ) {
       return false;
     }
 
-    hangupInProgress = true;
+    finalHangupInProgress = true;
 
     try {
-      const refreshedCall =
-        (await getCallById(call.call_id)) || call;
-
-      if (refreshedCall.awaiting_customer_response === true) {
-        return false;
+      const refreshedCall = (await getCallById(call.call_id)) || call;
+      if (!(await completeCallWasStored(refreshedCall))) {
+        throw new Error("complete_call was not stored before final hangup.");
       }
+
+      await pool.query(
+        `
+          UPDATE ai_calls
+          SET
+            current_state = CASE
+              WHEN current_state IN ('reconnect_pending', 'reconnect_in_progress')
+                THEN COALESCE(NULLIF(next_state, ''), 'completed')
+              ELSE current_state
+            END,
+            result = result || $2::jsonb,
+            updated_at = NOW()
+          WHERE call_id = $1
+        `,
+        [
+          call.call_id,
+          JSON.stringify({
+            normal_call_completed: true,
+            normal_call_completed_at: new Date().toISOString(),
+            unexpected_disconnect_reconnect_scheduled: false,
+            unexpected_disconnect_at: null
+          })
+        ]
+      );
+      await pool.query(
+        `
+          UPDATE call_attempts
+          SET
+            technical_status = 'canceled',
+            completed_at = NOW(),
+            cancellation_reason = 'normal_call_completed',
+            updated_at = NOW()
+          WHERE call_id = $1
+            AND attempt_type = 'disconnect_reconnect'
+            AND completed_at IS NULL
+            AND technical_status IN ('pending', 'scheduled', 'created')
+        `,
+        [call.call_id]
+      );
 
       const twilioCallSid =
-        refreshedCall.twilio_call_sid ||
-        call.twilio_call_sid;
+        refreshedCall.twilio_call_sid || call.twilio_call_sid;
 
       if (!twilioCallSid) {
-        throw new Error(
-          "Twilio Call SID is unavailable for final hangup."
-        );
+        throw new Error("Twilio Call SID unavailable for final hangup.");
       }
 
-      await twilioClient.calls(twilioCallSid).update({
-        status: "completed"
-      });
+      await twilioClient.calls(twilioCallSid).update({ status: "completed" });
 
-      hangupCompleted = true;
+      finalHangupCompleted = true;
+      if (finalHangupFallbackTimer) {
+        clearTimeout(finalHangupFallbackTimer);
+        finalHangupFallbackTimer = null;
+      }
 
       await appendAction(call.call_id, {
         action: "twilio_call_hangup",
         success: true,
-        reason: "completed_call_after_final_audio"
+        reason
       });
 
-      console.log(
-        JSON.stringify({
-          event: "twilio_call_hangup",
-          call_id: call.call_id,
-          twilio_call_sid: twilioCallSid,
-          success: true,
-          reason: "completed_call_after_final_audio"
-        })
-      );
+      console.log(JSON.stringify({
+        event: "twilio_call_hangup",
+        call_id: call.call_id,
+        twilio_call_sid: twilioCallSid,
+        success: true,
+        reason
+      }));
 
       return true;
     } catch (error) {
       const safeError =
-        cleanText(error.message, 1000) ||
-        "Twilio call hangup failed.";
+        cleanText(error.message, 1000) || "Twilio final hangup failed.";
 
       await appendAction(call.call_id, {
         action: "twilio_call_hangup",
         success: false,
-        reason: "completed_call_after_final_audio",
+        reason,
         error: safeError
       });
 
-      console.error(
-        JSON.stringify({
-          event: "twilio_call_hangup",
-          call_id: call.call_id,
-          success: false,
-          error: safeError
-        })
-      );
+      console.error(JSON.stringify({
+        event: "twilio_call_hangup",
+        call_id: call.call_id,
+        success: false,
+        reason,
+        error: safeError
+      }));
 
       return false;
     } finally {
-      hangupInProgress = false;
+      finalHangupInProgress = false;
     }
   }
 
@@ -6650,12 +7020,62 @@ mediaServer.on("connection", (twilioSocket) => {
     let output;
     try {
       const refreshed = await getCallById(call.call_id);
-      output = await routeIntent({
-        toolName: name,
-        args,
-        call: refreshed || call,
-        execute: executeDougTool
-      });
+      if (name === "send_resource_link") {
+        output = {
+          success: false,
+          intent: "send_resource_link",
+          customer_safe_message: null,
+          data: {},
+          error: { code: "SMS_DISABLED_FOR_DAISY", retryable: false }
+        };
+      } else if (name === "queue_monday_email") {
+        let raw;
+        try {
+          raw = await executeDougTool(refreshed || call, name, args);
+        } catch (error) {
+          raw = {
+            success: false,
+            error: cleanText(error.message, 1000) || "monday.com email queue failed."
+          };
+        }
+        if (raw?.success !== true) {
+          await mergeCallResult(call.call_id, {
+            email_follow_up_required: true,
+            email_follow_up_type: cleanText(args.email_type, 50),
+            email_queue_error: cleanText(raw?.error, 1000)
+          });
+          await appendAction(call.call_id, {
+            action: name,
+            success: false,
+            email_type: cleanText(args.email_type, 50),
+            error: cleanText(raw?.error, 1000)
+          });
+        }
+        output = raw?.success === true
+          ? {
+              success: true,
+              intent: "queue_monday_email",
+              customer_safe_message:
+                "Perfect. I've submitted that email to the address you provided.",
+              data: raw,
+              error: null
+            }
+          : {
+              success: false,
+              intent: "queue_monday_email",
+              customer_safe_message:
+                "I wasn't able to submit the email just now, but I've noted that it needs follow-up.",
+              data: {},
+              error: { code: "MONDAY_EMAIL_QUEUE_FAILED", retryable: true }
+            };
+      } else {
+        output = await routeIntent({
+          toolName: name,
+          args,
+          call: refreshed || call,
+          execute: executeDougTool
+        });
+      }
     } catch (error) {
       console.error(`Daisy tool ${name} failed for ${call.call_id}:`, error);
       output = {
@@ -6674,7 +7094,12 @@ mediaServer.on("connection", (twilioSocket) => {
       output?.error === null;
 
     if (completeCallSucceeded) {
-      hangupAfterPlaybackRequested = true;
+      finalHangupRequested = true;
+      console.log(JSON.stringify({
+        event: "complete_call_succeeded",
+        call_id: call.call_id,
+        final_hangup_requested: true
+      }));
     }
 
     sendToOpenAI({
@@ -6685,7 +7110,9 @@ mediaServer.on("connection", (twilioSocket) => {
         output: JSON.stringify(output)
       }
     });
-    requestAssistantResponse({ queueIfBusy: true });
+    if (!(completeCallSucceeded && exactFinalClosingSpoken(assistantTranscriptBuffer))) {
+      requestAssistantResponse({ queueIfBusy: true });
+    }
   }
 
   function connectToOpenAI() {
@@ -6767,6 +7194,7 @@ mediaServer.on("connection", (twilioSocket) => {
           assistantTranscriptBuffer = "";
           assistantTranscriptSaved = false;
           questionCapturedForResponse = false;
+          assistantAudioQueuedForResponse = false;
           return;
         }
 
@@ -6812,6 +7240,7 @@ mediaServer.on("connection", (twilioSocket) => {
           if (responseStartTimestamp === null) {
             responseStartTimestamp = latestMediaTimestamp;
           }
+          assistantAudioQueuedForResponse = true;
           sendToTwilio({
             event: "media",
             streamSid,
@@ -6910,6 +7339,9 @@ mediaServer.on("connection", (twilioSocket) => {
         }
 
         if (event.type === "response.output_audio_transcript.done") {
+          if (!assistantTranscriptBuffer && event.transcript) {
+            assistantTranscriptBuffer = event.transcript;
+          }
           if (!assistantTranscriptSaved) {
             await appendTranscript(call.call_id, "assistant", event.transcript);
             assistantTranscriptSaved = true;
@@ -6992,6 +7424,10 @@ mediaServer.on("connection", (twilioSocket) => {
           assistantResponseActive = false;
           responseCreatePending = false;
           assistantResponseFinished = true;
+          const responseOutput = event.response?.output || [];
+          const responseWasToolOnly =
+            responseOutput.length > 0 &&
+            responseOutput.every((item) => item?.type === "function_call");
           if (!assistantTranscriptSaved && assistantTranscriptBuffer) {
             await appendTranscript(
               call.call_id,
@@ -7006,7 +7442,7 @@ mediaServer.on("connection", (twilioSocket) => {
               extractPrimaryQuestion(assistantTranscriptBuffer)
             );
           }
-          for (const item of event.response?.output || []) {
+          for (const item of responseOutput) {
             if (item && item.type === "function_call") {
               await handleToolCall(
                 item.name,
@@ -7014,6 +7450,22 @@ mediaServer.on("connection", (twilioSocket) => {
                 item.arguments || "{}"
               );
             }
+          }
+          if (
+            exactFinalClosingSpoken(assistantTranscriptBuffer) &&
+            !awaitingCustomerResponse &&
+            !finalHangupCompleted
+          ) {
+            await ensureCompleteCallForFinalClosing();
+          }
+          if (
+            finalHangupRequested &&
+            !responseWasToolOnly &&
+            assistantAudioQueuedForResponse &&
+            !finalHangupMarkName &&
+            !finalHangupCompleted
+          ) {
+            sendFinalHangupMark();
           }
           activeResponsePreservesQuestion = false;
           lastWaitingPromptKind = activeResponseWaitingPromptKind;
@@ -7025,7 +7477,6 @@ mediaServer.on("connection", (twilioSocket) => {
           }
           complianceRecoveryActive = false;
           scheduleSilenceReminder();
-          void hangupTwilioCallAfterPlayback();
           return;
         }
 
@@ -7121,9 +7572,13 @@ mediaServer.on("connection", (twilioSocket) => {
       if (message.event === "mark") {
         const name = cleanText(message.mark?.name, 100);
         if (name) pendingMarkNames.delete(name);
+        if (name && name === finalHangupMarkName) {
+          void finishAndHangupTwilioCall(
+            "final_playback_mark_confirmed"
+          );
+        }
         if (!pendingMarkNames.size) {
           scheduleSilenceReminder();
-          void hangupTwilioCallAfterPlayback();
         }
         return;
       }
