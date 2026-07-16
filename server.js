@@ -1354,14 +1354,7 @@ const DOUG_TOOLS = [
         },
         prospect_confirmed: { type: "boolean" }
       },
-      required: [
-        "callback_at",
-        "customer_local_date",
-        "customer_local_time",
-        "timezone",
-        "reason",
-        "prospect_confirmed"
-      ],
+      required: [reason],
       additionalProperties: false
     }
   },
@@ -5936,7 +5929,47 @@ function localDateTimeToUtc(dateText, timeText, timeZone) {
     `${check.hour}:${check.minute}` === timeText;
   return matches ? result : null;
 }
+function resolveCustomerTimezone(value, fallback = null) {
+  const raw =
+    cleanText(value, 100) ||
+    cleanText(fallback, 100);
 
+  if (!raw) return null;
+
+  const timezoneKey = normalizeMondayKey(raw);
+  let timeZone = raw;
+
+  if (
+    timezoneKey.includes("eastern") ||
+    ["et", "est", "edt"].includes(timezoneKey)
+  ) {
+    timeZone = "America/New_York";
+  } else if (
+    timezoneKey.includes("central") ||
+    ["ct", "cst", "cdt"].includes(timezoneKey)
+  ) {
+    timeZone = "America/Chicago";
+  } else if (
+    timezoneKey.includes("mountain") ||
+    ["mt", "mst", "mdt"].includes(timezoneKey)
+  ) {
+    timeZone = "America/Denver";
+  } else if (
+    timezoneKey.includes("pacific") ||
+    ["pt", "pst", "pdt"].includes(timezoneKey)
+  ) {
+    timeZone = "America/Los_Angeles";
+  }
+
+  try {
+    new Intl.DateTimeFormat("en-US", {
+      timeZone
+    }).format(new Date());
+
+    return timeZone;
+  } catch {
+    return null;
+  }
 function resolveConfirmedCallbackDateTime(args, call) {
   const requestedTimezone =
     cleanText(args.timezone, 100) ||
@@ -8186,67 +8219,273 @@ if (pendingQuestionType === "application_started") {
 
     return;
   }
+const previousCallbackAnswer =
+  cleanText(call.result?.callback_datetime_answer, 500);
 
-  const previousCallbackAnswer =
-    cleanText(call.result?.callback_datetime_answer, 500);
+const combinedAnswer = [previousCallbackAnswer, answerText]
+  .filter(Boolean)
+  .join(" ");
 
-  const savedTimezone =
-    cleanText(call.callback_timezone, 100) ||
-    cleanText(call.result?.callback_timezone, 100);
+const savedTimezone =
+  cleanText(call.callback_timezone, 100) ||
+  cleanText(call.result?.callback_timezone, 100);
 
-  const normalizedAnswer = normalizeCustomerUtterance(answerText);
+const timeZone = resolveCustomerTimezone(
+  combinedAnswer,
+  savedTimezone
+);
 
-  const answerIncludesTimezone =
-    /\b(eastern|central|mountain|pacific|et|est|edt|ct|cst|cdt|mt|mst|mdt|pt|pst|pdt)\b/.test(
-      normalizedAnswer
-    );
+const customerLocalTime =
+  parseConfirmedLocalTime(answerText) ||
+  parseConfirmedLocalTime(previousCallbackAnswer);
 
-  await mergeCallResult(call.call_id, {
-    callback_datetime_answer: answerText,
-    callback_confirmation_explicitly_answered: false,
-    callback_confirmation_confirmed: false
-  });
+await mergeCallResult(call.call_id, {
+  callback_datetime_answer: combinedAnswer,
+  ...(timeZone ? { callback_timezone: timeZone } : {}),
+  callback_confirmation_explicitly_answered: false,
+  callback_confirmation_confirmed: false
+});
 
-  call = (await getCallById(call.call_id)) || call;
-  await endLocalWaitingState("callback_datetime_collected");
+call = (await getCallById(call.call_id)) || call;
+await endLocalWaitingState("callback_datetime_collected");
 
-  if (!savedTimezone && !answerIncludesTimezone) {
-    requestAssistantResponse({
-      queueIfBusy: true,
-      response: {
-        output_modalities: ["audio"],
-        instructions:
-          'Ask exactly: "What time zone are you in—Eastern, Central, Mountain, or Pacific?" Say nothing else.'
-      }
-    });
-
-    return;
-  }
-
-  const combinedAnswer = [previousCallbackAnswer, answerText]
-    .filter(Boolean)
-    .join(" ");
-
-  const applicationStartDate =
-    cleanText(call.result?.application_start_date_answer, 500);
-
+if (!timeZone) {
   requestAssistantResponse({
     queueIfBusy: true,
     response: {
       output_modalities: ["audio"],
-      instructions: `The customer provided these callback details: ${JSON.stringify(
-        combinedAnswer
-      )}.${
-        applicationStartDate
-          ? ` The customer plans to start the application on ${JSON.stringify(
-              applicationStartDate
-            )}, so the callback must be scheduled for the following day.`
-          : ""
-      } Do not call schedule_callback yet. Resolve the exact callback date, local time, and timezone. Ask exactly one confirmation question in this format: "I have us scheduled to speak on [exact date] at [exact time] [timezone]. Is that correct?" Say nothing else.`
+      instructions:
+        'Ask exactly: "What time zone are you in—Eastern, Central, Mountain, or Pacific?" Say nothing else.'
     }
   });
-
   return;
+}
+
+if (!customerLocalTime) {
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions:
+        'Ask exactly: "What time would you like me to call you?" Say nothing else.'
+    }
+  });
+  return;
+}
+
+const applicationStartDate =
+  cleanText(call.result?.application_start_date_answer, 500);
+
+const parsedApplicationDate = applicationStartDate
+  ? parseConfirmedLocalDate(applicationStartDate, timeZone)
+  : null;
+
+const customerLocalDate = parsedApplicationDate
+  ? addDaysToLocalDateText(parsedApplicationDate, 1)
+  : parseConfirmedLocalDate(
+      `${pendingQuestionText || ""} ${combinedAnswer}`,
+      timeZone
+    );
+
+if (!customerLocalDate) {
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions:
+        'Ask exactly: "What date would you like me to call you?" Say nothing else.'
+    }
+  });
+  return;
+}
+
+const callbackAt = localDateTimeToUtc(
+  customerLocalDate,
+  customerLocalTime,
+  timeZone
+);
+
+if (!callbackAt || callbackAt <= new Date()) {
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions:
+        'Ask exactly: "That time has already passed. What future time would work better?" Say nothing else.'
+    }
+  });
+  return;
+}
+
+const callbackReason =
+  applicationStartDate ||
+  call.result?.application_start_plan_explicitly_answered === true
+    ? "Application checkpoint"
+    : "Customer requested a better time";
+
+await mergeCallResult(call.call_id, {
+  callback_at: callbackAt.toISOString(),
+  callback_local_date: customerLocalDate,
+  callback_local_time: customerLocalTime,
+  callback_timezone: timeZone,
+  callback_reason: callbackReason,
+  callback_confirmation_explicitly_answered: false,
+  callback_confirmation_confirmed: false
+});
+
+call = (await getCallById(call.call_id)) || call;
+refreshActiveRealtimeInstructions();
+
+const spokenAppointment = formatCustomerCallbackTime(
+  callbackAt,
+  timeZone
+);
+
+requestAssistantResponse({
+  queueIfBusy: true,
+  response: {
+    output_modalities: ["audio"],
+    instructions: `Ask exactly: ${JSON.stringify(
+      `I have us scheduled to speak on ${spokenAppointment}. Is that correct?`
+    )} Say nothing else.`
+  }
+});
+
+return;
+}
+ const previousCallbackAnswer =
+  cleanText(call.result?.callback_datetime_answer, 500);
+
+const combinedAnswer = [previousCallbackAnswer, answerText]
+  .filter(Boolean)
+  .join(" ");
+
+const savedTimezone =
+  cleanText(call.callback_timezone, 100) ||
+  cleanText(call.result?.callback_timezone, 100);
+
+const timeZone = resolveCustomerTimezone(
+  combinedAnswer,
+  savedTimezone
+);
+
+const customerLocalTime =
+  parseConfirmedLocalTime(answerText) ||
+  parseConfirmedLocalTime(previousCallbackAnswer);
+
+await mergeCallResult(call.call_id, {
+  callback_datetime_answer: combinedAnswer,
+  ...(timeZone ? { callback_timezone: timeZone } : {}),
+  callback_confirmation_explicitly_answered: false,
+  callback_confirmation_confirmed: false
+});
+
+call = (await getCallById(call.call_id)) || call;
+await endLocalWaitingState("callback_datetime_collected");
+
+if (!timeZone) {
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions:
+        'Ask exactly: "What time zone are you in—Eastern, Central, Mountain, or Pacific?" Say nothing else.'
+    }
+  });
+  return;
+}
+
+if (!customerLocalTime) {
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions:
+        'Ask exactly: "What time would you like me to call you?" Say nothing else.'
+    }
+  });
+  return;
+}
+
+const applicationStartDate =
+  cleanText(call.result?.application_start_date_answer, 500);
+
+const parsedApplicationDate = applicationStartDate
+  ? parseConfirmedLocalDate(applicationStartDate, timeZone)
+  : null;
+
+const customerLocalDate = parsedApplicationDate
+  ? addDaysToLocalDateText(parsedApplicationDate, 1)
+  : parseConfirmedLocalDate(
+      `${pendingQuestionText || ""} ${combinedAnswer}`,
+      timeZone
+    );
+
+if (!customerLocalDate) {
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions:
+        'Ask exactly: "What date would you like me to call you?" Say nothing else.'
+    }
+  });
+  return;
+}
+
+const callbackAt = localDateTimeToUtc(
+  customerLocalDate,
+  customerLocalTime,
+  timeZone
+);
+
+if (!callbackAt || callbackAt <= new Date()) {
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions:
+        'Ask exactly: "That time has already passed. What future time would work better?" Say nothing else.'
+    }
+  });
+  return;
+}
+
+const callbackReason =
+  applicationStartDate ||
+  call.result?.application_start_plan_explicitly_answered === true
+    ? "Application checkpoint"
+    : "Customer requested a better time";
+
+await mergeCallResult(call.call_id, {
+  callback_at: callbackAt.toISOString(),
+  callback_local_date: customerLocalDate,
+  callback_local_time: customerLocalTime,
+  callback_timezone: timeZone,
+  callback_reason: callbackReason,
+  callback_confirmation_explicitly_answered: false,
+  callback_confirmation_confirmed: false
+});
+
+call = (await getCallById(call.call_id)) || call;
+refreshActiveRealtimeInstructions();
+
+const spokenAppointment = formatCustomerCallbackTime(
+  callbackAt,
+  timeZone
+);
+
+requestAssistantResponse({
+  queueIfBusy: true,
+  response: {
+    output_modalities: ["audio"],
+    instructions: `Ask exactly: ${JSON.stringify(
+      `I have us scheduled to speak on ${spokenAppointment}. Is that correct?`
+    )} Say nothing else.`
+  }
+});
+
+return;
 }
   if (pendingQuestionType === "callback_confirmation") {
   const explicitAnswer = normalizeExplicitYesNo(transcript);
@@ -8262,6 +8501,7 @@ if (pendingQuestionType === "application_started") {
           'Ask exactly: "Was that a yes or a no?" Say nothing else.'
       }
     });
+
     return;
   }
 
@@ -8270,8 +8510,11 @@ if (pendingQuestionType === "application_started") {
     callback_confirmation_confirmed: explicitAnswer
   });
 
+  await endLocalWaitingState(
+    "explicit_callback_confirmation_answer"
+  );
+
   call = (await getCallById(call.call_id)) || call;
-  await endLocalWaitingState("explicit_callback_confirmation_answer");
 
   if (!explicitAnswer) {
     requestAssistantResponse({
@@ -8279,18 +8522,80 @@ if (pendingQuestionType === "application_started") {
       response: {
         output_modalities: ["audio"],
         instructions:
-          'Say exactly: "No problem. What date and time would work better for you?" Say nothing else.'
+          'Ask exactly: "No problem. What date and time would work better for you?" Say nothing else.'
       }
     });
+
     return;
   }
+
+  const callbackAt =
+    cleanText(call.result?.callback_at, 100);
+
+  const customerLocalDate =
+    cleanText(call.result?.callback_local_date, 100);
+
+  const customerLocalTime =
+    cleanText(call.result?.callback_local_time, 100);
+
+  const timezone = resolveCustomerTimezone(
+    call.result?.callback_timezone,
+    call.callback_timezone
+  );
+
+  const reason =
+    cleanText(call.result?.callback_reason, 1000) ||
+    "Application checkpoint";
+
+  const scheduleResult = await executeDougTool(
+    call,
+    "schedule_callback",
+    {
+      callback_at: callbackAt,
+      customer_local_date: customerLocalDate,
+      customer_local_time: customerLocalTime,
+      timezone,
+      reason,
+      prospect_confirmed: true,
+      discussion_summary:
+        cleanText(call.summary, 4000) ||
+        cleanText(call.result?.discussion_summary, 4000)
+    },
+    sessionCallPhase
+  );
+
+  if (!scheduleResult?.success) {
+    console.error(JSON.stringify({
+      event: "confirmed_callback_schedule_failed",
+      call_id: call.call_id,
+      error: scheduleResult?.error || "unknown"
+    }));
+
+    requestAssistantResponse({
+      queueIfBusy: true,
+      response: {
+        output_modalities: ["audio"],
+        instructions:
+          "Say exactly: \"I'm sorry, I couldn't complete the scheduling. Let's verify the date and time one more time.\" Say nothing else."
+      }
+    });
+
+    return;
+  }
+
+  const confirmedAppointment =
+    formatCustomerCallbackTime(
+      scheduleResult.callback_at,
+      scheduleResult.timezone || timezone
+    );
 
   requestAssistantResponse({
     queueIfBusy: true,
     response: {
       output_modalities: ["audio"],
-      instructions:
-        "The customer explicitly confirmed the callback appointment. Use schedule_callback now with the exact confirmed date, time, timezone, reason, and prospect_confirmed set to true. Do not ask another question."
+      instructions: `Say exactly: ${JSON.stringify(
+        `Excellent. I have us scheduled to speak on ${confirmedAppointment}.`
+      )} Then use complete_call with outcome "follow_up_scheduled", next_action "Complete the application before Call Two", a concise summary, stop_sequence false, and pause_sequence false.`
     }
   });
 
