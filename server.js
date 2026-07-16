@@ -7459,6 +7459,7 @@ mediaServer.on("connection", (twilioSocket) => {
   let finalPlaybackMarkName = "";
   let finalHangupInProgress = false;
   let finalHangupCompleted = false;
+  let finalHangupAttemptCount = 0; 
   let finalHangupFallbackTimer = null;
   let finalAbsoluteHangupTimer = null;
   let activeTwilioCallSid = "";
@@ -8034,7 +8035,8 @@ mediaServer.on("connection", (twilioSocket) => {
     if (
       !normalEndRequested ||
       finalHangupInProgress ||
-      finalHangupCompleted
+      finalHangupCompleted ||
+      finalHangupAttemptCount >= 3
     ) {
       return false;
     }
@@ -8060,20 +8062,26 @@ mediaServer.on("connection", (twilioSocket) => {
 
       let updatedCall = null;
       let lastUpdateError = null;
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        try {
-          updatedCall = await twilioClient
-            .calls(twilioCallSid)
-            .update({
-              status: "completed"
-            });
-          lastUpdateError = null;
-          break;
-        } catch (error) {
-          lastUpdateError = error;
-          if (attempt < 3) await sleep(attempt === 1 ? 500 : 1000);
-        }
-      }
+      while (finalHangupAttemptCount < 3) {
+  finalHangupAttemptCount += 1;
+
+  try {
+    updatedCall = await twilioClient
+      .calls(twilioCallSid)
+      .update({
+        status: "completed"
+      });
+
+    lastUpdateError = null;
+    break;
+  } catch (error) {
+    lastUpdateError = error;
+
+    if (finalHangupAttemptCount < 3) {
+      await sleep(finalHangupAttemptCount === 1 ? 500 : 1000);
+    }
+  }
+}
       if (lastUpdateError) throw lastUpdateError;
 
       finalHangupCompleted = true;
