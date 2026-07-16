@@ -8028,46 +8028,6 @@ if (pendingQuestionType === "application_start_plan") {
   });
 
   return;
-}
-    if (pendingQuestionType === "application_start_plan") {
-  const explicitAnswer = normalizeExplicitYesNo(transcript);
-
-  if (explicitAnswer === null) {
-    requestAssistantResponse({
-      queueIfBusy: true,
-      allowWhileAwaiting: true,
-      preservePendingQuestion: true,
-      response: {
-        output_modalities: ["audio"],
-        instructions:
-          'Ask exactly: "Was that a yes or a no?" Say nothing else.'
-      }
-    });
-    return;
-  }
-
-  await mergeCallResult(call.call_id, {
-    application_start_plan_explicitly_answered: true,
-    application_start_today_confirmed: explicitAnswer,
-    callback_confirmation_explicitly_answered: false,
-    callback_confirmation_confirmed: false
-  });
-
-  call = (await getCallById(call.call_id)) || call;
-  await endLocalWaitingState("explicit_application_start_plan_answer");
-
-  requestAssistantResponse({
-    queueIfBusy: true,
-    response: {
-      output_modalities: ["audio"],
-      instructions: explicitAnswer
-        ? 'Ask exactly: "Excellent. What time tomorrow would be best for our second call?" Say nothing else.'
-        : 'Ask exactly: "No problem. What day do you think you will have time to start it?" Say nothing else.'
-    }
-  });
-
-  return;
-}
     }
 if (pendingQuestionType === "application_started") {
   const explicitAnswer = normalizeApplicationStartedAnswer(transcript);
