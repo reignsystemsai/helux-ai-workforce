@@ -18,7 +18,7 @@ const { buildRealtimeSession } = require("./src/realtime/openai-session");
 
 /*
  * HELUX AI WORKFORCE - DAISY 3.2.0
- * Daisy, Doug's assistant: calling, callbacks, resources, and two-way monday.com control.
+ * Daisy, Doug's assistant: calling, resources, and two-way monday.com control.
  * monday.com failures never block or terminate a customer call.
  */
 
@@ -88,9 +88,6 @@ const DAISY_RESOURCE_LIBRARY = Object.freeze({
   }
 });
 
-const CALL_SCHEDULER_ENABLED =
-  String(process.env.CALL_SCHEDULER_ENABLED || "false").toLowerCase() ===
-  "true";
 const OUTBOUND_CALLS_ENABLED =
   String(
     process.env.OUTBOUND_CALLS_ENABLED || "false"
@@ -100,10 +97,6 @@ const ENFORCE_CALL_CONSENT =
   "true";
 const DEFAULT_TIMEZONE =
   process.env.DEFAULT_TIMEZONE || "America/New_York";
-const SCHEDULER_INTERVAL_MS = Math.max(
-  30000,
-  Number(process.env.SCHEDULER_INTERVAL_MS || 60000)
-);
 
 /*
  * Daisy does not interrupt herself for a single VAD spike. A possible customer
@@ -196,29 +189,11 @@ if (missingEnvironment.length) {
 
 const DOUG_CONFIG = Object.freeze({
   agentVersion: "daisy-3.2.0",
-  promptVersion: "dpa-two-call-noise-resistant-v3.2",
+  promptVersion: "dpa-call-noise-resistant-v3.2",
   toolVersion: "intent-actions-v3.0",
   knowledgeVersion: "dpa-general-v1",
   routingVersion: "dpa-routing-v1",
-  cadenceVersion: "dpa-ready-6-attempt-adaptive-v2",
   mondayAdapterVersion: "monday-call-control-v2.5-compatible",
-  maxAttempts: 6,
-  maxVoicemails: 2,
-  minimumGapMinutes: 180,
-  operatingWindow: {
-    alwaysOpen: true,
-    weekdayStart: "00:00",
-    weekdayEnd: "23:59",
-    saturdayStart: "00:00",
-    saturdayEnd: "23:59",
-    sundayStart: "00:00",
-    sundayEnd: "23:59",
-    sundayEnabled: true
-  },
-  preferredWindows: {
-    morning: "09:15",
-    lateAfternoon: "16:30"
-  },
   voiceRules: {
     maximumResponseSeconds: 12,
     questionsPerTurn: 1,
@@ -242,8 +217,6 @@ app.use(express.urlencoded({ extended: false }));
 const server = http.createServer(app);
 const mediaServer = new WebSocketServer({ noServer: true });
 
-let schedulerTimer = null;
-let schedulerRunning = false;
 let mondayMetadataCache = null;
 let mondayMetadataExpiresAt = 0;
 const mondaySyncTimers = new Map();
@@ -312,45 +285,6 @@ function normalizeExplicitYesNo(value) {
     /\bi am working with\b/
   ];
   if (positivePatterns.some((pattern) => pattern.test(normalized))) return true;
-  return null;
-}
-function normalizeApplicationStartedAnswer(value) {
-  const explicitAnswer = normalizeExplicitYesNo(value);
-  if (explicitAnswer !== null) return explicitAnswer;
-
-  const normalized = normalizeCustomerUtterance(value);
-
-  const negativePatterns = [
-    /\bi haven'?t\b/,
-    /\bi have not\b/,
-    /\bi didn'?t\b/,
-    /\bi did not\b/,
-    /\bnot started\b/,
-    /\bhaven'?t started\b/,
-    /\bdidn'?t get to it\b/,
-    /\bstill need to\b/
-  ];
-
-  if (negativePatterns.some((pattern) => pattern.test(normalized))) {
-    return false;
-  }
-
-  const positivePatterns = [
-    /\bi did\b/,
-    /\bi have\b/,
-    /\bi started\b/,
-    /\balready started\b/,
-    /\bstarted it\b/,
-    /\bi began\b/,
-    /\bcompleted it\b/,
-    /\bsubmitted it\b/,
-    /\bfilled it out\b/
-  ];
-
-  if (positivePatterns.some((pattern) => pattern.test(normalized))) {
-    return true;
-  }
-
   return null;
 }
 function wholeNumberToWords(value) {
@@ -498,23 +432,8 @@ function normalizeDaisyAnswers(input) {
       80
     );
   }
-  if (Object.prototype.hasOwnProperty.call(
-    answers,
-    "tentative_meeting_availability"
-  )) {
-    answers.tentative_meeting_availability = cleanText(
-      answers.tentative_meeting_availability,
-      1000
-    );
-  }
   if (answers.application_link_sent !== undefined) {
     answers.application_link_sent = answers.application_link_sent === true;
-  }
-  if (answers.application_follow_up_at) {
-    const followUp = new Date(answers.application_follow_up_at);
-    answers.application_follow_up_at = Number.isNaN(followUp.getTime())
-      ? null
-      : followUp.toISOString();
   }
   return answers;
 }
@@ -622,7 +541,7 @@ function confirmedConsent(payload) {
 }
 
 const DOUGLAS_DAISY_SCRIPT = String.raw`
-DAISY 3.2 — TWO-CALL DPA SCRIPT
+DAISY 3.2 — DPA CALL SCRIPT
 
 These are internal operating instructions. Never read headings, rules, braces, or placeholders aloud.
 
@@ -656,8 +575,7 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - Daisy cannot offer, send, or claim to have sent text messages.
 - Do not ask for SMS consent.
 - Do not call or mention send_resource_link.
-- After a confirmed callback, proceed directly to the closing.
-- Never claim a callback, handoff, or other action succeeded until the tool confirms success.
+- Never claim a handoff or other action succeeded until the tool confirms success.
 - Before ending a connected call, save the outcome, confirm the next step, use complete_call, give one brief closing, and end normally.
 
 When the current call has no remaining question or action:
@@ -687,7 +605,6 @@ Saved purchase area: {purchase_area}
 Saved lender status: {has_lender}
 Saved Realtor status: {has_realtor}
 Previous call summary: {previous_call_summary}
-Previous callback reason: {previous_callback_reason}
 
 Never speak "not provided" as though it were customer data. When a value is unavailable, use a natural generic version of the sentence.
 
@@ -742,7 +659,7 @@ Do not repeat confirmed answers.
 A normal goodbye or a call ending at the end of the script must never trigger a reconnect call.
 
 ==================================================
-4. CALL ONE — DISCOVERY AND CALL-TWO SCHEDULING
+4. CALL ONE — DISCOVERY
 ==================================================
 
 Use this section when Runtime mode says CALL ONE.
@@ -794,41 +711,14 @@ Save corrections without asking the customer to repeat information that remains 
 CONFIRM AVAILABILITY
 
 Daisy says:
-"Wonderful, {customer_name}. It sounds like you're ready to explore down payment assistance and take the next step toward becoming a homeowner. Do you have a minute or two so I can explain our simple two-call process?"
+"Wonderful, {customer_name}. It sounds like you're ready to explore down payment assistance and take the next step toward becoming a homeowner. Do you have a minute or two so I can ask a few quick questions?"
 
 WAIT.
 
-IF ANOTHER TIME IS BETTER
-
-Daisy says:
-"What date and time would work better for you?"
-
-WAIT.
-
-Collect:
-- Callback date
-- Callback time
-- Customer timezone
-- Callback reason
-
-After collecting the date, time, and timezone, Daisy asks:
-"Excellent. I'll call you on {callback_date} at {callback_time} in your time zone. Is that correct?"
-
-WAIT.
-
-After confirmation, Daisy says:
-"Excellent. I have us scheduled to speak on {callback_date} at {callback_time} in your time zone."
-
-Then:
-- Use schedule_callback with reason "Customer requested a better time."
-
-END THE CALL AND HANG UP.
-DO NOT CONTINUE CALL ONE.
-
-EXPLAIN THE TWO-CALL PROCESS
+EXPLAIN THE CALL
 
 When the customer can continue, Daisy says:
-"Perfect, this will be quick. Our two-call process is simple. Call one, which is now, quickly covers your purchase timeline, whether you're working with a lender or Realtor, and the area where you'd like to purchase. On call two, we'll review your application status, debt-to-income ratio, and potential program options, and make sure you're connected with DPA lender and Realtor specialists when needed. How does that sound?"
+"Perfect, this will be quick. I'll cover your purchase timeline, whether you're working with a lender or Realtor, and the area where you'd like to purchase. How does that sound?"
 
 WAIT.
 
@@ -878,210 +768,24 @@ Save has_realtor as Yes or No.
 QUESTION FOUR — PURCHASE AREA
 
 Daisy says:
-"And one more question before we schedule your second call: what area would you like to purchase a home in?"
+"And one more question: what area would you like to purchase a home in?"
 
 WAIT.
 
 Save the customer's exact meaningful answer as purchase_area without changing its spelling or location. Never infer it from lead city, ZIP code, intake data, Monday.com, another lead, or a nearby city. If the answer is unclear, ask exactly: "What city or area would you like to purchase in?" Do not guess.
 
-SCHEDULE CALL TWO
+END CALL ONE
 
-Daisy says:
+After saving the exact purchase area, Daisy says:
 "{purchase_area_closing}"
 
-Daisy says:
-"Your next step is to start the application so I can follow up with you about its status, review your debt-to-income ratio, and explore potential program options."
-
-Daisy asks:
-"{customer_name}, do you think you'll have time to start the application today?"
-
-WAIT.
-
-IF THE CUSTOMER SAYS YES
-
-Daisy asks:
-"Excellent. What time zone are you in, and what time tomorrow would be best for our second call?"
-
-WAIT.
-
-Use the customer's answer to calculate a specific callback date and time for the following day.
-
-IF THE CUSTOMER SAYS NO
-
-Daisy says:
-"No problem. What day do you think you'll have time to start it?"
-
-WAIT.
-
-Then Daisy asks:
-"And what time would be best for me to follow up with you the following day?"
-
-WAIT.
-
-For both branches:
-- Collect the exact callback date.
-- Collect the exact callback time.
-- Confirm the timezone.
-- Repeat the exact appointment.
-
-Daisy says:
-"I have us scheduled to speak on {callback_date} at {callback_time} in your time zone. Is that correct?"
-
-WAIT.
-
-After confirmation, Daisy says:
-"Excellent. I have us scheduled to speak on {callback_date} at {callback_time} in your time zone."
-
-Then use schedule_callback with:
-- reason: "Application checkpoint"
-- prospect_confirmed: true
-- the correct callback_at
-- the correct timezone
-
-END THE CALL AND HANG UP.
-A SUCCESSFULLY COMPLETED CALL MUST NOT TRIGGER A RECONNECT.
-
-==================================================
-5. CALL TWO — APPLICATION STATUS, DTI, AND CONNECTIONS
-==================================================
-
-Use this section when Runtime mode says CALL TWO.
-
-OPENING
-
-Daisy says:
-"Hi, is {customer_name} available?"
-
-WAIT.
-
-After confirmation Daisy says:
-"Great, this is Daisy with the DPA Help Center. I'm following up like we discussed."
-
-Briefly summarize the saved:
-- Purchase timeline
-- Purchase area
-
-When the assistance amount is available, Daisy says:
-"You were also looking for up to {estimated_dpa} in down payment assistance. Is that still correct?"
-
-WAIT.
-
-When the assistance amount is unavailable, Daisy says:
-"You were also looking into down payment assistance. Is that still correct?"
-
-WAIT.
-
-Do not repeat all of Call One.
-
-Ask:
-"Did you have a chance to start the application?"
-
-WAIT.
-
-IF THE APPLICATION WAS STARTED
-
-Daisy says:
-"Excellent. That's great to hear."
-
-Use record_application_checkpoint with:
-- started: true
-- a concise summary
-
-Mark the lead hot through the existing tool workflow.
-
-Daisy asks:
-"Before I connect you with the next step, let's review your preliminary debt-to-income ratio. Do you have a few minutes to do that now?"
-
-WAIT.
-
-If the customer agrees, continue into the existing DTI section.
-
-Do not tell the customer that a specialist will contact them before completing or appropriately addressing the DTI review.
-
-IF THE APPLICATION WAS NOT STARTED
-
-Daisy says:
-"No worries."
-
-DTI REVIEW
-
-Daisy says:
-"One of the main things that can affect your homebuying options is your debt-to-income ratio. Would you like me to help you calculate a preliminary DTI estimate now?"
-
-WAIT.
-
-IF THE CUSTOMER WANTS HELP NOW
-
-Ask one number at a time.
-
-Daisy asks:
-"What is your gross monthly household income before taxes?"
-
-WAIT.
-
-Then Daisy asks:
-"Approximately how much do you pay each month toward recurring debts, including credit-card minimums, vehicle payments, student loans, personal loans, child support, and alimony?"
-
-WAIT.
-
-Do not include:
-- Groceries
-- Utilities
-- Phone service
-- Internet
-- Gas
-- Normal household living expenses
-
-After receiving both numbers:
-- Use calculate_preliminary_dti.
-- Call the result a preliminary estimate.
-- Explain that a lender must verify income, debt, credit, and final homebuying power.
-- Do not quote an interest rate.
-- Do not guarantee an approved home price.
-
-After the DTI review is completed, Daisy says:
-"Excellent. Your application has been started, and we now have a clearer picture of your debt-to-income position."
-
-Daisy says:
-"A DPA specialist should reach out within 24 to 48 hours to help you continue with the next step."
-
-PROFESSIONAL CONNECTIONS
-
-Use the saved lender and Realtor answers.
-
-- Do not re-ask a status already confirmed unless the customer says it changed.
-- When a lender or Realtor connection is missing and human follow-up is appropriate, use create_specialist_handoff.
-- Never claim a connection was completed before the tool confirms it.
-
-CALL-TWO CLOSING WHEN THE APPLICATION WAS STARTED
-
-When the next action belongs to a specialist:
-- Confirm that a specialist should follow up within 24 to 48 hours.
-- Use complete_call with the correct final outcome.
-- Thank the customer.
-- End normally.
-
-CALL-TWO CLOSING WHEN THE APPLICATION WAS NOT STARTED
-
-Ask:
-"When do you think you'll have time to start it, so I can help you stay moving forward?"
-
-WAIT.
-
-Collect:
-- Specific date
-- Specific time
-- Timezone
-
-Repeat and confirm the appointment.
-
-Daisy says:
-"Excellent. I have us scheduled to speak on {callback_date} at {callback_time} in your time zone."
-
-Then use schedule_callback with reason:
-"Application checkpoint"
-
-End normally.
+Then:
+- Save all captured answers and the summary.
+- Use complete_call.
+- After complete_call succeeds, play the existing final closing.
+- Ask no additional questions.
+- End the call normally and allow the server to physically disconnect it.
+- A successfully completed call must not trigger a reconnect.
 
 ==================================================
 6. REQUIRED RHYTHM
@@ -1116,9 +820,6 @@ function resolveSessionCallPhase(call, attempt = null) {
     call?.result?.outbound_call_reason || call?.payload?.outbound_call_reason
   );
   const attemptType = normalizeMondayKey(attempt?.attempt_type);
-  const scheduledPurpose = normalizeMondayKey(
-    call?.result?.scheduled_second_call_purpose
-  );
 
   if (
     callType === "dpaagentnotification" ||
@@ -1129,12 +830,6 @@ function resolveSessionCallPhase(call, attempt = null) {
     attemptType === "disconnectreconnect" ||
     call?.result?.reconnect_source_call_id
   ) return "RECONNECT";
-  if (
-    callType === "calltwo" ||
-    outboundReason === "calltwo" ||
-    attemptType === "applicationcheckpoint" ||
-    scheduledPurpose === "applicationcheckpoint"
-  ) return "CALL_TWO";
   return "CALL_ONE";
 }
 
@@ -1144,7 +839,6 @@ function buildDouglasDaisyInstructions(call, sessionCallPhase) {
   const confirmedPurchaseArea = cleanText(result.purchase_area, 1000);
   const callMode = {
     CALL_ONE: "CALL ONE",
-    CALL_TWO: "CALL TWO",
     RECONNECT: "RECONNECT",
     SPECIALIST_NOTIFICATION: "INTERNAL SPECIALIST NOTIFICATION"
   }[sessionCallPhase] || "CALL ONE";
@@ -1211,16 +905,7 @@ income_submitted:
           result.discussion_summary ??
           result.summary,
         4000
-      ) || "not provided",
-    previous_callback_reason:
-      cleanText(result.callback_reason, 1000) ||
-      "not provided",
-    callback_date:
-      cleanText(result.callback_date, 100) ||
-      "the confirmed date",
-    callback_time:
-      cleanText(result.callback_time, 100) ||
-      "the confirmed time"
+      ) || "not provided"
   };
 
   return Object.entries(values).reduce(
@@ -1232,21 +917,6 @@ income_submitted:
 }
 
 const DOUG_TOOLS = [
-  {
-    type: "function",
-    name: "record_application_checkpoint",
-    description:
-      "Record whether the customer started the application at the scheduled checkpoint.",
-    parameters: {
-      type: "object",
-      properties: {
-        started: { type: "boolean" },
-        summary: { type: "string" }
-      },
-      required: ["started", "summary"],
-      additionalProperties: false
-    }
-  },
   {
     type: "function",
     name: "save_call_progress",
@@ -1321,46 +991,6 @@ const DOUG_TOOLS = [
   },
   {
     type: "function",
-    name: "schedule_callback",
-    description:
-      "Schedule a confirmed callback and pause the normal calling cadence.",
-    parameters: {
-      type: "object",
-      properties: {
-        callback_at: {
-          type: "string",
-          description: "ISO 8601 datetime including timezone offset."
-        },
-        customer_local_date: {
-          type: "string",
-          description: "Customer-confirmed local date or relative date phrase."
-        },
-        customer_local_time: {
-          type: "string",
-          description: "Customer-confirmed local time."
-        },
-        application_local_date: {
-          type: "string",
-          description: "Stated application date when the callback is the following day."
-        },
-        timezone: { type: "string" },
-        reason: { type: "string" },
-        primary_concern: { type: "string" },
-        hold_reason: { type: "string" },
-        discussion_summary: { type: "string" },
-        preferred_contact_method: {
-          type: "string",
-          enum: ["phone", "email"]
-        },
-        prospect_confirmed: { type: "boolean" }
-      },
-      required: ["reason"],
-      additionalProperties: false
-    }
-  },
-
-  {
-    type: "function",
     name: "create_specialist_handoff",
     description: "Create a structured handoff for a DPA specialist.",
     parameters: {
@@ -1371,8 +1001,7 @@ const DOUG_TOOLS = [
           type: "string",
           enum: ["normal", "high", "urgent"]
         },
-        summary: { type: "string" },
-        requested_callback_at: { type: "string" }
+        summary: { type: "string" }
       },
       required: ["reason", "priority", "summary"],
       additionalProperties: false
@@ -1433,7 +1062,7 @@ const DOUG_TOOLS = [
     type: "function",
     name: "complete_call",
     description:
-      "Complete the conversation with the final outcome, next action, summary, and cadence instruction.",
+      "Complete the conversation with the final outcome, next action, and summary.",
     parameters: {
       type: "object",
       properties: {
@@ -1443,8 +1072,6 @@ const DOUG_TOOLS = [
             "qualified",
             "hot_transfer",
             "specialist_handoff",
-            "specialist_callback",
-            "follow_up_scheduled",
             "application_link_sent",
             "dti_calculator_sent",
             "needs_review",
@@ -1463,8 +1090,7 @@ const DOUG_TOOLS = [
         next_action: { type: "string" },
         summary: { type: "string" },
         stop_sequence: { type: "boolean" },
-        pause_sequence: { type: "boolean" },
-        requested_next_call_at: { type: "string" }
+        pause_sequence: { type: "boolean" }
       },
       required: [
         "outcome",
@@ -1478,25 +1104,10 @@ const DOUG_TOOLS = [
   }
 ];
 
-const LOCAL_SCHEDULE_CALLBACK_TOOL = DOUG_TOOLS.find(
-  (toolDefinition) => toolDefinition.name === "schedule_callback"
-);
 const REALTIME_TOOLS = Object.freeze(
-  BASE_REALTIME_TOOLS
-    .filter((toolDefinition) => toolDefinition.name !== "send_resource_link")
-    .map((toolDefinition) =>
-    toolDefinition.name === "schedule_callback"
-      ? {
-          ...toolDefinition,
-          parameters: {
-            ...LOCAL_SCHEDULE_CALLBACK_TOOL.parameters,
-            properties: {
-              ...LOCAL_SCHEDULE_CALLBACK_TOOL.parameters.properties
-            }
-          }
-        }
-      : toolDefinition
-    )
+  BASE_REALTIME_TOOLS.filter(
+    (toolDefinition) => toolDefinition.name !== "send_resource_link"
+  )
 );
 
 async function runMigrationStep(name, sql, options = {}) {
@@ -1542,8 +1153,6 @@ async function initializeDatabase() {
 
   const aiCallColumns = [
     ["sequence_status", "VARCHAR(50) NOT NULL DEFAULT 'ready'"],
-    ["max_attempts", "INTEGER NOT NULL DEFAULT 6"],
-    ["next_attempt_at", "TIMESTAMPTZ"],
     ["timezone", "VARCHAR(100) NOT NULL DEFAULT 'America/New_York'"],
     ["consent_status", "VARCHAR(50) NOT NULL DEFAULT 'unverified'"],
     ["consent_timestamp", "TIMESTAMPTZ"],
@@ -1557,17 +1166,13 @@ async function initializeDatabase() {
     ["outcome", "VARCHAR(80)"],
     ["next_action", "TEXT"],
     ["summary", "TEXT"],
-    ["callback_at", "TIMESTAMPTZ"],
-    ["callback_timezone", "VARCHAR(100)"],
     ["actions", "JSONB NOT NULL DEFAULT '[]'::jsonb"],
-    ["voicemail_count", "INTEGER NOT NULL DEFAULT 0"],
     ["last_attempt_id", "VARCHAR(100)"],
     ["agent_version", "VARCHAR(50)"],
     ["prompt_version", "VARCHAR(80)"],
     ["tool_version", "VARCHAR(80)"],
     ["knowledge_version", "VARCHAR(80)"],
     ["routing_version", "VARCHAR(80)"],
-    ["cadence_version", "VARCHAR(100)"],
     ["monday_item_id", "VARCHAR(100)"],
     ["monday_group_id", "VARCHAR(100)"],
     ["monday_last_sync_at", "TIMESTAMPTZ"],
@@ -1575,7 +1180,6 @@ async function initializeDatabase() {
     ["human_owner_id", "VARCHAR(100)"],
     ["priority", "VARCHAR(30) NOT NULL DEFAULT 'normal'"],
     ["last_attempt_at", "TIMESTAMPTZ"],
-    ["callback_requested", "BOOLEAN NOT NULL DEFAULT FALSE"],
     ["awaiting_customer_response", "BOOLEAN NOT NULL DEFAULT FALSE"],
     ["pending_question_type", "VARCHAR(100)"],
     ["pending_question_text", "TEXT"],
@@ -1599,7 +1203,6 @@ async function initializeDatabase() {
         call_id VARCHAR(100) NOT NULL,
         attempt_number INTEGER NOT NULL,
         call_leg INTEGER NOT NULL DEFAULT 1,
-        scheduled_at TIMESTAMPTZ,
         dialed_at TIMESTAMPTZ,
         answered_at TIMESTAMPTZ,
         completed_at TIMESTAMPTZ,
@@ -1611,7 +1214,6 @@ async function initializeDatabase() {
         sms_sent BOOLEAN NOT NULL DEFAULT FALSE,
         duration_seconds INTEGER NOT NULL DEFAULT 0,
         disconnect_reason TEXT,
-        next_attempt_at TIMESTAMPTZ,
         transcript JSONB NOT NULL DEFAULT '[]'::jsonb,
         summary TEXT,
         actions JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -1627,7 +1229,6 @@ async function initializeDatabase() {
     ["call_id", "VARCHAR(100)"],
     ["attempt_number", "INTEGER"],
     ["call_leg", "INTEGER NOT NULL DEFAULT 1"],
-    ["scheduled_at", "TIMESTAMPTZ"],
     ["dialed_at", "TIMESTAMPTZ"],
     ["answered_at", "TIMESTAMPTZ"],
     ["completed_at", "TIMESTAMPTZ"],
@@ -1639,7 +1240,6 @@ async function initializeDatabase() {
     ["sms_sent", "BOOLEAN NOT NULL DEFAULT FALSE"],
     ["duration_seconds", "INTEGER NOT NULL DEFAULT 0"],
     ["disconnect_reason", "TEXT"],
-    ["next_attempt_at", "TIMESTAMPTZ"],
     ["transcript", "JSONB NOT NULL DEFAULT '[]'::jsonb"],
     ["summary", "TEXT"],
     ["actions", "JSONB NOT NULL DEFAULT '[]'::jsonb"],
@@ -1647,7 +1247,7 @@ async function initializeDatabase() {
     ["monday_subitem_id", "VARCHAR(100)"],
     ["monday_last_sync_at", "TIMESTAMPTZ"],
     ["monday_last_error", "TEXT"],
-    ["attempt_type", "VARCHAR(50) NOT NULL DEFAULT 'cadence'"],
+    ["attempt_type", "VARCHAR(50) NOT NULL DEFAULT 'initial_lead_call'"],
     ["idempotency_key", "VARCHAR(255)"],
     ["cancellation_reason", "TEXT"],
     ["created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"],
@@ -1660,22 +1260,6 @@ async function initializeDatabase() {
       `ALTER TABLE call_attempts ADD COLUMN IF NOT EXISTS ${columnName} ${definition}`
     );
   }
-
-  await runMigrationStep(
-    "classify legacy explicit attempts",
-    `UPDATE call_attempts ca
-     SET attempt_type = CASE
-       WHEN ac.payload->>'call_type' = 'dpa_agent_notification' THEN 'specialist_notification'
-       WHEN ac.current_state IN ('reconnect_pending', 'reconnect_in_progress') THEN 'disconnect_reconnect'
-       WHEN ac.current_state = 'application_checkpoint' THEN 'application_checkpoint'
-       WHEN ac.callback_requested AND ca.scheduled_at = ac.callback_at THEN 'customer_callback'
-       ELSE ca.attempt_type
-     END
-     FROM ai_calls ac
-     WHERE ac.call_id = ca.call_id AND ca.attempt_type = 'cadence'
-       AND ca.completed_at IS NULL
-       AND ca.technical_status IN ('pending', 'scheduled', 'created')`
-  );
 
   await runMigrationStep(
     "create integration_state",
@@ -1718,10 +1302,6 @@ async function initializeDatabase() {
       "CREATE INDEX IF NOT EXISTS idx_ai_calls_status ON ai_calls(status)"
     ],
     [
-      "idx_ai_calls_due",
-      "CREATE INDEX IF NOT EXISTS idx_ai_calls_due ON ai_calls(sequence_status, next_attempt_at)"
-    ],
-    [
       "idx_ai_calls_twilio_sid",
       "CREATE INDEX IF NOT EXISTS idx_ai_calls_twilio_sid ON ai_calls(twilio_call_sid)"
     ],
@@ -1755,16 +1335,6 @@ async function initializeDatabase() {
     await runMigrationStep(name, sql, { optional: true });
   }
 
-  await cleanupPreResultDuplicateAttempts();
-  await runMigrationStep(
-    "idx_call_attempts_one_pending_cadence",
-    `CREATE UNIQUE INDEX IF NOT EXISTS idx_call_attempts_one_pending_cadence
-     ON call_attempts(call_id)
-     WHERE attempt_type = 'cadence'
-       AND technical_status IN ('pending', 'scheduled', 'created')
-       AND completed_at IS NULL`
-  );
-
   console.log("HELUX AI Workforce database initialized.");
 }
 
@@ -1793,14 +1363,13 @@ async function getAttemptById(attemptId) {
 }
 
 function pendingAttemptStatus(status) {
-  return ["pending", "scheduled", "created"].includes(
+  return ["pending", "created"].includes(
     String(status || "").toLowerCase()
   );
 }
 
 const PERMITTED_OUTBOUND_CALL_REASONS = Object.freeze([
   "initial_lead_call",
-  "scheduled_second_call",
   "unexpected_disconnect_reconnect"
 ]);
 
@@ -1862,275 +1431,43 @@ function logOutboundCallFinalEligibility(call, resolvedCallReason) {
     call_id: call.call_id,
     lead_id: outboundLeadId(call),
     call_reason: resolvedCallReason,
-    callback_at: call.callback_at || null,
     reconnect_source_call_id:
       call.result?.reconnect_source_call_id || null,
     eligible: true
   }));
 }
 
-function callHasSuccessfulCompleteCall(call, attempt = null) {
-  const actions = Array.isArray(attempt?.actions)
-    ? attempt.actions
-    : Array.isArray(call?.actions)
-      ? call.actions
-      : [];
-  return Boolean(
-    actions.some(
-      (action) =>
-        action?.action === "complete_call" && action?.success === true
-    ) ||
-      call?.result?.normal_completion_recorded === true ||
-      call?.result?.completion_reason === "normal_completion"
-  );
-}
-
 function outboundCallSource(attempt, requestedSource) {
   if (requestedSource) return requestedSource;
-  if (attempt?.attempt_type === "disconnect_reconnect") {
-    return "unexpected_reconnect";
-  }
-  if (
-    ["customer_callback", "application_checkpoint"].includes(
-      attempt?.attempt_type
-    )
-  ) {
-    return "callback";
-  }
-  return "scheduler";
+  return attempt?.attempt_type === "disconnect_reconnect"
+    ? "unexpected_reconnect"
+    : "initial";
 }
 
-function outboundCallDueAt(call, resolvedCallReason) {
-  if (resolvedCallReason === "initial_lead_call") {
-    return call?.next_attempt_at || null;
-  }
-  if (
-    ["scheduled_second_call", "unexpected_disconnect_reconnect"].includes(
-      resolvedCallReason
-    )
-  ) {
-    return call?.callback_at || null;
-  }
-  return null;
-}
-
-function legitimateScheduledAppointment(call, attempt, resolvedCallReason) {
-  if (
-    resolvedCallReason !== "scheduled_second_call" ||
-    !["customer_callback", "application_checkpoint"].includes(
-      attempt?.attempt_type
-    ) ||
-    call?.callback_requested !== true ||
-    !call?.result?.scheduled_second_call_appointment_id ||
-    !call?.result?.scheduled_second_call_source_call_id ||
-    call?.result?.scheduled_second_call_dialed_at
-  ) {
-    return false;
-  }
-  const callbackAt = call.callback_at ? new Date(call.callback_at) : null;
-  const scheduledAt = attempt?.scheduled_at
-    ? new Date(attempt.scheduled_at)
-    : null;
-  return Boolean(
-    callbackAt &&
-      scheduledAt &&
-      !Number.isNaN(callbackAt.getTime()) &&
-      !Number.isNaN(scheduledAt.getTime()) &&
-      callbackAt.getTime() === scheduledAt.getTime() &&
-      attempt.attempt_id !== call.last_attempt_id
-  );
-}
-
-function outboundCallEligibility(
-  call,
-  attempt,
-  resolvedCallReason,
-  currentTime = new Date()
-) {
-  const dueAtValue = outboundCallDueAt(call, resolvedCallReason);
-  const dueAt = dueAtValue ? new Date(dueAtValue) : null;
-  const attemptDueAt = attempt?.scheduled_at
-    ? new Date(attempt.scheduled_at)
-    : null;
-  const scheduledAppointment = legitimateScheduledAppointment(
-    call,
-    attempt,
-    resolvedCallReason
-  );
-  const status = String(call?.status || "").toLowerCase();
-  const sequenceStatus = String(call?.sequence_status || "").toLowerCase();
-  const activeStatuses = [
-    "placing",
-    "queued",
-    "initiated",
-    "ringing",
-    "answered",
-    "in-progress"
-  ];
-
-  let reason = "eligible_due_call";
-  if (!call) reason = "call_missing";
-  else if (!attempt) reason = "attempt_missing";
-  else if (internalNotificationCallReason(resolvedCallReason)) {
-    reason = "specialist_notification_phone_calls_disabled";
-  } else if (!permittedOutboundCallReason(resolvedCallReason)) {
-    reason = "missing_permitted_call_reason";
-  } else if (
-    resolvedCallReason === "initial_lead_call" &&
-    attempt.attempt_type !== "initial_lead_call"
-  ) {
-    reason = "missing_permitted_call_reason";
-  } else if (
-    resolvedCallReason === "scheduled_second_call" &&
-    !["customer_callback", "application_checkpoint"].includes(
-      attempt.attempt_type
-    )
-  ) {
-    reason = "missing_permitted_call_reason";
-  } else if (
-    resolvedCallReason === "unexpected_disconnect_reconnect" &&
-    attempt.attempt_type !== "disconnect_reconnect"
-  ) {
-    reason = "missing_permitted_call_reason";
-  } else if (!pendingAttemptStatus(attempt.technical_status)) {
-    reason = "attempt_already_claimed_or_cancelled";
-  } else if (
-    resolvedCallReason === "initial_lead_call" &&
-    (Number(call.attempts || 0) > 0 ||
-      call.last_attempt_id ||
-      call.result?.initial_call_claimed_at)
-  ) {
-    reason = "initial_call_already_exists";
-  } else if (
-    resolvedCallReason === "scheduled_second_call" &&
-    call.result?.scheduled_second_call_dialed_at
-  ) {
-    reason = "scheduled_second_call_already_dialed";
-  } else if (
-    resolvedCallReason === "scheduled_second_call" &&
-    !scheduledAppointment
-  ) {
-    reason = "invalid_callback_date";
-  } else if (
-    resolvedCallReason === "unexpected_disconnect_reconnect" &&
-    call.result?.unexpected_disconnect_reconnect_attempted === true
-  ) {
-    reason = "reconnect_already_attempted";
-  } else if (
-    resolvedCallReason === "unexpected_disconnect_reconnect" &&
-    (
-      call.result?.unexpected_disconnect_reconnect_scheduled !== true ||
-      !call.result?.reconnect_source_call_id ||
-      !call.result?.reconnect_source_twilio_call_sid
-    )
-  ) {
-    reason = "normal_completion_not_reconnectable";
-  } else if (
-    callHasSuccessfulCompleteCall(call, attempt) &&
-    !scheduledAppointment
-  ) {
-    reason = "complete_call_already_succeeded";
-  } else if (
-    (status === "completed" || sequenceStatus === "completed") &&
-    !scheduledAppointment
-  ) {
-    reason = "completed_call";
-  } else if (["canceled", "cancelled"].includes(status)) {
-    reason = "call_cancelled";
-  } else if (call.do_not_call) reason = "do_not_call";
-  else if (call.wrong_number || call.invalid_number) {
-    reason = "contact_suppressed";
-  } else if (sequenceStatus === "paused") reason = "manual_hold";
-  else if (["suppressed", "exhausted", "human_action"].includes(sequenceStatus)) {
-    reason = "sequence_not_callable";
-  } else if (activeStatuses.includes(status) || sequenceStatus === "calling") {
-    reason = "call_already_dialing_or_connected";
-  } else if (
-    call.twilio_call_sid &&
-    !["busy", "failed", "no-answer", "completed"].includes(status)
-  ) {
-    reason = "active_twilio_call_exists";
-  } else if (!dueAtValue) {
-    reason = resolvedCallReason === "scheduled_second_call"
-      ? "invalid_callback_date"
-      : "due_timestamp_missing";
-  } else if (!dueAt || Number.isNaN(dueAt.getTime())) {
-    reason = resolvedCallReason === "scheduled_second_call"
-      ? "invalid_callback_date"
-      : "due_timestamp_invalid";
-  } else if (dueAt > currentTime) {
-    reason = resolvedCallReason === "scheduled_second_call"
-      ? "callback_not_due"
-      : "call_not_due_yet";
-  } else if (!attempt?.scheduled_at) reason = "attempt_due_timestamp_missing";
-  else if (!attemptDueAt || Number.isNaN(attemptDueAt.getTime())) {
-    reason = "attempt_due_timestamp_invalid";
-  } else if (attemptDueAt > currentTime) reason = "attempt_not_due_yet";
-
-  return {
-    eligible: reason === "eligible_due_call",
-    reason,
-    dueAt: dueAt && !Number.isNaN(dueAt.getTime())
-      ? dueAt.toISOString()
-      : cleanText(dueAtValue, 100),
-    scheduledAppointment
-  };
-}
-
-function logOutboundCallEligibility(call, attempt, source, eligibility) {
-  console.log(JSON.stringify({
-    event: "outbound_call_eligibility",
-    call_id: call?.call_id || null,
-    source,
-    due_at: eligibility?.dueAt || null,
-    eligible: eligibility?.eligible === true,
-    reason: eligibility?.reason || "unknown"
-  }));
-}
-
-function blockDisabledOutboundCall(call, source, dueAt = null) {
+function blockDisabledOutboundCall(call, source) {
   console.log(JSON.stringify({
     event: "outbound_call_blocked",
     call_id: call?.call_id || null,
+    source,
     reason: "OUTBOUND_CALLS_ENABLED_is_false"
   }));
-  logOutboundCallEligibility(call, null, source, {
-    dueAt: dueAt ? cleanText(dueAt, 100) : null,
-    eligible: false,
-    reason: "OUTBOUND_CALLS_ENABLED_is_false"
-  });
 }
 
 function attemptTypeForCall(call, requestedType = null) {
   if (requestedType) return requestedType;
-  const outboundReason = resolveOutboundCallReason(call, null);
-  if (outboundReason === "initial_lead_call") {
-    return "initial_lead_call";
-  }
-  if (outboundReason === "scheduled_second_call") {
-    return call.current_state === "application_checkpoint"
-      ? "application_checkpoint"
-      : "customer_callback";
-  }
-  if (outboundReason === "unexpected_disconnect_reconnect") {
+  if (
+    resolveOutboundCallReason(call, null) === "unexpected_disconnect_reconnect" ||
+    ["reconnect_pending", "reconnect_in_progress"].includes(call.current_state)
+  ) {
     return "disconnect_reconnect";
   }
   if (call.payload?.call_type === "dpa_agent_notification") {
     return "specialist_notification";
   }
-  if (call.current_state === "application_checkpoint") {
-    return "application_checkpoint";
-  }
-  if (["reconnect_pending", "reconnect_in_progress"].includes(call.current_state)) {
-    return "disconnect_reconnect";
-  }
-  if (call.callback_requested || call.sequence_status === "callback_scheduled") {
-    return "customer_callback";
-  }
-  return "cadence";
+  return "initial_lead_call";
 }
 
-async function ensurePendingAttempt(callId, options = {}) {
+async function createCallAttempt(callId, options = {}) {
   const client = options.client || pool;
   const callResult = await client.query(
     "SELECT * FROM ai_calls WHERE call_id = $1 LIMIT 1",
@@ -2140,37 +1477,28 @@ async function ensurePendingAttempt(callId, options = {}) {
   if (!call) throw new Error("Call sequence not found.");
 
   const attemptType = attemptTypeForCall(call, options.attemptType);
-  const scheduledAt = options.scheduledAt || call.next_attempt_at || new Date();
   const attemptNumber = Number(call.attempts || 0) + 1;
   const idempotencyKey =
     options.idempotencyKey || `${attemptType}:${call.call_id}:${attemptNumber}`;
-  const attemptId = createPublicId("ATTEMPT");
   const inserted = await client.query(
     `
       INSERT INTO call_attempts (
-        attempt_id, call_id, attempt_number, call_leg, scheduled_at,
+        attempt_id, call_id, attempt_number, call_leg,
         technical_status, attempt_type, idempotency_key
       )
-      VALUES ($1, $2, $3, 1, $4, 'pending', $5, $6)
+      VALUES ($1, $2, $3, 1, 'created', $4, $5)
       ON CONFLICT DO NOTHING
       RETURNING *
     `,
-    [attemptId, call.call_id, attemptNumber, scheduledAt, attemptType, idempotencyKey]
+    [
+      createPublicId("ATTEMPT"),
+      call.call_id,
+      attemptNumber,
+      attemptType,
+      idempotencyKey
+    ]
   );
-
-  if (inserted.rows[0]) return inserted.rows[0];
-  const existing = await client.query(
-    `
-      SELECT * FROM call_attempts
-      WHERE call_id = $1 AND completed_at IS NULL
-        AND technical_status IN ('pending', 'scheduled', 'created')
-        AND (idempotency_key = $2 OR ($3 = 'cadence' AND attempt_type = 'cadence'))
-      ORDER BY scheduled_at ASC NULLS FIRST, id ASC
-      LIMIT 1
-    `,
-    [call.call_id, idempotencyKey, attemptType]
-  );
-  return existing.rows[0] || null;
+  return inserted.rows[0] || null;
 }
 
 async function sequenceHasUnresolvedWork(callId, client = pool) {
@@ -2181,8 +1509,6 @@ async function sequenceHasUnresolvedWork(callId, client = pool) {
         WHERE call_id = $1 AND (
           sequence_status = 'human_action'
           OR awaiting_customer_response = TRUE
-          OR next_attempt_at IS NOT NULL
-          OR (callback_requested AND callback_at > NOW())
         )
       ) OR EXISTS (
         SELECT 1 FROM call_attempts
@@ -2197,166 +1523,6 @@ async function sequenceHasUnresolvedWork(callId, client = pool) {
   );
   return Boolean(result.rows[0]?.unresolved);
 }
-
-async function reconcileScheduledAttempts() {
-  const scheduled = await pool.query(
-    `SELECT * FROM ai_calls
-     WHERE sequence_status IN ('ready', 'active', 'scheduled', 'waiting_retry', 'callback_scheduled')
-       AND next_attempt_at IS NOT NULL
-       AND COALESCE(
-         result->>'outbound_call_reason',
-         payload->>'outbound_call_reason',
-         ''
-       ) IN (
-         'initial_lead_call',
-         'scheduled_second_call',
-         'unexpected_disconnect_reconnect'
-       )
-       AND do_not_call = FALSE AND wrong_number = FALSE AND invalid_number = FALSE`
-  );
-  for (const call of scheduled.rows) {
-    const attemptType = attemptTypeForCall(call);
-    if (attemptType !== "cadence") {
-      const cancelled = await pool.query(
-        `UPDATE call_attempts SET technical_status = 'canceled', completed_at = NOW(),
-         cancellation_reason = 'ordinary_cadence_paused_for_explicit_action', updated_at = NOW()
-         WHERE call_id = $1 AND attempt_type = 'cadence' AND completed_at IS NULL
-           AND technical_status IN ('pending', 'scheduled', 'created')
-         RETURNING *`,
-        [call.call_id]
-      );
-      for (const attempt of cancelled.rows) {
-        logSchedulingDecision(
-          call,
-          attempt,
-          "cancel",
-          "ordinary_cadence_paused_for_explicit_action"
-        );
-      }
-    }
-    await ensurePendingAttempt(call.call_id, {
-      attemptType,
-      scheduledAt: call.next_attempt_at,
-      idempotencyKey:
-        attemptType === "cadence"
-          ? `cadence:${call.call_id}:${Number(call.attempts || 0) + 1}`
-          : `${attemptType}:${call.call_id}:${new Date(call.next_attempt_at).toISOString()}`
-    });
-  }
-}
-
-async function cleanupPreResultDuplicateAttempts() {
-  const cancelled = await pool.query(
-    `
-      WITH ranked AS (
-        SELECT ca.id,
-          ROW_NUMBER() OVER (
-            PARTITION BY ca.call_id
-            ORDER BY ca.scheduled_at ASC NULLS FIRST, ca.id ASC
-          ) AS pending_rank
-        FROM call_attempts ca
-        WHERE ca.attempt_type = 'cadence'
-          AND ca.completed_at IS NULL
-          AND ca.dialed_at IS NULL
-          AND ca.technical_status IN ('pending', 'scheduled', 'created')
-          AND NOT EXISTS (
-            SELECT 1 FROM call_attempts result_attempt
-            WHERE result_attempt.call_id = ca.call_id
-              AND (
-                result_attempt.completed_at IS NOT NULL
-                OR result_attempt.dialed_at IS NOT NULL
-                OR result_attempt.business_outcome IS NOT NULL
-              )
-          )
-      )
-      UPDATE call_attempts ca
-      SET technical_status = 'canceled', completed_at = NOW(),
-          cancellation_reason = 'pre_result_duplicate_cadence_cleanup',
-          updated_at = NOW()
-      FROM ranked
-      WHERE ca.id = ranked.id AND ranked.pending_rank > 1
-      RETURNING ca.call_id, ca.attempt_id, ca.attempt_type,
-                ca.scheduled_at, ca.technical_status
-    `
-  );
-
-  const remainingDuplicates = await pool.query(
-    `
-      WITH ranked AS (
-        SELECT id, ROW_NUMBER() OVER (
-          PARTITION BY call_id ORDER BY scheduled_at ASC NULLS FIRST, id ASC
-        ) AS pending_rank
-        FROM call_attempts
-        WHERE attempt_type = 'cadence' AND completed_at IS NULL
-          AND technical_status IN ('pending', 'scheduled', 'created')
-      )
-      UPDATE call_attempts ca
-      SET technical_status = 'canceled', completed_at = NOW(),
-          cancellation_reason = 'concurrent_duplicate_cadence_cleanup',
-          updated_at = NOW()
-      FROM ranked
-      WHERE ca.id = ranked.id AND ranked.pending_rank > 1
-      RETURNING ca.call_id, ca.attempt_id, ca.attempt_type,
-                ca.scheduled_at, ca.technical_status
-    `
-  );
-
-  const due = await pool.query(
-    `
-      WITH earliest AS (
-        SELECT DISTINCT ON (ca.call_id) ca.call_id, ca.attempt_id
-        FROM call_attempts ca
-        JOIN ai_calls ac ON ac.call_id = ca.call_id
-        WHERE ca.attempt_type = 'cadence' AND ca.completed_at IS NULL
-          AND ca.technical_status IN ('pending', 'scheduled', 'created')
-          AND ac.status <> 'completed'
-          AND ac.sequence_status <> 'completed'
-          AND COALESCE(ac.result->>'normal_completion_recorded', 'false') <> 'true'
-          AND COALESCE(ac.result->>'completion_reason', '') <> 'normal_completion'
-        ORDER BY ca.call_id, ca.scheduled_at ASC NULLS FIRST, ca.id ASC
-      ), made_due AS (
-        UPDATE call_attempts ca
-        SET scheduled_at = NOW(), updated_at = NOW()
-        FROM earliest
-        WHERE ca.attempt_id = earliest.attempt_id AND ca.scheduled_at < NOW()
-        RETURNING ca.call_id, ca.scheduled_at
-      )
-      UPDATE ai_calls ac
-      SET next_attempt_at = made_due.scheduled_at,
-          completed_at = NULL, updated_at = NOW()
-      FROM made_due
-      WHERE ac.call_id = made_due.call_id
-      RETURNING ac.call_id
-    `
-  );
-  for (const attempt of cancelled.rows) {
-    const call = await getCallById(attempt.call_id);
-    logSchedulingDecision(
-      call,
-      attempt,
-      "cancel",
-      "pre_result_duplicate_cadence_cleanup"
-    );
-  }
-  for (const attempt of remainingDuplicates.rows) {
-    const call = await getCallById(attempt.call_id);
-    logSchedulingDecision(
-      call,
-      attempt,
-      "cancel",
-      "concurrent_duplicate_cadence_cleanup"
-    );
-  }
-
-  console.log(JSON.stringify({
-    event: "scheduler_cleanup",
-    decision: "cancel",
-    reason: "pre_result_duplicate_cadence_cleanup",
-    cancelled_attempts: cancelled.rowCount + remainingDuplicates.rowCount,
-    overdue_attempts_made_due: due.rowCount
-  }));
-}
-
 async function getCallByMondayItemId(itemId) {
   const result = await pool.query(
     "SELECT * FROM ai_calls WHERE monday_item_id = $1 LIMIT 1",
@@ -2497,32 +1663,8 @@ function pendingQuestionType(value) {
   if (/what.*(?:city|area).*purchase|area.*purchase.*home/.test(text)) {
     return "purchase_area";
   }
-  if (
-  /didyouhaveachancetostarttheapplication/.test(text) ||
-  /haveyoustartedtheapplication/.test(text) ||
-  /didyoustarttheapplication/.test(text)
-) {
-  return "application_started";
-}
-
-if (
-  /thinkyoullhavetimetostarttheapplication/.test(text) ||
-  /havetimetostarttheapplicationtoday/.test(text) ||
-  /plantostarttheapplicationtoday/.test(text)
-) {
-  return "application_start_plan";
-}
   if (/send.*link|text.*link|want.*link|receive.*link/.test(text)) {
     return "application_link_permission";
-  }
-  if (
-  /scheduledtospeakon.*isthatcorrect/.test(text) ||
-  /call.*on.*at.*isthatcorrect/.test(text)
-) {
-  return "callback_confirmation";
-}
-  if (/when|whatday|whattime|timezone|followup|callback/.test(text)) {
-    return "callback_time";
   }
   if (/correct|isthatright|stillaccurate|confirm/.test(text)) {
     return "confirmation";
@@ -3213,10 +2355,7 @@ function sequenceStatusLabel(call) {
 
   const map = {
     ready: "Ready",
-    scheduled: "Scheduled",
     calling: "Calling",
-    waiting_retry: "Waiting Retry",
-    callback_scheduled: "Callback Scheduled",
     human_action: "Human Action",
     completed: "Completed",
     exhausted: "Exhausted",
@@ -3249,12 +2388,9 @@ function businessOutcomeLabel(outcome) {
     qualified: "Qualified",
     hot_transfer: "Hot Transfer",
     specialist_handoff: "Specialist Handoff",
-    specialist_callback: "Specialist Callback",
-    follow_up_scheduled: "Follow-Up Scheduled",
     application_link_sent: "Application Sent",
     dti_calculator_sent: "DTI Sent",
     agent_notified: "Agent Notified",
-    application_started_hot_lead: "Application Started — Hot Lead",
     needs_review: "Needs Review",
     nurture: "Nurture",
     not_interested: "Not Interested",
@@ -3304,13 +2440,12 @@ function targetMondayGroupTitle(call) {
 
   const status = String(call.sequence_status || "").toLowerCase();
   if (
-    ["ready", "scheduled", "calling", "waiting_retry", "paused"].includes(
+    ["ready", "calling", "paused"].includes(
       status
     )
   ) {
     return ["New Leads", "Active Sequences", "Ready to Call"];
   }
-  if (status === "callback_scheduled") return ["Callbacks"];
   if (["human_action", "exhausted"].includes(status)) {
     return ["Agent Needed", "Human Action Needed"];
   }
@@ -3354,21 +2489,6 @@ function terminalCompletionValidation(call, sessionCallPhase) {
     if (lender === null) missing.push("lender");
     if (realtor === null) missing.push("realtor");
     if (!cleanText(result.purchase_area, 220)) missing.push("purchase area");
-    if (!cleanText(result.callback_local_date, 100)) missing.push("callback date");
-    if (!cleanText(result.callback_local_time, 100)) missing.push("callback time");
-    if (!cleanText(result.callback_timezone || call.callback_timezone, 100)) {
-      missing.push("callback timezone");
-    }
-  } else if (sessionCallPhase === "CALL_TWO") {
-    if (
-      result.application_status_explicitly_answered !== true ||
-      typeof result.application_started_confirmed !== "boolean"
-    ) missing.push("application started");
-    if (lender === null) missing.push("lender");
-    if (realtor === null) missing.push("realtor");
-    if (!cleanText(call.next_action || result.conversation_state?.next_best_action, 220)) {
-      missing.push("next step");
-    }
   }
 
   return { complete: missing.length === 0, missing, lender, realtor };
@@ -3380,49 +2500,21 @@ function buildStructuredMondayCallSummary(call, sessionCallPhase) {
   const actions = Array.isArray(call.actions) ? call.actions : [];
   const terminalRecorded =
     actions.some((action) =>
-      ["complete_call", "schedule_callback"].includes(action?.action) &&
-      action?.success === true
+      action?.action === "complete_call" && action?.success === true
     ) || call.result?.normal_completion_recorded === true;
   const completed = terminalRecorded && validation.complete;
-
-  if (sessionCallPhase === "CALL_TWO") {
-    const dti = Number.isFinite(Number(result.preliminary_dti_percent))
-      ? `${Number(result.preliminary_dti_percent)}%`
-      : "Not completed";
-    const nextStep = cleanText(
-      call.next_action || result.conversation_state?.next_best_action,
-      220
-    ) || "Not confirmed";
-    return cleanText(
-      `Call Two ${completed ? "completed" : "incomplete"}. ` +
-      `Application started: ${typeof result.application_started_confirmed === "boolean" ? (result.application_started_confirmed ? "Yes" : "No") : "Not confirmed"}. ` +
-      `Preliminary DTI: ${dti}. ` +
-      `Lender needed: ${validation.lender === null ? "Not confirmed" : (validation.lender ? "No" : "Yes")}. ` +
-      `Realtor needed: ${validation.realtor === null ? "Not confirmed" : (validation.realtor ? "No" : "Yes")}. ` +
-      `Next step: ${nextStep}.`,
-      800
-    );
-  }
 
   const timeline = cleanText(
     result.purchase_timeline_detail || result.time_frame,
     220
   ) || "Not confirmed";
   const purchaseArea = cleanText(result.purchase_area, 220) || "Not confirmed";
-  const secondCall = call.callback_at
-    ? formatCustomerCallbackTime(
-        call.callback_at,
-        result.callback_timezone || call.callback_timezone || call.timezone
-      )
-    : null;
   return cleanText(
     `Call One ${completed ? "completed" : "incomplete"}. ` +
     `Timeline: ${timeline}. ` +
     `Lender: ${validation.lender === null ? "Not confirmed" : (validation.lender ? "Yes" : "No")}. ` +
     `Realtor: ${validation.realtor === null ? "Not confirmed" : (validation.realtor ? "Yes" : "No")}. ` +
-    `Purchase area: ${purchaseArea}. ` +
-    `Second call: ${secondCall || "Not confirmed"}. ` +
-    "Next step: Start application.",
+    `Purchase area: ${purchaseArea}.`,
     800
   );
 }
@@ -3434,7 +2526,7 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
   const recordedSessionPhase = [...(Array.isArray(call.actions) ? call.actions : [])]
     .reverse()
     .find((action) =>
-      ["CALL_ONE", "CALL_TWO", "RECONNECT", "SPECIALIST_NOTIFICATION"].includes(
+      ["CALL_ONE", "RECONNECT", "SPECIALIST_NOTIFICATION"].includes(
         action?.session_call_phase
       )
     )?.session_call_phase;
@@ -3450,7 +2542,6 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
     ["Sequence Status"],
     sequenceStatusLabel(call)
   );
-  assignMondayValue(values, board, ["Max Attempts"], call.max_attempts);
   assignMondayValue(values, board, ["Attempts Used"], call.attempts);
   assignMondayValue(
     values,
@@ -3464,8 +2555,6 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
     ["Last Call"],
     call.last_attempt_at || latestAttempt?.dialed_at
   );
-  assignMondayValue(values, board, ["Next Call"], call.next_attempt_at);
-  assignMondayValue(values, board, ["Callback At"], call.callback_at);
   assignMondayValue(
     values,
     board,
@@ -3500,7 +2589,6 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
     )
   );
   assignMondayValue(values, board, ["Owner"], call.human_owner_id);
-  assignMondayValue(values, board, ["Cadence Version"], call.cadence_version);
   assignMondayValueById(
     values,
     board,
@@ -3564,7 +2652,6 @@ function buildAttemptMondayValues(attempt, metadata) {
     answeredByLabel(attempt.answered_by)
   );
   assignMondayValue(values, board, ["Dialed At"], attempt.dialed_at);
-  assignMondayValue(values, board, ["Scheduled At"], attempt.scheduled_at);
   assignMondayValue(values, board, ["Answered At"], attempt.answered_at);
   assignMondayValue(values, board, ["Twilio SID"], attempt.twilio_call_sid);
   assignMondayValue(values, board, ["Call ID"], attempt.call_id);
@@ -3949,28 +3036,6 @@ function mondayEventBoolean(value) {
   return normalizeBoolean(checked);
 }
 
-function mondayEventDateToUtc(value, timeZone) {
-  if (!value || !value.date) return null;
-  const [year, month, day] = String(value.date).split("-").map(Number);
-  const [hour, minute, second] = String(value.time || "09:00:00")
-    .split(":")
-    .map(Number);
-
-  if (![year, month, day, hour, minute].every(Number.isFinite)) return null;
-
-  return zonedDateTimeToUtc(
-    {
-      year,
-      month,
-      day,
-      hour,
-      minute,
-      second: Number.isFinite(second) ? second : 0
-    },
-    normalizeTimezone(timeZone)
-  );
-}
-
 async function discoverDpaDepartmentBoard() {
   const cached = await getIntegrationState("dpa_department_board");
   const configuredId = DPA_BOARD_ID || cleanText(cached?.board_id, 100);
@@ -4087,10 +3152,6 @@ async function createDpaAgentNotification(itemId, statusLabel) {
   const timeFrame = normalizeTimeFrame(
     mondayRawColumnValue(byTitle(["Time frame", "Purchase timeframe", "Timeline"]))
   );
-  const availability = mondayRawColumnValue(
-    byTitle(["Tentative meeting availability", "Meeting availability", "Availability"])
-  );
-
   if (!agentPhone || !validE164Phone(agentPhone)) {
     await createMondayItemUpdate(
       item.id,
@@ -4117,20 +3178,19 @@ async function createDpaAgentNotification(itemId, statusLabel) {
     customer_name: cleanText(item.name, 160) || "the customer",
     dpa_item_id: String(item.id),
     time_frame: timeFrame,
-    tentative_meeting_availability: availability,
     app_started_status: statusLabel
   };
   const inserted = await pool.query(
     `
       INSERT INTO ai_calls (
         call_id, request_key, phone, status, stream_token, payload,
-        max_attempts, timezone, consent_status, current_state, next_state,
+        timezone, consent_status, current_state, next_state,
         agent_version, prompt_version, tool_version, knowledge_version,
-        routing_version, cadence_version, priority
+        routing_version, priority
       ) VALUES (
-        $1, $2, $3, 'created', $4, $5::jsonb, 1, $6, 'confirmed',
+        $1, $2, $3, 'created', $4, $5::jsonb, $6, 'confirmed',
         'dpa_agent_notification', 'identity_confirmation',
-        $7, $8, $9, $10, $11, $12, 'urgent'
+        $7, $8, $9, $10, $11, 'urgent'
       ) RETURNING *
     `,
     [
@@ -4144,14 +3204,12 @@ async function createDpaAgentNotification(itemId, statusLabel) {
       DOUG_CONFIG.promptVersion,
       DOUG_CONFIG.toolVersion,
       DOUG_CONFIG.knowledgeVersion,
-      DOUG_CONFIG.routingVersion,
-      DOUG_CONFIG.cadenceVersion
+      DOUG_CONFIG.routingVersion
     ]
   );
   const notificationCall = inserted.rows[0];
-  const notificationAttempt = await ensurePendingAttempt(notificationCall.call_id, {
+  const notificationAttempt = await createCallAttempt(notificationCall.call_id, {
     attemptType: "specialist_notification",
-    scheduledAt: new Date(),
     idempotencyKey: `specialist_notification:${notificationCall.call_id}:1`
   });
   logOutboundCallRejected(
@@ -4169,7 +3227,7 @@ async function createDpaAgentNotification(itemId, statusLabel) {
   );
   await pool.query(
     `UPDATE ai_calls
-     SET sequence_status = 'human_action', next_attempt_at = NULL,
+     SET sequence_status = 'human_action',
          result = result || $2::jsonb, updated_at = NOW()
      WHERE call_id = $1`,
     [
@@ -4288,16 +3346,6 @@ async function ensureMondayInboundWebhooks() {
   return results;
 }
 
-function mondayDatesMatch(first, second, toleranceMs = 60000) {
-  if (!first || !second) return false;
-  const firstDate = first instanceof Date ? first : new Date(first);
-  const secondDate = second instanceof Date ? second : new Date(second);
-  if (Number.isNaN(firstDate.getTime()) || Number.isNaN(secondDate.getTime())) {
-    return false;
-  }
-  return Math.abs(firstDate.getTime() - secondDate.getTime()) <= toleranceMs;
-}
-
 async function applyMondayGroupControl(call, event) {
   const groupName = cleanText(event.groupName || event.groupTitle, 150);
   if (!groupName) return false;
@@ -4308,43 +3356,11 @@ async function applyMondayGroupControl(call, event) {
   // Ignore the webhook generated by HELUX moving the item to its expected group.
   if (expectedGroups.includes(normalized)) return false;
 
-  if (["newleads", "activesequences", "readytocall"].includes(normalized)) {
-    if (call.do_not_call || call.wrong_number || call.invalid_number) return false;
-    await pool.query(
-      `
-        UPDATE ai_calls
-        SET
-          sequence_status = 'scheduled',
-          next_attempt_at = COALESCE(next_attempt_at, NOW()),
-          updated_at = NOW()
-        WHERE call_id = $1
-      `,
-      [call.call_id]
-    );
-    return true;
-  }
-
-  if (normalized === "callbacks") {
-    await pool.query(
-      `
-        UPDATE ai_calls
-        SET
-          sequence_status = 'callback_scheduled',
-          callback_requested = TRUE,
-          next_attempt_at = COALESCE(callback_at, next_attempt_at, NOW()),
-          updated_at = NOW()
-        WHERE call_id = $1
-      `,
-      [call.call_id]
-    );
-    return true;
-  }
-
   if (["agentneeded", "humanactionneeded"].includes(normalized)) {
     await pool.query(
       `
         UPDATE ai_calls
-        SET sequence_status = 'human_action', next_attempt_at = NULL,
+        SET sequence_status = 'human_action',
             updated_at = NOW()
         WHERE call_id = $1
       `,
@@ -4358,7 +3374,7 @@ async function applyMondayGroupControl(call, event) {
     await pool.query(
       `
         UPDATE ai_calls
-        SET sequence_status = 'completed', next_attempt_at = NULL,
+        SET sequence_status = 'completed',
             updated_at = NOW()
         WHERE call_id = $1
       `,
@@ -4375,7 +3391,6 @@ async function applyMondayGroupControl(call, event) {
           do_not_call = TRUE,
           sequence_status = 'suppressed',
           outcome = COALESCE(outcome, 'opt_out'),
-          next_attempt_at = NULL,
           updated_at = NOW()
         WHERE call_id = $1
       `,
@@ -4410,72 +3425,6 @@ async function applyMondayColumnControl(call, event) {
     return true;
   }
 
-  if (title === "nextcall") {
-    const nextCall = mondayEventDateToUtc(value, call.timezone);
-
-    if (nextCall && mondayDatesMatch(nextCall, call.next_attempt_at)) {
-      return false;
-    }
-
-    if (!nextCall && !call.next_attempt_at) return false;
-
-    if (!nextCall) {
-      await pool.query(
-        `
-          UPDATE ai_calls
-          SET sequence_status = 'paused', next_attempt_at = NULL,
-              updated_at = NOW()
-          WHERE call_id = $1
-        `,
-        [call.call_id]
-      );
-      return true;
-    }
-
-    const callbackMode =
-      call.callback_requested || call.sequence_status === "callback_scheduled";
-
-    await pool.query(
-      `
-        UPDATE ai_calls
-        SET
-          sequence_status = $2,
-          next_attempt_at = $3,
-          callback_at = CASE WHEN $4 THEN $3 ELSE callback_at END,
-          updated_at = NOW()
-        WHERE call_id = $1
-      `,
-      [
-        call.call_id,
-        callbackMode ? "callback_scheduled" : "scheduled",
-        nextCall,
-        callbackMode
-      ]
-    );
-    return true;
-  }
-
-  if (title === "callbackat") {
-    const callbackAt = mondayEventDateToUtc(value, call.timezone);
-    if (!callbackAt) return false;
-    if (mondayDatesMatch(callbackAt, call.callback_at)) return false;
-
-    await pool.query(
-      `
-        UPDATE ai_calls
-        SET
-          callback_at = $2,
-          callback_requested = TRUE,
-          sequence_status = 'callback_scheduled',
-          next_attempt_at = $2,
-          updated_at = NOW()
-        WHERE call_id = $1
-      `,
-      [call.call_id, callbackAt]
-    );
-    return true;
-  }
-
   if (title === "sequencestatus") {
     const label = normalizeMondayKey(mondayEventStatusLabel(value));
     const expectedLabel = normalizeMondayKey(sequenceStatusLabel(call));
@@ -4483,66 +3432,9 @@ async function applyMondayColumnControl(call, event) {
     // Ignore status changes written by HELUX itself.
     if (label && label === expectedLabel) return false;
 
-    if (["ready", "callnow"].includes(label)) {
-      await pool.query(
-        `
-          UPDATE ai_calls
-          SET sequence_status = 'scheduled', next_attempt_at = NOW(),
-              updated_at = NOW()
-          WHERE call_id = $1
-        `,
-        [call.call_id]
-      );
-      return true;
-    }
-
-    if (label === "scheduled") {
-      await pool.query(
-        `
-          UPDATE ai_calls
-          SET sequence_status = 'scheduled',
-              next_attempt_at = COALESCE(next_attempt_at, NOW()),
-              updated_at = NOW()
-          WHERE call_id = $1
-        `,
-        [call.call_id]
-      );
-      return true;
-    }
-
-    if (label === "waitingretry") {
-      await pool.query(
-        `
-          UPDATE ai_calls
-          SET sequence_status = 'waiting_retry',
-              next_attempt_at = COALESCE(next_attempt_at, NOW()),
-              updated_at = NOW()
-          WHERE call_id = $1
-        `,
-        [call.call_id]
-      );
-      return true;
-    }
-
-    if (label === "callbackscheduled") {
-      await pool.query(
-        `
-          UPDATE ai_calls
-          SET
-            sequence_status = 'callback_scheduled',
-            callback_requested = TRUE,
-            next_attempt_at = COALESCE(callback_at, next_attempt_at, NOW()),
-            updated_at = NOW()
-          WHERE call_id = $1
-        `,
-        [call.call_id]
-      );
-      return true;
-    }
-
     if (label === "paused") {
       await pool.query(
-        `UPDATE ai_calls SET sequence_status = 'paused', next_attempt_at = NULL,
+        `UPDATE ai_calls SET sequence_status = 'paused',
          updated_at = NOW() WHERE call_id = $1`,
         [call.call_id]
       );
@@ -4552,7 +3444,7 @@ async function applyMondayColumnControl(call, event) {
     if (["humanaction", "agentneeded", "exhausted"].includes(label)) {
       await pool.query(
         `UPDATE ai_calls SET sequence_status = 'human_action',
-         next_attempt_at = NULL, updated_at = NOW() WHERE call_id = $1`,
+         updated_at = NOW() WHERE call_id = $1`,
         [call.call_id]
       );
       return true;
@@ -4562,7 +3454,7 @@ async function applyMondayColumnControl(call, event) {
       if (await sequenceHasUnresolvedWork(call.call_id)) return false;
       await pool.query(
         `UPDATE ai_calls SET sequence_status = 'completed',
-         next_attempt_at = NULL, updated_at = NOW() WHERE call_id = $1`,
+         updated_at = NOW() WHERE call_id = $1`,
         [call.call_id]
       );
       return true;
@@ -4577,7 +3469,6 @@ async function applyMondayColumnControl(call, event) {
             wrong_number = wrong_number OR $3,
             invalid_number = invalid_number OR $4,
             sequence_status = 'suppressed',
-            next_attempt_at = NULL,
             updated_at = NOW()
           WHERE call_id = $1
         `,
@@ -4600,7 +3491,7 @@ async function applyMondayColumnControl(call, event) {
       `
         UPDATE ai_calls
         SET do_not_call = TRUE, sequence_status = 'suppressed',
-            outcome = COALESCE(outcome, 'opt_out'), next_attempt_at = NULL,
+            outcome = COALESCE(outcome, 'opt_out'),
             updated_at = NOW()
         WHERE call_id = $1
       `,
@@ -4743,6 +3634,58 @@ async function updateCallStatus(callId, status, extra = {}) {
   queueMondaySync(callId, `call_status_${statusValue}`);
 }
 
+function publicCallResult(result = {}) {
+  const fields = [
+    "purchase_timeline_detail",
+    "time_frame",
+    "interest_level",
+    "applied_with_lender",
+    "has_realtor",
+    "purchase_area",
+    "preliminary_dti_percent",
+    "preliminary_dti_classification",
+    "application_link_sent",
+    "final_outcome",
+    "next_action",
+    "summary",
+    "normal_completion_recorded",
+    "final_hangup_requested",
+    "final_hangup_completed",
+    "completion_reason",
+    "contact_restriction"
+  ];
+  return Object.fromEntries(
+    fields
+      .filter((field) => result[field] !== undefined)
+      .map((field) => [field, result[field]])
+  );
+}
+
+function publicCallActions(actions = []) {
+  const fields = [
+    "action",
+    "success",
+    "outcome",
+    "restriction_type",
+    "resource_type",
+    "transfer_status",
+    "priority",
+    "reason",
+    "technical_failure",
+    "attempt_number",
+    "twilio_call_sid",
+    "session_call_phase",
+    "created_at"
+  ];
+  return (Array.isArray(actions) ? actions : []).map((action) =>
+    Object.fromEntries(
+      fields
+        .filter((field) => action?.[field] !== undefined)
+        .map((field) => [field, action[field]])
+    )
+  );
+}
+
 async function notifyHelux(call) {
   if (!call) return;
 
@@ -4762,9 +3705,6 @@ async function notifyHelux(call) {
         status: call.status,
         sequence_status: call.sequence_status,
         attempts_used: call.attempts,
-        max_attempts: call.max_attempts,
-        next_attempt_at: call.next_attempt_at,
-        callback_at: call.callback_at,
         outcome: call.outcome,
         sentiment: call.sentiment,
         awaiting_customer_response: call.awaiting_customer_response,
@@ -4775,8 +3715,8 @@ async function notifyHelux(call) {
         next_action: call.next_action,
         summary: call.summary,
         transcript: call.transcript || [],
-        actions: call.actions || [],
-        result: call.result || {},
+        actions: publicCallActions(call.actions),
+        result: publicCallResult(call.result),
         monday: {
           enabled: MONDAY_SYNC_ENABLED,
           board_id: MONDAY_BOARD_ID,
@@ -4797,7 +3737,6 @@ async function notifyHelux(call) {
           tools: call.tool_version,
           knowledge: call.knowledge_version,
           routing: call.routing_version,
-          cadence: call.cadence_version,
           monday_adapter: DOUG_CONFIG.mondayAdapterVersion,
           realtime_model: OPENAI_REALTIME_MODEL,
           voice: OPENAI_VOICE
@@ -4819,275 +3758,45 @@ async function notifyHelux(call) {
   }
 }
 
-const formatterCache = new Map();
-
-function getFormatter(timeZone) {
-  if (!formatterCache.has(timeZone)) {
-    formatterCache.set(
-      timeZone,
-      new Intl.DateTimeFormat("en-US", {
-        timeZone,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hourCycle: "h23"
-      })
-    );
-  }
-  return formatterCache.get(timeZone);
-}
-
-function zonedParts(date, timeZone) {
-  const parts = {};
-  for (const part of getFormatter(timeZone).formatToParts(date)) {
-    if (part.type !== "literal") parts[part.type] = Number(part.value);
-  }
-  return {
-    year: parts.year,
-    month: parts.month,
-    day: parts.day,
-    hour: parts.hour,
-    minute: parts.minute,
-    second: parts.second
-  };
-}
-
-function zonedDateTimeToUtc(localParts, timeZone) {
-  let guess = Date.UTC(
-    localParts.year,
-    localParts.month - 1,
-    localParts.day,
-    localParts.hour,
-    localParts.minute,
-    localParts.second || 0
-  );
-
-  for (let index = 0; index < 3; index += 1) {
-    const actual = zonedParts(new Date(guess), timeZone);
-    const desiredEpoch = Date.UTC(
-      localParts.year,
-      localParts.month - 1,
-      localParts.day,
-      localParts.hour,
-      localParts.minute,
-      localParts.second || 0
-    );
-    const actualEpoch = Date.UTC(
-      actual.year,
-      actual.month - 1,
-      actual.day,
-      actual.hour,
-      actual.minute,
-      actual.second || 0
-    );
-    guess += desiredEpoch - actualEpoch;
-  }
-
-  return new Date(guess);
-}
-
-function addLocalCalendarDays(parts, days) {
-  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days));
-  return {
-    year: date.getUTCFullYear(),
-    month: date.getUTCMonth() + 1,
-    day: date.getUTCDate()
-  };
-}
-
-function localDayOfWeek(parts) {
-  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay();
-}
-
-function parseClock(value) {
-  const [hour, minute] = String(value).split(":").map(Number);
-  return { hour, minute };
-}
-
-function validCallingDay(parts) {
-  const day = localDayOfWeek(parts);
-  return day !== 0 || DOUG_CONFIG.operatingWindow.sundayEnabled;
-}
-
-function operatingWindowForParts(parts) {
-  const day = localDayOfWeek(parts);
-
- if (day === 0) {
-  if (!DOUG_CONFIG.operatingWindow.sundayEnabled) {
-    return null;
-  }
-
-  return {
-    start: parseClock(DOUG_CONFIG.operatingWindow.sundayStart),
-    end: parseClock(DOUG_CONFIG.operatingWindow.sundayEnd)
-  };
-}
-
-  if (day === 6) {
-    return {
-      start: parseClock(DOUG_CONFIG.operatingWindow.saturdayStart),
-      end: parseClock(DOUG_CONFIG.operatingWindow.saturdayEnd)
-    };
-  }
-  return {
-    start: parseClock(DOUG_CONFIG.operatingWindow.weekdayStart),
-    end: parseClock(DOUG_CONFIG.operatingWindow.weekdayEnd)
-  };
-}
-
-function minutesOfDay(parts) {
-  return parts.hour * 60 + parts.minute;
-}
-
-function insideOperatingWindow(date, timeZone) {
-  if (DOUG_CONFIG.operatingWindow.alwaysOpen) return true;
-  const parts = zonedParts(date, timeZone);
-  const window = operatingWindowForParts(parts);
-  if (!window) return false;
-  const current = minutesOfDay(parts);
-  const start = window.start.hour * 60 + window.start.minute;
-  const end = window.end.hour * 60 + window.end.minute;
-  return current >= start && current <= end;
-}
-
-function candidateLocalDate(baseParts, dayOffset, clock) {
-  const date = addLocalCalendarDays(baseParts, dayOffset);
-  const parsed = parseClock(clock);
-  return {
-    ...date,
-    hour: parsed.hour,
-    minute: parsed.minute,
-    second: 0
-  };
-}
-
-function nextValidWindow(timeZone, afterDate, preferredClock, minimumGapMinutes) {
-  const minimumDate = new Date(
-    afterDate.getTime() + Math.max(0, minimumGapMinutes || 0) * 60000
-  );
-  if (DOUG_CONFIG.operatingWindow.alwaysOpen) return minimumDate;
-  const base = zonedParts(afterDate, timeZone);
-
-  for (let dayOffset = 0; dayOffset < 21; dayOffset += 1) {
-    const localCandidate = candidateLocalDate(base, dayOffset, preferredClock);
-    if (!validCallingDay(localCandidate)) continue;
-    const candidate = zonedDateTimeToUtc(localCandidate, timeZone);
-    if (candidate >= minimumDate && insideOperatingWindow(candidate, timeZone)) {
-      return candidate;
-    }
-  }
-
-  return new Date(afterDate.getTime() + 24 * 60 * 60 * 1000);
-}
-
-function calculateNextAttemptAt(call) {
-  const now = new Date();
-  const attempt = Number(call.attempts || 0);
-  const delayHours =
-    attempt <= 1
-      ? 3
-      : attempt === 2
-        ? 12
-        : attempt === 3
-          ? 36
-          : attempt === 4
-            ? 60
-            : 72;
-  return new Date(now.getTime() + delayHours * 60 * 60 * 1000);
-}
-
-async function scheduleUnexpectedReconnect(callId) {
+async function reconnectAfterUnexpectedDisconnect(callId) {
   const call = await getCallById(callId);
   if (!call || call.payload?.call_type === "dpa_agent_notification") return false;
   if (!call.last_attempt_id) return false;
+
   const attempt = await getAttemptById(call.last_attempt_id);
   const transcript = Array.isArray(attempt?.transcript) ? attempt.transcript : [];
   const actions = Array.isArray(attempt?.actions) ? attempt.actions : [];
   const completedByTool = actions.some(
-    (action) => action && action.action === "complete_call" && action.success
+    (action) => action?.action === "complete_call" && action?.success === true
   );
   const intentionallyEnded = actions.some(
     (action) =>
-      action &&
       [
         "twilio_call_hangup",
         "twilio_final_hangup",
         "twilio_physical_hangup"
-      ].includes(action.action) &&
-      action.success &&
-      (
-        action.action === "twilio_physical_hangup" ||
-        action.completion_reason === "normal_completion"
-      )
-  );
-  const callbackConcluded = actions.some(
-    (action) =>
-      action && action.action === "schedule_callback" && action.success
-  );
-  const alreadyScheduled = Boolean(
-    call.result?.unexpected_disconnect_reconnect_scheduled ||
-      call.result?.unexpected_disconnect_reconnect_attempted
-  );
-  const connectedCall = Boolean(
-    ["answered", "in-progress"].includes(
-      String(call.status || "").toLowerCase()
-    ) && call.twilio_call_sid
+      ].includes(action?.action) &&
+      action?.success === true
   );
   const normalCompletion = Boolean(
     completedByTool ||
-    intentionallyEnded ||
-    call.result?.normal_completion_recorded === true ||
-    call.result?.final_hangup_requested === true ||
-    call.result?.final_hangup_completed === true ||
-    call.result?.completion_reason === "normal_completion" ||
-    String(call.status || "").toLowerCase() === "completed"
+      intentionallyEnded ||
+      call.result?.normal_completion_recorded === true ||
+      call.result?.final_hangup_requested === true ||
+      call.result?.final_hangup_completed === true ||
+      call.result?.completion_reason === "normal_completion" ||
+      String(call.status || "").toLowerCase() === "completed"
   );
-  if (normalCompletion) {
+  if (normalCompletion || transcript.length < 2) {
     console.log(JSON.stringify({
       event: "unexpected_reconnect_skipped",
       call_id: call.call_id,
-      reason: "normal_terminal_call"
+      reason: normalCompletion ? "normal_terminal_call" : "insufficient_connected_conversation"
     }));
     return false;
   }
-  const callbackAt = call.callback_at ? new Date(call.callback_at) : null;
-  const hasFutureCallback = Boolean(
-    callbackAt && !Number.isNaN(callbackAt.getTime()) && callbackAt > new Date()
-  );
-  if (
-    hasFutureCallback ||
-    callbackConcluded ||
-    call.result?.outbound_call_reason === "scheduled_second_call"
-  ) {
-    logOutboundCallRejected(
-      call,
-      "unexpected_disconnect_reconnect",
-      "normal_completion_not_reconnectable"
-    );
-    return false;
-  }
-  if (!connectedCall || transcript.length < 2) {
-    logOutboundCallRejected(
-      call,
-      "unexpected_disconnect_reconnect",
-      "normal_completion_not_reconnectable"
-    );
-    return false;
-  }
-  if (alreadyScheduled) {
-    logOutboundCallRejected(
-      call,
-      "unexpected_disconnect_reconnect",
-      "reconnect_already_attempted"
-    );
-    return false;
-  }
 
-  const reconnectAt = new Date(Date.now() + 60 * 1000);
-  const reconnectSourceTwilioCallSid = call.twilio_call_sid;
+  const sourceTwilioCallSid = call.twilio_call_sid;
   const savedSummary = cleanText(
     call.summary ||
       transcript
@@ -5101,69 +3810,67 @@ async function scheduleUnexpectedReconnect(callId) {
       UPDATE ai_calls
       SET current_state = 'reconnect_pending',
           next_state = COALESCE(next_state, 'resume_conversation'),
-          sequence_status = 'callback_scheduled', callback_requested = TRUE,
-          callback_at = $2, next_attempt_at = $2,
-          status = 'disconnected', twilio_call_sid = NULL,
-          summary = COALESCE(summary, $3),
+          sequence_status = 'ready',
+          status = 'disconnected',
+          twilio_call_sid = NULL,
+          summary = COALESCE(summary, $2),
           next_action = COALESCE(next_action, 'Resume after unexpected disconnect'),
-          completed_at = NULL, result = result || $4::jsonb, updated_at = NOW()
+          completed_at = NULL,
+          result = result || $3::jsonb,
+          updated_at = NOW()
       WHERE call_id = $1
-        AND COALESCE(result->>'unexpected_disconnect_reconnect_scheduled', 'false') <> 'true'
+        AND COALESCE(result->>'unexpected_disconnect_reconnect_attempted', 'false') <> 'true'
         AND COALESCE(result->>'normal_completion_recorded', 'false') <> 'true'
         AND COALESCE(result->>'final_hangup_requested', 'false') <> 'true'
         AND COALESCE(result->>'final_hangup_completed', 'false') <> 'true'
         AND COALESCE(result->>'completion_reason', '') <> 'normal_completion'
-        AND status <> 'completed'
         AND status IN ('answered', 'in-progress')
-        AND twilio_call_sid = $5
-        AND NOT EXISTS (
-          SELECT 1
-          FROM jsonb_array_elements(actions) AS callback_action
-          WHERE callback_action->>'action' = 'schedule_callback'
-            AND COALESCE((callback_action->>'success')::BOOLEAN, FALSE) = TRUE
-        )
+        AND twilio_call_sid = $4
         AND NOT EXISTS (
           SELECT 1
           FROM jsonb_array_elements(actions) AS action
           WHERE action->>'action' = 'complete_call'
             AND COALESCE((action->>'success')::BOOLEAN, FALSE) = TRUE
         )
-      RETURNING call_id
+      RETURNING *
     `,
     [
       callId,
-      reconnectAt,
       savedSummary,
       JSON.stringify({
-        unexpected_disconnect_reconnect_scheduled: true,
+        unexpected_disconnect_reconnect_attempted: true,
         unexpected_disconnect_at: new Date().toISOString(),
-        reconnect_at: reconnectAt.toISOString(),
         reconnect_source_call_id: callId,
-        reconnect_source_twilio_call_sid: reconnectSourceTwilioCallSid,
+        reconnect_source_twilio_call_sid: sourceTwilioCallSid,
         outbound_call_reason: "unexpected_disconnect_reconnect"
       }),
-      reconnectSourceTwilioCallSid
+      sourceTwilioCallSid
     ]
   );
   if (!updated.rowCount) return false;
-  await ensurePendingAttempt(callId, {
+
+  const reconnectCall = updated.rows[0];
+  const reconnectAttempt = await createCallAttempt(callId, {
     attemptType: "disconnect_reconnect",
-    scheduledAt: reconnectAt,
-    idempotencyKey: `disconnect_reconnect:${callId}:${reconnectAt.toISOString()}`
+    idempotencyKey: `disconnect_reconnect:${callId}`
   });
+  if (!reconnectAttempt) return false;
+
   await appendAction(callId, {
-    action: "unexpected_disconnect_reconnect_scheduled",
+    action: "unexpected_disconnect_reconnect",
     success: true,
-    reconnect_at: reconnectAt.toISOString(),
     reconnect_source_call_id: callId,
-    reconnect_source_twilio_call_sid: reconnectSourceTwilioCallSid,
+    reconnect_source_twilio_call_sid: sourceTwilioCallSid,
     outbound_call_reason: "unexpected_disconnect_reconnect"
   });
-  queueMondaySync(callId, "unexpected_disconnect_reconnect");
+  await placeTwilioCall(reconnectCall, {
+    attemptId: reconnectAttempt.attempt_id,
+    source: "unexpected_reconnect",
+    callReason: "unexpected_disconnect_reconnect"
+  });
   return true;
 }
-
-async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
+async function finalizeAfterTerminal(callId, technicalStatus) {
   const call = await getCallById(callId);
   if (!call) return;
 
@@ -5171,12 +3878,6 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
     ? call.transcript.length
     : 0;
   const outcome = String(call.outcome || "").toLowerCase();
-  const callbackAt = call.callback_at ? new Date(call.callback_at) : null;
-  const hasFutureCallback = Boolean(
-    callbackAt &&
-      !Number.isNaN(callbackAt.getTime()) &&
-      callbackAt > new Date()
-  );
 
   if (
     call.result?.unexpected_disconnect_reconnect_attempted &&
@@ -5185,84 +3886,38 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
     await pool.query(
       `
         UPDATE ai_calls
-        SET sequence_status = 'human_action', callback_requested = FALSE,
-            callback_at = NULL, next_attempt_at = NULL,
+        SET sequence_status = 'human_action',
             current_state = 'reconnect_attempt_completed',
-            result = result || $2::jsonb, updated_at = NOW()
+            result = result || $2::jsonb,
+            updated_at = NOW()
         WHERE call_id = $1
       `,
       [
         callId,
-        JSON.stringify({
-          unexpected_disconnect_reconnect_completed: true,
-          automatic_redial_disabled: true
-        })
+        JSON.stringify({ unexpected_disconnect_reconnect_completed: true })
       ]
     );
-    queueMondaySync(callId, "reconnect_attempt_completed_no_redial");
-    return;
-  }
-
-  if (
-    call.sequence_status === "callback_scheduled" &&
-    hasFutureCallback &&
-    call.result?.outbound_call_reason === "scheduled_second_call" &&
-    call.result?.scheduled_second_call_appointment_id
-  ) {
-    await pool.query(
-      `
-        UPDATE ai_calls
-        SET
-          sequence_status = 'callback_scheduled',
-          next_attempt_at = $2,
-          completed_at = NULL,
-          updated_at = NOW()
-        WHERE call_id = $1
-      `,
-      [callId, callbackAt]
-    );
-
-    queueMondaySync(callId, "cadence_callback_preserved");
+    queueMondaySync(callId, "reconnect_attempt_completed");
     return;
   }
 
   if (call.do_not_call || call.wrong_number || call.invalid_number) {
     await pool.query(
-      `
-        UPDATE ai_calls
-        SET sequence_status = 'suppressed', next_attempt_at = NULL,
-            updated_at = NOW()
-        WHERE call_id = $1
-      `,
+      `UPDATE ai_calls SET sequence_status = 'suppressed', updated_at = NOW()
+       WHERE call_id = $1`,
       [callId]
     );
-    queueMondaySync(callId, "cadence_suppressed");
+    queueMondaySync(callId, "contact_suppressed");
     return;
   }
 
   if (stopOutcome(outcome)) {
-    if (await sequenceHasUnresolvedWork(callId)) {
-      await pool.query(
-        `UPDATE ai_calls SET sequence_status = CASE
-           WHEN callback_requested THEN 'callback_scheduled'
-           WHEN sequence_status = 'human_action' THEN 'human_action'
-           ELSE 'scheduled' END,
-         completed_at = NULL, updated_at = NOW() WHERE call_id = $1`,
-        [callId]
-      );
-      queueMondaySync(callId, "cadence_completion_blocked_unresolved_work");
-      return;
-    }
     await pool.query(
-      `
-        UPDATE ai_calls
-        SET sequence_status = 'completed', next_attempt_at = NULL,
-            updated_at = NOW()
-        WHERE call_id = $1
-      `,
+      `UPDATE ai_calls SET sequence_status = 'completed', updated_at = NOW()
+       WHERE call_id = $1`,
       [callId]
     );
-    queueMondaySync(callId, "cadence_completed");
+    queueMondaySync(callId, "call_completed");
     return;
   }
 
@@ -5273,61 +3928,42 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
     await pool.query(
       `
         UPDATE ai_calls
-        SET
-          sequence_status = 'human_action',
-          next_action = COALESCE(next_action, 'Review connected call'),
-          next_attempt_at = NULL,
-          updated_at = NOW()
+        SET sequence_status = 'human_action',
+            next_action = COALESCE(next_action, 'Review connected call'),
+            updated_at = NOW()
         WHERE call_id = $1
       `,
       [callId]
     );
-    queueMondaySync(callId, "cadence_human_action");
+    queueMondaySync(callId, "connected_call_review");
     return;
   }
 
   await pool.query(
     `
       UPDATE ai_calls
-      SET
-        sequence_status = 'human_action',
-        next_action = COALESCE(next_action, 'Manual review required; automatic redial disabled'),
-        next_attempt_at = NULL,
-        result = result || $2::jsonb,
-        updated_at = NOW()
+      SET sequence_status = 'human_action',
+          next_action = COALESCE(next_action, 'Manual review required'),
+          updated_at = NOW()
       WHERE call_id = $1
     `,
-    [callId, JSON.stringify({ automatic_redial_disabled: true })]
+    [callId]
   );
-
-  await pool.query(
-    `UPDATE call_attempts
-     SET technical_status = 'canceled', completed_at = NOW(),
-         cancellation_reason = 'automatic_redial_disabled', updated_at = NOW()
-     WHERE call_id = $1 AND completed_at IS NULL
-       AND technical_status IN ('pending', 'scheduled', 'created')
-       AND attempt_id IS DISTINCT FROM $2`,
-    [callId, call.last_attempt_id]
-  );
-  queueMondaySync(callId, "automatic_redial_disabled");
+  queueMondaySync(callId, "manual_review_required");
 }
-
 async function placeTwilioCall(call, options = {}) {
   let refreshedCall = await getCallById(call.call_id);
   if (!refreshedCall) throw new Error("Call sequence not found.");
-  let source = outboundCallSource(null, options.source);
-  let resolvedCallReason = resolveOutboundCallReason(
+
+  const resolvedCallReason = resolveOutboundCallReason(
     refreshedCall,
     null,
     options
   );
+  const source = outboundCallSource(null, options.source);
 
   if (!OUTBOUND_CALLS_ENABLED) {
-    blockDisabledOutboundCall(
-      refreshedCall,
-      source,
-      refreshedCall.callback_at || refreshedCall.next_attempt_at
-    );
+    blockDisabledOutboundCall(refreshedCall, source);
     logOutboundCallRejected(
       refreshedCall,
       resolvedCallReason,
@@ -5335,7 +3971,6 @@ async function placeTwilioCall(call, options = {}) {
     );
     throw new HttpError(409, "Outbound calls are disabled.");
   }
-
   if (internalNotificationCallReason(resolvedCallReason)) {
     logOutboundCallRejected(
       refreshedCall,
@@ -5352,84 +3987,31 @@ async function placeTwilioCall(call, options = {}) {
     );
     throw new HttpError(409, "A permitted outbound call reason is required.");
   }
-
   if (
     refreshedCall.do_not_call ||
     refreshedCall.wrong_number ||
     refreshedCall.invalid_number
   ) {
-    logOutboundCallRejected(
-      refreshedCall,
-      resolvedCallReason,
-      refreshedCall.do_not_call ? "do_not_call" : "contact_suppressed"
-    );
-    throw new HttpError(409, "This contact is suppressed from future calls.");
+    throw new HttpError(409, "This contact is suppressed from calls.");
   }
-
   if (
     ENFORCE_CALL_CONSENT &&
     refreshedCall.consent_status !== "confirmed" &&
     options.force !== true
   ) {
-    logOutboundCallRejected(
-      refreshedCall,
-      resolvedCallReason,
-      "consent_not_confirmed"
-    );
     throw new HttpError(409, "Confirmed AI voice consent is required.");
   }
 
-  if (
-    attemptTypeForCall(refreshedCall, options.attemptType) === "cadence" &&
-    Number(refreshedCall.attempts || 0) >=
-    Number(refreshedCall.max_attempts || DOUG_CONFIG.maxAttempts)
-  ) {
-    throw new HttpError(409, "Maximum call attempts have been reached.");
-  }
-
-  let pendingAttempt = options.attemptId
+  let attempt = options.attemptId
     ? await getAttemptById(options.attemptId)
-    : await ensurePendingAttempt(refreshedCall.call_id, {
-        attemptType: options.attemptType,
-        scheduledAt: refreshedCall.next_attempt_at || new Date()
+    : await createCallAttempt(refreshedCall.call_id, {
+        attemptType: options.attemptType
       });
-  if (!pendingAttempt) {
-    logOutboundCallRejected(
-      refreshedCall,
-      resolvedCallReason,
-      "atomic_claim_failed"
-    );
-    throw new HttpError(409, "No pending attempt is available.");
-  }
-  source = outboundCallSource(pendingAttempt, options.source);
-  resolvedCallReason = resolveOutboundCallReason(
-    refreshedCall,
-    pendingAttempt,
-    options
-  );
-
-  const initialEligibility = outboundCallEligibility(
-    refreshedCall,
-    pendingAttempt,
-    resolvedCallReason
-  );
-  if (!initialEligibility.eligible) {
-    logOutboundCallEligibility(
-      refreshedCall,
-      pendingAttempt,
-      source,
-      initialEligibility
-    );
-    logOutboundCallRejected(
-      refreshedCall,
-      resolvedCallReason,
-      initialEligibility.reason
-    );
-    throw new HttpError(409, `Outbound call blocked: ${initialEligibility.reason}.`);
+  if (!attempt || !pendingAttemptStatus(attempt.technical_status)) {
+    throw new HttpError(409, "No call attempt is available.");
   }
 
   const client = await pool.connect();
-  let claimedDueAt = initialEligibility.dueAt;
   try {
     await client.query("BEGIN");
     if (resolvedCallReason === "initial_lead_call") {
@@ -5442,187 +4024,99 @@ async function placeTwilioCall(call, options = {}) {
         [`initial_lead_call:${leadIdentity}`]
       );
       const priorInitialCall = await client.query(
-        `SELECT call_id FROM ai_calls
-         WHERE call_id <> $1
-           AND COALESCE(NULLIF(lead_id, ''), NULLIF(payload->>'lead_id', ''),
-                        NULLIF(case_id, ''), request_key) = $2
-           AND COALESCE(
-             result->>'outbound_call_reason',
-             payload->>'outbound_call_reason',
-             ''
-           ) = 'initial_lead_call'
-           AND (
-             attempts > 0 OR last_attempt_id IS NOT NULL OR twilio_call_sid IS NOT NULL
-             OR result->>'initial_call_claimed_at' IS NOT NULL
-           )
-         LIMIT 1`,
+        `
+          SELECT call_id FROM ai_calls
+          WHERE call_id <> $1
+            AND COALESCE(NULLIF(lead_id, ''), NULLIF(payload->>'lead_id', ''),
+                         NULLIF(case_id, ''), request_key) = $2
+            AND COALESCE(
+              result->>'outbound_call_reason',
+              payload->>'outbound_call_reason',
+              ''
+            ) = 'initial_lead_call'
+            AND (
+              attempts > 0 OR last_attempt_id IS NOT NULL
+              OR twilio_call_sid IS NOT NULL
+              OR result->>'initial_call_claimed_at' IS NOT NULL
+            )
+          LIMIT 1
+        `,
         [refreshedCall.call_id, leadIdentity]
       );
       if (priorInitialCall.rowCount) {
-        logOutboundCallRejected(
-          refreshedCall,
-          resolvedCallReason,
-          "initial_call_already_exists"
-        );
         throw new HttpError(409, "An initial call already exists for this lead.");
       }
     }
-    const lockedCallResult = await client.query(
-      "SELECT * FROM ai_calls WHERE call_id = $1 FOR UPDATE",
-      [refreshedCall.call_id]
-    );
-    const lockedAttemptResult = await client.query(
-      "SELECT * FROM call_attempts WHERE attempt_id = $1 FOR UPDATE",
-      [pendingAttempt.attempt_id]
-    );
-    refreshedCall = lockedCallResult.rows[0];
-    pendingAttempt = lockedAttemptResult.rows[0];
-    resolvedCallReason = resolveOutboundCallReason(
-      refreshedCall,
-      pendingAttempt,
-      options
-    );
-    const lockedEligibility = outboundCallEligibility(
-      refreshedCall,
-      pendingAttempt,
-      resolvedCallReason
-    );
-    if (!lockedEligibility.eligible) {
-      logOutboundCallEligibility(
-        refreshedCall,
-        pendingAttempt,
-        source,
-        lockedEligibility
-      );
-      logOutboundCallRejected(
-        refreshedCall,
-        resolvedCallReason,
-        lockedEligibility.reason
-      );
-      throw new HttpError(409, `Outbound call blocked: ${lockedEligibility.reason}.`);
-    }
-    claimedDueAt = lockedEligibility.dueAt;
 
-    const explicitAppointment = lockedEligibility.scheduledAppointment;
-    const lifecycleHistoryExemption = Boolean(
-      explicitAppointment ||
-        resolvedCallReason === "unexpected_disconnect_reconnect"
-    );
-    const consumesScheduledTime = [
-      "scheduled_second_call",
-      "unexpected_disconnect_reconnect"
-    ].includes(resolvedCallReason);
     const claimedAt = new Date().toISOString();
-    const claimResultPatch = {
+    const claimPatch = {
       outbound_call_reason: resolvedCallReason,
       outbound_call_claimed_at: claimedAt,
       ...(resolvedCallReason === "initial_lead_call"
         ? { initial_call_claimed_at: claimedAt }
-        : {}),
-      ...(resolvedCallReason === "scheduled_second_call"
-        ? { scheduled_second_call_dialed_at: claimedAt }
-        : {}),
-      ...(resolvedCallReason === "unexpected_disconnect_reconnect"
-        ? { unexpected_disconnect_reconnect_attempted: true }
-        : {})
+        : { unexpected_disconnect_reconnect_attempted: true })
     };
-    const claimedCallResult = await client.query(
-      `UPDATE ai_calls
-       SET status = 'placing', sequence_status = 'calling',
-           current_state = CASE
-             WHEN $10 = 'unexpected_disconnect_reconnect'
-               THEN 'reconnect_in_progress'
-             ELSE current_state
-           END,
-           stream_token = $4, twilio_call_sid = NULL,
-           attempts = attempts + 1, last_attempt_id = $2, last_attempt_at = NOW(),
-           last_error = NULL, completed_at = NULL,
-           callback_requested = CASE WHEN $3::BOOLEAN THEN FALSE ELSE callback_requested END,
-           result = (CASE
-             WHEN $5::BOOLEAN THEN result
-               - 'normal_completion_recorded'
-               - 'normal_completion_recorded_at'
-               - 'final_hangup_requested'
-               - 'final_hangup_completed'
-               - 'final_hangup_completed_at'
-               - 'completion_reason'
-               - 'intentional_twilio_hangup'
-             ELSE result
-           END) || $11::jsonb,
-           updated_at = NOW()
-       WHERE call_id = $1
-         AND status = $6
-         AND sequence_status = $7
-         AND twilio_call_sid IS NOT DISTINCT FROM $8::VARCHAR
-         AND do_not_call = FALSE
-         AND wrong_number = FALSE
-         AND invalid_number = FALSE
-         AND status NOT IN ('placing', 'queued', 'initiated', 'ringing', 'answered', 'in-progress', 'canceled', 'cancelled')
-         AND sequence_status IN ('ready', 'active', 'scheduled', 'waiting_retry', 'callback_scheduled')
-         AND ($5::BOOLEAN OR (
-           status <> 'completed'
-           AND sequence_status <> 'completed'
-           AND COALESCE(result->>'normal_completion_recorded', 'false') <> 'true'
-           AND COALESCE(result->>'completion_reason', '') <> 'normal_completion'
-           AND NOT EXISTS (
-             SELECT 1
-             FROM jsonb_array_elements(actions) AS action
-             WHERE action->>'action' = 'complete_call'
-               AND COALESCE((action->>'success')::BOOLEAN, FALSE) = TRUE
-           )
-         ))
-         AND $9::TIMESTAMPTZ <= NOW()
-         AND COALESCE(result->>'outbound_call_reason', payload->>'outbound_call_reason', '') = $10
-         AND (
-           ($10 = 'initial_lead_call' AND next_attempt_at = $9::TIMESTAMPTZ)
-           OR ($10 IN ('scheduled_second_call', 'unexpected_disconnect_reconnect')
-               AND callback_at = $9::TIMESTAMPTZ)
-         )
-       RETURNING *`,
+    const claimedCall = await client.query(
+      `
+        UPDATE ai_calls
+        SET status = 'placing',
+            sequence_status = 'calling',
+            current_state = CASE
+              WHEN $4 = 'unexpected_disconnect_reconnect'
+                THEN 'reconnect_in_progress'
+              ELSE current_state
+            END,
+            stream_token = $3,
+            twilio_call_sid = NULL,
+            attempts = attempts + 1,
+            last_attempt_id = $2,
+            last_attempt_at = NOW(),
+            last_error = NULL,
+            completed_at = NULL,
+            result = result || $5::jsonb,
+            updated_at = NOW()
+        WHERE call_id = $1
+          AND do_not_call = FALSE
+          AND wrong_number = FALSE
+          AND invalid_number = FALSE
+          AND status NOT IN ('placing', 'queued', 'initiated', 'ringing', 'answered', 'in-progress')
+          AND ($4 <> 'initial_lead_call' OR (
+            attempts = 0
+            AND last_attempt_id IS NULL
+            AND result->>'initial_call_claimed_at' IS NULL
+          ))
+        RETURNING *
+      `,
       [
         refreshedCall.call_id,
-        pendingAttempt.attempt_id,
-        consumesScheduledTime,
+        attempt.attempt_id,
         createStreamToken(),
-        lifecycleHistoryExemption,
-        refreshedCall.status,
-        refreshedCall.sequence_status,
-        refreshedCall.twilio_call_sid || null,
-        claimedDueAt,
         resolvedCallReason,
-        JSON.stringify(claimResultPatch)
+        JSON.stringify(claimPatch)
       ]
     );
-    if (!claimedCallResult.rowCount) {
-      logOutboundCallRejected(
-        refreshedCall,
-        resolvedCallReason,
-        "atomic_claim_failed"
-      );
-      throw new HttpError(409, "Call row was not eligible for atomic claim.");
+    if (!claimedCall.rowCount) {
+      throw new HttpError(409, "Call is no longer eligible to be placed.");
     }
-    const claimedAttemptResult = await client.query(
-      `UPDATE call_attempts
-       SET technical_status = 'placing', dialed_at = NOW(), updated_at = NOW()
-       WHERE attempt_id = $1
-         AND call_id = $2
-         AND technical_status IN ('pending', 'scheduled', 'created')
-         AND completed_at IS NULL
-         AND scheduled_at IS NOT NULL
-         AND scheduled_at <= NOW()
-       RETURNING *`,
-      [pendingAttempt.attempt_id, refreshedCall.call_id]
+
+    const claimedAttempt = await client.query(
+      `
+        UPDATE call_attempts
+        SET technical_status = 'placing', dialed_at = NOW(), updated_at = NOW()
+        WHERE attempt_id = $1
+          AND call_id = $2
+          AND technical_status IN ('pending', 'created')
+          AND completed_at IS NULL
+        RETURNING *
+      `,
+      [attempt.attempt_id, refreshedCall.call_id]
     );
-    if (!claimedAttemptResult.rowCount) {
-      logOutboundCallRejected(
-        refreshedCall,
-        resolvedCallReason,
-        "atomic_claim_failed"
-      );
-      throw new HttpError(409, "Call attempt was not eligible for atomic claim.");
+    if (!claimedAttempt.rowCount) {
+      throw new HttpError(409, "Call attempt is no longer available.");
     }
-    refreshedCall = claimedCallResult.rows[0];
-    pendingAttempt = claimedAttemptResult.rows[0];
+
+    refreshedCall = claimedCall.rows[0];
+    attempt = claimedAttempt.rows[0];
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -5631,99 +4125,19 @@ async function placeTwilioCall(call, options = {}) {
     client.release();
   }
 
-  refreshedCall = await getCallById(refreshedCall.call_id);
-  pendingAttempt = await getAttemptById(pendingAttempt.attempt_id);
-  const postClaimReason = resolveOutboundCallReason(
-    refreshedCall,
-    pendingAttempt,
-    options
-  );
-  const postClaimDueAt = outboundCallDueAt(
-    refreshedCall,
-    postClaimReason
-  );
-  const claimMarkerRecorded = Boolean(
-    (postClaimReason === "initial_lead_call" &&
-      refreshedCall?.result?.initial_call_claimed_at) ||
-    (postClaimReason === "scheduled_second_call" &&
-      refreshedCall?.result?.scheduled_second_call_dialed_at) ||
-    (postClaimReason === "unexpected_disconnect_reconnect" &&
-      refreshedCall?.result?.unexpected_disconnect_reconnect_attempted === true)
-  );
-  const claimedEligibility = {
-    dueAt: claimedDueAt,
-    eligible: Boolean(
-      refreshedCall &&
-        pendingAttempt &&
-        refreshedCall.status === "placing" &&
-        refreshedCall.sequence_status === "calling" &&
-        refreshedCall.last_attempt_id === pendingAttempt.attempt_id &&
-        pendingAttempt.technical_status === "placing" &&
-        postClaimReason === resolvedCallReason &&
-        permittedOutboundCallReason(postClaimReason) &&
-        postClaimDueAt &&
-        new Date(postClaimDueAt).toISOString() === claimedDueAt &&
-        claimMarkerRecorded &&
-        !refreshedCall.twilio_call_sid &&
-        !refreshedCall.do_not_call &&
-        !refreshedCall.wrong_number &&
-        !refreshedCall.invalid_number
-    ),
-    reason: "atomic_claim_confirmed"
-  };
-  if (!claimedEligibility.eligible) {
-    claimedEligibility.reason = "post_claim_recheck_failed";
-    logOutboundCallEligibility(
-      refreshedCall,
-      pendingAttempt,
-      source,
-      claimedEligibility
-    );
-    logOutboundCallRejected(
-      refreshedCall,
-      resolvedCallReason,
-      "atomic_claim_failed"
-    );
-    throw new HttpError(409, "Outbound call blocked after atomic claim recheck.");
-  }
-  logOutboundCallEligibility(
-    refreshedCall,
-    pendingAttempt,
-    source,
-    claimedEligibility
-  );
-
-  const attemptId = pendingAttempt.attempt_id;
-  const attemptNumber = Number(pendingAttempt.attempt_number);
   const voiceUrl = new URL(`${PUBLIC_BASE_URL}/api/v1/twilio/voice`);
   voiceUrl.searchParams.set("call_id", refreshedCall.call_id);
   voiceUrl.searchParams.set("token", refreshedCall.stream_token);
   const statusUrl = new URL(`${PUBLIC_BASE_URL}/api/v1/twilio/status`);
   statusUrl.searchParams.set("call_id", refreshedCall.call_id);
   statusUrl.searchParams.set("token", refreshedCall.stream_token);
-  queueMondaySync(refreshedCall.call_id, "attempt_created");
 
   await appendAction(refreshedCall.call_id, {
     action: "outbound_call_claimed",
     success: true,
     call_reason: resolvedCallReason,
-    attempt_id: attemptId,
-    due_at: claimedDueAt,
-    ...(resolvedCallReason === "unexpected_disconnect_reconnect"
-      ? { reconnect_source_call_id: refreshedCall.result?.reconnect_source_call_id }
-      : {})
+    attempt_id: attempt.attempt_id
   });
-
-  if (!OUTBOUND_CALLS_ENABLED) {
-    blockDisabledOutboundCall(refreshedCall, source, claimedDueAt);
-    logOutboundCallRejected(
-      refreshedCall,
-      resolvedCallReason,
-      "outbound_calls_disabled"
-    );
-    throw new HttpError(409, "Outbound calls are disabled.");
-  }
-
   logOutboundCallFinalEligibility(refreshedCall, resolvedCallReason);
 
   try {
@@ -5742,311 +4156,53 @@ async function placeTwilioCall(call, options = {}) {
       twilioCall.status || "queued",
       { twilio_call_sid: twilioCall.sid }
     );
-    await pool.query(
-      `UPDATE ai_calls
-       SET next_attempt_at = NULL,
-           callback_at = CASE
-             WHEN $2 = 'unexpected_disconnect_reconnect' THEN NULL
-             ELSE callback_at
-           END,
-           result = result || $3::jsonb,
-           updated_at = NOW()
-       WHERE call_id = $1`,
-      [
-        refreshedCall.call_id,
-        resolvedCallReason,
-        JSON.stringify({
-          outbound_call_placed_at: new Date().toISOString(),
-          outbound_call_reason: resolvedCallReason
-        })
-      ]
-    );
-
+    await mergeCallResult(refreshedCall.call_id, {
+      outbound_call_placed_at: new Date().toISOString(),
+      outbound_call_reason: resolvedCallReason
+    });
     await appendAction(refreshedCall.call_id, {
       action: "outbound_call_placed",
       success: true,
       call_reason: resolvedCallReason,
-      attempt_number: attemptNumber,
+      attempt_number: Number(attempt.attempt_number),
       twilio_call_sid: twilioCall.sid
     });
-
     queueMondaySync(refreshedCall.call_id, "twilio_call_placed");
     return twilioCall;
   } catch (error) {
     const safeError =
       cleanText(error.message, 4000) || "Twilio call creation failed.";
-
     await pool.query(
       `
         UPDATE call_attempts
-        SET
-          technical_status = 'failed',
-          completed_at = NOW(),
-          last_error = $2,
-          updated_at = NOW()
+        SET technical_status = 'failed', completed_at = NOW(),
+            last_error = $2, updated_at = NOW()
         WHERE attempt_id = $1
       `,
-      [attemptId, safeError]
+      [attempt.attempt_id, safeError]
     );
-
     await pool.query(
       `
         UPDATE ai_calls
-        SET
-          status = 'failed',
-          sequence_status = 'human_action',
-          next_attempt_at = NULL,
-          callback_requested = FALSE,
-          last_error = $2,
-          result = result || $3::jsonb,
-          updated_at = NOW()
+        SET status = 'failed', sequence_status = 'human_action',
+            last_error = $2, updated_at = NOW()
         WHERE call_id = $1
       `,
-      [
-        refreshedCall.call_id,
-        safeError,
-        JSON.stringify({
-          outbound_call_failed_at: new Date().toISOString(),
-          outbound_call_reason: resolvedCallReason,
-          automatic_redial_disabled: true
-        })
-      ]
+      [refreshedCall.call_id, safeError]
     );
-
     await appendAction(refreshedCall.call_id, {
       action: "outbound_call_placed",
       success: false,
       call_reason: resolvedCallReason,
       technical_failure: true,
       customer_attempt_consumed: false,
-      attempt_number: attemptNumber,
+      attempt_number: Number(attempt.attempt_number),
       error: safeError
     });
-
-    queueMondaySync(refreshedCall.call_id, "twilio_call_failed_no_redial");
+    queueMondaySync(refreshedCall.call_id, "twilio_call_failed");
     throw error;
   }
 }
-
-function formatCustomerCallbackTime(value, timeZone) {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) return null;
-
-  return new Intl.DateTimeFormat("en-US", {
-    timeZone: normalizeTimezone(timeZone),
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZoneName: "short"
-  }).format(date);
-}
-
-function localDateParts(value, timeZone) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: normalizeTimezone(timeZone),
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23"
-  }).formatToParts(value instanceof Date ? value : new Date(value));
-  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
-}
-
-function addDaysToLocalDateText(dateText, days) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateText || ""));
-  if (!match) return null;
-  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
-  date.setUTCDate(date.getUTCDate() + days);
-  return date.toISOString().slice(0, 10);
-}
-
-function parseConfirmedLocalDate(value, timeZone) {
-  const raw = cleanText(value, 160);
-  if (!raw) return null;
-  const normalized = normalizeCustomerUtterance(raw);
-  const nowParts = localDateParts(new Date(), timeZone);
-  const today = `${nowParts.year}-${nowParts.month}-${nowParts.day}`;
-  if (/\bfollowing day\b/.test(normalized)) {
-    return addDaysToLocalDateText(today, 1);
-  }
-  if (/\btomorrow\b/.test(normalized)) return addDaysToLocalDateText(today, 1);
-  if (/\btoday\b/.test(normalized)) return today;
-  const isoMatch = /\b(\d{4})-(\d{2})-(\d{2})\b/.exec(raw);
-  if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
-  const parsed = new Date(`${raw} 12:00:00 UTC`);
-  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
-}
-
-function parseConfirmedLocalTime(value) {
-  const raw = cleanText(value, 100);
-  if (!raw) return null;
-  const match = /\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b/i.exec(raw);
-  if (!match) return null;
-  let hour = Number(match[1]);
-  const minute = Number(match[2] || 0);
-  const meridiem = String(match[3] || "").toLowerCase().replace(/\./g, "");
-  if (minute > 59 || hour > (meridiem ? 12 : 23)) return null;
-  if (meridiem === "pm" && hour < 12) hour += 12;
-  if (meridiem === "am" && hour === 12) hour = 0;
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-}
-
-function localDateTimeToUtc(dateText, timeText, timeZone) {
-  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateText || ""));
-  const timeMatch = /^(\d{2}):(\d{2})$/.exec(String(timeText || ""));
-  if (!dateMatch || !timeMatch) return null;
-  const desired = Date.UTC(
-    Number(dateMatch[1]),
-    Number(dateMatch[2]) - 1,
-    Number(dateMatch[3]),
-    Number(timeMatch[1]),
-    Number(timeMatch[2]),
-    0
-  );
-  let guess = desired;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const actual = localDateParts(new Date(guess), timeZone);
-    const actualAsUtc = Date.UTC(
-      Number(actual.year),
-      Number(actual.month) - 1,
-      Number(actual.day),
-      Number(actual.hour),
-      Number(actual.minute),
-      Number(actual.second)
-    );
-    guess += desired - actualAsUtc;
-  }
-  const result = new Date(guess);
-  const check = localDateParts(result, timeZone);
-  const matches =
-    `${check.year}-${check.month}-${check.day}` === dateText &&
-    `${check.hour}:${check.minute}` === timeText;
-  return matches ? result : null;
-}
-function resolveCustomerTimezone(value, fallback = null) {
-  const raw =
-    cleanText(value, 100) ||
-    cleanText(fallback, 100);
-
-  if (!raw) return null;
-
-  const timezoneKey = normalizeMondayKey(raw);
-  let timeZone = raw;
-
-  if (
-    timezoneKey.includes("eastern") ||
-    ["et", "est", "edt"].includes(timezoneKey)
-  ) {
-    timeZone = "America/New_York";
-  } else if (
-    timezoneKey.includes("central") ||
-    ["ct", "cst", "cdt"].includes(timezoneKey)
-  ) {
-    timeZone = "America/Chicago";
-  } else if (
-    timezoneKey.includes("mountain") ||
-    ["mt", "mst", "mdt"].includes(timezoneKey)
-  ) {
-    timeZone = "America/Denver";
-  } else if (
-    timezoneKey.includes("pacific") ||
-    ["pt", "pst", "pdt"].includes(timezoneKey)
-  ) {
-    timeZone = "America/Los_Angeles";
-  }
-
-  try {
-    new Intl.DateTimeFormat("en-US", {
-      timeZone
-    }).format(new Date());
-
-    return timeZone;
-  } catch {
-    return null;
-   }
-  }
-function resolveConfirmedCallbackDateTime(args, call) {
-  const requestedTimezone =
-    cleanText(args.timezone, 100) ||
-    cleanText(call?.callback_timezone, 100) ||
-    cleanText(call?.result?.callback_timezone, 100);
-
-  if (!requestedTimezone) return null;
-
-  const timezoneKey = normalizeMondayKey(requestedTimezone);
-
-  const timeZone =
-    timezoneKey.includes("eastern") ||
-    ["et", "est", "edt"].includes(timezoneKey)
-      ? "America/New_York"
-      : timezoneKey.includes("central") ||
-          ["ct", "cst", "cdt"].includes(timezoneKey)
-        ? "America/Chicago"
-        : timezoneKey.includes("mountain") ||
-            ["mt", "mst", "mdt"].includes(timezoneKey)
-          ? "America/Denver"
-          : timezoneKey.includes("pacific") ||
-              ["pt", "pst", "pdt"].includes(timezoneKey)
-            ? "America/Los_Angeles"
-            : requestedTimezone;
-
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
-  } catch {
-    return null;
-  }
-
-  let customerLocalDate = parseConfirmedLocalDate(
-    args.customer_local_date,
-    timeZone
-  );
-
-  let customerLocalTime = parseConfirmedLocalTime(
-    args.customer_local_time
-  );
-
-  let callbackAt =
-    customerLocalDate && customerLocalTime
-      ? localDateTimeToUtc(
-          customerLocalDate,
-          customerLocalTime,
-          timeZone
-        )
-      : null;
-
-  if (!callbackAt) {
-    const directCallbackAt = new Date(args.callback_at);
-
-    if (Number.isNaN(directCallbackAt.getTime())) {
-      return null;
-    }
-
-    const localParts = localDateParts(directCallbackAt, timeZone);
-
-    customerLocalDate =
-      `${localParts.year}-${localParts.month}-${localParts.day}`;
-
-    customerLocalTime =
-      `${localParts.hour}:${localParts.minute}`;
-
-    callbackAt = directCallbackAt;
-  }
-
-  return {
-    callbackAt,
-    customerLocalDate,
-    customerLocalTime,
-    timeZone
-  };
-}
-
-
 function smsStatusCallbackUrl(call) {
   const url = new URL(`${PUBLIC_BASE_URL}/api/v1/twilio/sms-status`);
   url.searchParams.set("call_id", call.call_id);
@@ -6212,78 +4368,6 @@ async function executeDougTool(call, name, args, sessionCallPhase) {
     };
   }
 
-  if (name === "record_application_checkpoint") {
-    const confirmedStarted = call.result?.application_started_confirmed;
-    if (
-      sessionCallPhase !== "CALL_TWO" ||
-      call.result?.application_status_explicitly_answered !== true ||
-      typeof confirmedStarted !== "boolean" ||
-      safeArgs.started !== confirmedStarted
-    ) {
-      return {
-        success: false,
-        error:
-          "Application status can only be recorded in Call Two after the customer explicitly answers the application-status question."
-      };
-    }
-    if (confirmedStarted !== true) {
-      return {
-        success: true,
-        app_started_confirmation: "No",
-        application_started: false
-      };
-    }
-
-    const summary =
-      cleanText(safeArgs.summary, 4000) ||
-      "Customer confirmed the DPA application was started.";
-    await pool.query(
-      `
-        UPDATE ai_calls
-        SET
-          current_state = 'application_started',
-          next_state = 'human_action',
-          outcome = 'application_started_hot_lead',
-          priority = 'urgent',
-          sequence_status = 'human_action',
-          next_action = 'Agent Needed: review started application',
-          summary = $2,
-          callback_at = NULL,
-          callback_requested = FALSE,
-          next_attempt_at = NULL,
-          result = result || $3::jsonb,
-          updated_at = NOW()
-        WHERE call_id = $1
-      `,
-      [
-        call.call_id,
-        summary,
-        JSON.stringify({
-          app_started_confirmation: "Yes",
-          application_started_confirmed: true,
-          application_status_explicitly_answered: true,
-          interest_level: "Hot",
-          business_outcome: "Application Started — Hot Lead"
-        })
-      ]
-    );
-    await appendAction(call.call_id, {
-      action: name,
-      success: true,
-      app_started_confirmation: "Yes",
-      priority: "urgent"
-    });
-    queueMondaySync(call.call_id, "application_started_hot_lead");
-    return {
-      success: true,
-      app_started_confirmation: "Yes",
-      interest_level: "Hot",
-      priority: "Urgent",
-      business_outcome: "Application Started — Hot Lead",
-      sequence_status: "human_action"
-    };
-  }
-
   if (name === "send_resource_link") {
     if (safeArgs.consent_confirmed !== true) {
       return {
@@ -6340,8 +4424,8 @@ async function executeDougTool(call, name, args, sessionCallPhase) {
           `
             UPDATE ai_calls
             SET current_state = 'application_link_sent',
-                next_state = 'confirm_application_checkpoint',
-                next_action = 'Confirm next-day application checkpoint date, time, and timezone',
+                next_state = 'closing',
+                next_action = 'Complete the current call',
                 updated_at = NOW()
             WHERE call_id = $1
           `,
@@ -6391,229 +4475,11 @@ async function executeDougTool(call, name, args, sessionCallPhase) {
     }
   }
 
-  if (name === "schedule_callback") {
-    if (safeArgs.prospect_confirmed !== true) {
-      return {
-        success: false,
-        error: "The callback time must be confirmed by the customer."
-      };
-    }
-if (
-  call.result?.callback_confirmation_explicitly_answered !== true ||
-  call.result?.callback_confirmation_confirmed !== true
-) {
-  return {
-    success: false,
-    error:
-      "The customer must explicitly confirm the exact callback date, time, and timezone during the live conversation."
-  };
-}
-    const confirmedCallback = resolveConfirmedCallbackDateTime(safeArgs, call);
-    if (!confirmedCallback) {
-      return {
-        success: false,
-        error: "A confirmed local callback date, time, and timezone are required."
-      };
-    }
-    const {
-      callbackAt,
-      customerLocalDate,
-      customerLocalTime,
-      timeZone: timezone
-    } = confirmedCallback;
-    const isFuture = callbackAt > new Date();
-    console.log(JSON.stringify({
-      event: "callback_datetime_confirmed",
-      call_id: call.call_id,
-      customer_local_date: customerLocalDate,
-      customer_local_time: customerLocalTime,
-      timezone,
-      callback_at_utc: callbackAt.toISOString(),
-      is_future: isFuture
-    }));
-    if (!isFuture) {
-      return { success: false, error: "The callback time must be in the future." };
-    }
-    const reason =
-      cleanText(safeArgs.reason, 1000) || "Customer requested callback";
-    const primaryConcern = cleanText(safeArgs.primary_concern, 1200);
-    const holdReason = cleanText(safeArgs.hold_reason, 2000);
-    const discussionSummary = cleanText(
-      safeArgs.discussion_summary,
-      4000
-    );
-    const callbackOutcome =
-      primaryConcern || holdReason
-        ? "follow_up_scheduled"
-        : "specialist_callback";
-    if (call.result?.scheduled_second_call_dialed_at) {
-      return {
-        success: false,
-        error: "The explicitly scheduled second call has already been dialed."
-      };
-    }
-    const isApplicationCheckpoint = normalizeMondayKey(reason).includes(
-      "applicationcheckpoint"
-    );
-    if (
-  isApplicationCheckpoint &&
-  sessionCallPhase === "CALL_ONE" &&
-  call.result?.application_start_plan_explicitly_answered !== true
-) {
-  return {
-    success: false,
-    error:
-      "Call One must reach and answer the application-start planning question before scheduling Call Two."
-  };
-}
-
-if (
-  isApplicationCheckpoint &&
-  sessionCallPhase === "CALL_TWO" &&
-  (
-    call.result?.application_status_explicitly_answered !== true ||
-    call.result?.application_started_confirmed !== false
-  )
-) {
-  return {
-    success: false,
-    error:
-      "A Call Two application checkpoint may only be scheduled after the customer explicitly says the application was not started."
-  };
-}
-    const callbackAttemptType = isApplicationCheckpoint
-      ? "application_checkpoint"
-      : "customer_callback";
-    const scheduledSecondCallSourceId =
-      cleanText(call.result?.scheduled_second_call_source_call_id, 100) ||
-      call.call_id;
-    const scheduledSecondCallAppointmentId =
-      cleanText(call.result?.scheduled_second_call_appointment_id, 100) ||
-      stableHash(`${scheduledSecondCallSourceId}:scheduled_second_call`).slice(0, 40);
-    const leadIdentity = outboundLeadId(call);
-    const existingAppointment = leadIdentity
-      ? await pool.query(
-          `SELECT * FROM ai_calls
-           WHERE call_id <> $1
-             AND COALESCE(NULLIF(lead_id, ''), NULLIF(payload->>'lead_id', ''),
-                          NULLIF(case_id, ''), request_key) = $2
-             AND result->>'scheduled_second_call_source_call_id' = $3
-             AND result->>'outbound_call_reason' = 'scheduled_second_call'
-             AND callback_at > NOW()
-             AND sequence_status IN ('callback_scheduled', 'calling', 'completed')
-           ORDER BY updated_at DESC
-           LIMIT 1`,
-          [call.call_id, leadIdentity, scheduledSecondCallSourceId]
-        )
-      : { rows: [] };
-    const appointmentCall = existingAppointment.rows[0] || call;
-    const appointmentCallId = appointmentCall.call_id;
-
-    await pool.query(
-      `
-        UPDATE ai_calls
-        SET
-          callback_at = $2,
-          callback_timezone = $3,
-          callback_requested = TRUE,
-          next_attempt_at = $2,
-          sequence_status = 'callback_scheduled',
-          outcome = $5,
-          next_action = $4,
-          summary = COALESCE($6, summary),
-          updated_at = NOW()
-        WHERE call_id = $1
-      `,
-      [
-        appointmentCallId,
-        callbackAt,
-        timezone,
-        reason,
-        callbackOutcome,
-        discussionSummary
-      ]
-    );
-
-    await mergeCallResult(appointmentCallId, {
-      callback_at: callbackAt.toISOString(),
-      callback_local_date: customerLocalDate,
-      callback_local_time: customerLocalTime,
-      callback_timezone: timezone,
-      callback_confirmation_explicitly_answered: false,
-callback_confirmation_confirmed: false,
-      outbound_call_reason: "scheduled_second_call",
-      scheduled_second_call_source_call_id: scheduledSecondCallSourceId,
-      scheduled_second_call_appointment_id: scheduledSecondCallAppointmentId,
-      scheduled_second_call_purpose: callbackAttemptType,
-      ...(safeArgs.application_local_date
-        ? {
-            application_local_date: parseConfirmedLocalDate(
-              safeArgs.application_local_date,
-              timezone
-            )
-          }
-        : {}),
-      callback_reason: reason,
-      primary_concern: primaryConcern,
-      hold_reason: holdReason,
-      discussion_summary: discussionSummary,
-      follow_up_outcome: callbackOutcome,
-      preferred_contact_method:
-        cleanText(safeArgs.preferred_contact_method, 30) || "phone",
-      ...(isApplicationCheckpoint
-        ? { application_follow_up_at: callbackAt.toISOString() }
-        : {})
-    });
-
-    await pool.query(
-      `UPDATE call_attempts SET technical_status = 'canceled', completed_at = NOW(),
-       cancellation_reason = 'explicit_callback_rescheduled', updated_at = NOW()
-       WHERE call_id = $1 AND attempt_type = $2 AND completed_at IS NULL
-         AND technical_status IN ('pending', 'scheduled', 'created')
-         AND scheduled_at IS DISTINCT FROM $3`,
-      [appointmentCallId, callbackAttemptType, callbackAt]
-    );
-
-    await ensurePendingAttempt(appointmentCallId, {
-      attemptType: callbackAttemptType,
-      scheduledAt: callbackAt,
-      idempotencyKey: `${callbackAttemptType}:${scheduledSecondCallAppointmentId}:${callbackAt.toISOString()}`
-    });
-
-    await appendAction(appointmentCallId, {
-      action: name,
-      success: true,
-      session_call_phase: sessionCallPhase,
-      outbound_call_reason: "scheduled_second_call",
-      scheduled_second_call_source_call_id: scheduledSecondCallSourceId,
-      scheduled_second_call_appointment_id: scheduledSecondCallAppointmentId,
-      callback_at: callbackAt.toISOString(),
-      customer_local_date: customerLocalDate,
-      customer_local_time: customerLocalTime,
-      timezone,
-      reason,
-      primary_concern: primaryConcern,
-      hold_reason: holdReason,
-      outcome: callbackOutcome
-    });
-
-    queueMondaySync(call.call_id, "callback_scheduled");
-
-    return {
-      success: true,
-      callback_at: callbackAt.toISOString(),
-      timezone,
-      outcome: callbackOutcome,
-      sequence_status: "callback_scheduled"
-    };
-  }
-
   if (name === "create_specialist_handoff") {
     const handoff = {
       reason: cleanText(safeArgs.reason, 1000),
       priority: cleanText(safeArgs.priority, 30) || "normal",
-      summary: cleanText(safeArgs.summary, 4000),
-      requested_callback_at: cleanText(safeArgs.requested_callback_at, 100)
+      summary: cleanText(safeArgs.summary, 4000)
     };
 
     await pool.query(
@@ -6626,7 +4492,6 @@ callback_confirmation_confirmed: false,
           next_action = 'DPA specialist follow-up',
           summary = COALESCE($2, summary),
           result = result || $3::jsonb,
-          next_attempt_at = NULL,
           updated_at = NOW()
         WHERE call_id = $1
       `,
@@ -6662,7 +4527,7 @@ callback_confirmation_confirmed: false,
       return {
         success: false,
         transfer_status: "specialist_unavailable",
-        fallback: "Create a specialist handoff and schedule a callback."
+        fallback: "Create a specialist handoff."
       };
     }
 
@@ -6671,7 +4536,7 @@ callback_confirmation_confirmed: false,
       return {
         success: false,
         transfer_status: "transfer_failed",
-        fallback: "Create a specialist handoff and schedule a callback."
+        fallback: "Create a specialist handoff."
       };
     }
 
@@ -6695,7 +4560,6 @@ callback_confirmation_confirmed: false,
             sequence_status = 'active',
             priority = $2,
             next_action = 'Live specialist transfer',
-            next_attempt_at = NULL,
             updated_at = NOW()
           WHERE call_id = $1
         `,
@@ -6722,7 +4586,7 @@ callback_confirmation_confirmed: false,
       return {
         success: false,
         transfer_status: "transfer_failed",
-        fallback: "Create a specialist handoff and schedule a callback."
+        fallback: "Create a specialist handoff."
       };
     }
   }
@@ -6758,7 +4622,6 @@ callback_confirmation_confirmed: false,
             WHEN $2 OR $3 OR $4 THEN 'suppressed'
             ELSE 'active'
           END,
-          next_attempt_at = NULL,
           next_action = $6,
           awaiting_customer_response = FALSE,
           pending_question_type = NULL,
@@ -6809,103 +4672,28 @@ callback_confirmation_confirmed: false,
     const summary = cleanText(safeArgs.summary, 4000);
     const stopSequence = safeArgs.stop_sequence === true;
     const pauseSequence = safeArgs.pause_sequence === true;
-    const requestedNext = cleanText(safeArgs.requested_next_call_at, 100);
     const completionValidation = terminalCompletionValidation(
       call,
       sessionCallPhase
     );
-
-    const hardTerminalOutcome = [
-      "qualified",
-      "hot_transfer",
-      "specialist_handoff",
-      "dti_calculator_sent",
-      "agent_notified",
-      "not_interested",
-      "wrong_number",
-      "opt_out"
-    ].includes(outcome);
-
-    let callbackAt = call.callback_at ? new Date(call.callback_at) : null;
-    if (callbackAt && Number.isNaN(callbackAt.getTime())) {
-      callbackAt = null;
-    }
-
-    let nextAttemptAt = null;
-    let sequenceStatus = stopSequence ? "completed" : "waiting_retry";
-
-    if (pauseSequence) {
-      sequenceStatus = "paused";
-    }
-
-    if (requestedNext) {
-      const parsed = new Date(requestedNext);
-      if (!Number.isNaN(parsed.getTime()) && parsed > new Date()) {
-        nextAttemptAt = parsed;
-        callbackAt = parsed;
-        sequenceStatus = [
-          "follow_up_scheduled",
-          "specialist_callback",
-          "nurture"
-        ].includes(outcome)
-          ? "callback_scheduled"
-          : "scheduled";
-      }
-    }
-
-    const hasFutureCallback = Boolean(
-      callbackAt && callbackAt > new Date()
-    );
-
-    if (hasFutureCallback) {
-      nextAttemptAt = callbackAt;
-      sequenceStatus = "callback_scheduled";
-    }
-
-    if (sequenceStatus === "completed" && (await sequenceHasUnresolvedWork(call.call_id))) {
-      sequenceStatus = "active";
-      nextAttemptAt = null;
-    }
-
-    const clearCallback = hardTerminalOutcome && !hasFutureCallback;
+    const sequenceStatus = pauseSequence ? "paused" : "completed";
 
     await pool.query(
       `
         UPDATE ai_calls
-        SET
-          outcome = $2,
-          next_action = $3,
-          summary = $4,
-          sequence_status = $5,
-          next_attempt_at = $6,
-          callback_at = CASE
-            WHEN $8::BOOLEAN THEN NULL
-            WHEN $7::TIMESTAMPTZ IS NOT NULL THEN $7::TIMESTAMPTZ
-            ELSE callback_at
-          END,
-          callback_requested = CASE
-            WHEN $8::BOOLEAN THEN FALSE
-            WHEN $5 = 'callback_scheduled' THEN TRUE
-            ELSE callback_requested
-          END,
-          awaiting_customer_response = FALSE,
-          pending_question_type = NULL,
-          pending_question_text = NULL,
-          question_asked_at = NULL,
-          response_reminder_count = 0,
-          updated_at = NOW()
+        SET outcome = $2,
+            next_action = $3,
+            summary = $4,
+            sequence_status = $5,
+            awaiting_customer_response = FALSE,
+            pending_question_type = NULL,
+            pending_question_text = NULL,
+            question_asked_at = NULL,
+            response_reminder_count = 0,
+            updated_at = NOW()
         WHERE call_id = $1
       `,
-      [
-        call.call_id,
-        outcome,
-        nextAction,
-        summary,
-        sequenceStatus,
-        nextAttemptAt,
-        callbackAt,
-        clearCallback
-      ]
+      [call.call_id, outcome, nextAction, summary, sequenceStatus]
     );
 
     if (call.last_attempt_id) {
@@ -6926,13 +4714,8 @@ callback_confirmation_confirmed: false,
       stop_sequence_requested: stopSequence,
       pause_sequence_requested: pauseSequence,
       actual_sequence_status: sequenceStatus,
-      callback_preserved: sequenceStatus === "callback_scheduled",
-      completion_validation: completionValidation,
-      requested_next_call_at: nextAttemptAt
-        ? nextAttemptAt.toISOString()
-        : null
+      completion_validation: completionValidation
     });
-
     await appendAction(call.call_id, {
       action: name,
       success: true,
@@ -6941,22 +4724,17 @@ callback_confirmation_confirmed: false,
       pause_sequence_requested: pauseSequence,
       actual_sequence_status: sequenceStatus,
       session_call_phase: sessionCallPhase,
-      completion_validation: completionValidation,
-      next_attempt_at: nextAttemptAt ? nextAttemptAt.toISOString() : null
+      completion_validation: completionValidation
     });
-
     queueMondaySync(call.call_id, `complete_call_${outcome}`);
 
     return {
       success: true,
       outcome,
       sequence_status: sequenceStatus,
-      completion_validation: completionValidation,
-      callback_preserved: sequenceStatus === "callback_scheduled",
-      next_attempt_at: nextAttemptAt ? nextAttemptAt.toISOString() : null
+      completion_validation: completionValidation
     };
   }
-
   return { success: false, error: `Unknown tool: ${name}` };
 }
 
@@ -6967,8 +4745,6 @@ app.get("/", (req, res) => {
     worker: "Daisy — Doug's DPA assistant",
     realtime_model: OPENAI_REALTIME_MODEL,
     voice: OPENAI_VOICE,
-    cadence: DOUG_CONFIG.cadenceVersion,
-    scheduler: CALL_SCHEDULER_ENABLED ? "enabled" : "disabled",
     monday_sync: MONDAY_SYNC_ENABLED ? "enabled" : "disabled",
     monday_adapter: DOUG_CONFIG.mondayAdapterVersion
   });
@@ -6987,7 +4763,6 @@ app.get("/health", async (req, res) => {
       twilio: Boolean(
         TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM_NUMBER
       ),
-      scheduler: CALL_SCHEDULER_ENABLED,
       consent_enforcement: ENFORCE_CALL_CONSENT,
       monday: {
         requested: MONDAY_SYNC_REQUESTED,
@@ -7096,10 +4871,51 @@ app.post(
   authenticateHelux,
   async (req, res, next) => {
     try {
-      const payload = req.body || {};
+      const incoming = req.body || {};
+      const acceptedLeadFields = [
+        "case_id",
+        "lead_id",
+        "phone",
+        "timezone",
+        "consent_confirmed",
+        "ai_voice_consent",
+        "consent_status",
+        "consent_timestamp",
+        "consent_source",
+        "first_name",
+        "last_name",
+        "name",
+        "customer_name",
+        "estimated_dpa",
+        "household_income",
+        "income",
+        "employment_history",
+        "employment",
+        "tax_history_submitted",
+        "tax_return_history",
+        "taxes_filed",
+        "readiness_score",
+        "has_lender",
+        "has_realtor",
+        "realtor_status",
+        "applied_with_lender",
+        "applied_other_lender",
+        "purchase_timeframe",
+        "time_frame",
+        "timeframe",
+        "priority",
+        "human_owner_id",
+        "owner_id",
+        "app_started_confirmation",
+        "application_status"
+      ];
+      const payload = Object.fromEntries(
+        acceptedLeadFields
+          .filter((field) => incoming[field] !== undefined)
+          .map((field) => [field, incoming[field]])
+      );
       const requestKey = callRequestKey(payload);
       const phone = normalizePhone(payload.phone);
-
       if (!phone) {
         throw new HttpError(422, "A valid phone number is required.");
       }
@@ -7114,8 +4930,6 @@ app.post(
           status: existing.status,
           sequence_status: existing.sequence_status,
           attempts_used: existing.attempts,
-          max_attempts: existing.max_attempts,
-          next_attempt_at: existing.next_attempt_at,
           twilio_call_sid: existing.twilio_call_sid,
           monday_item_id: existing.monday_item_id
         });
@@ -7126,22 +4940,13 @@ app.post(
       const timezone = normalizeTimezone(payload.timezone);
       const consentConfirmed = confirmedConsent(payload);
       const consentStatus = consentConfirmed ? "confirmed" : "unverified";
-      const forceCallNow =
-        payload.force_call_now === true || payload.test_mode === true;
-
-      if (ENFORCE_CALL_CONSENT && !consentConfirmed && !forceCallNow) {
+      if (ENFORCE_CALL_CONSENT && !consentConfirmed) {
         throw new HttpError(422, "Confirmed AI voice consent is required.");
       }
-
-      const maxAttempts = Math.min(
-        6,
-        Math.max(1, Number(payload.max_attempts || DOUG_CONFIG.maxAttempts))
-      );
 
       const consentTimestamp = payload.consent_timestamp
         ? new Date(payload.consent_timestamp)
         : null;
-
       const safeConsentTimestamp =
         consentTimestamp && !Number.isNaN(consentTimestamp.getTime())
           ? consentTimestamp
@@ -7151,15 +4956,14 @@ app.post(
         `
           INSERT INTO ai_calls (
             call_id, request_key, case_id, lead_id, phone, status,
-            sequence_status, stream_token, payload, max_attempts,
+            sequence_status, stream_token, payload,
             timezone, consent_status, consent_timestamp, consent_source,
             agent_version, prompt_version, tool_version, knowledge_version,
-            routing_version, cadence_version, priority, human_owner_id
+            routing_version, priority, human_owner_id
           )
           VALUES (
             $1, $2, $3, $4, $5, 'created', 'ready', $6, $7::jsonb,
-            $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, $20
+            $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
           )
           RETURNING *
         `,
@@ -7174,7 +4978,6 @@ app.post(
             ...payload,
             outbound_call_reason: "initial_lead_call"
           }),
-          maxAttempts,
           timezone,
           consentStatus,
           safeConsentTimestamp,
@@ -7184,7 +4987,6 @@ app.post(
           DOUG_CONFIG.toolVersion,
           DOUG_CONFIG.knowledgeVersion,
           DOUG_CONFIG.routingVersion,
-          DOUG_CONFIG.cadenceVersion,
           cleanText(payload.priority, 30) || "normal",
           cleanText(payload.human_owner_id || payload.owner_id, 100)
         ]
@@ -7201,10 +5003,7 @@ app.post(
             payload.app_started_confirmation ?? payload.application_status ?? null,
           time_frame: payload.time_frame ?? payload.timeframe ?? null,
           interest_level: null,
-          tentative_meeting_availability:
-            payload.tentative_meeting_availability ?? null,
           application_link_sent: false,
-          application_follow_up_at: null,
           outbound_call_reason: "initial_lead_call",
           initial_call_source_lead_id:
             cleanText(payload.lead_id || payload.case_id, 150) || requestKey
@@ -7212,43 +5011,14 @@ app.post(
       );
       queueMondaySync(call.call_id, "sequence_created");
 
-      const now = new Date();
-      const shouldDialNow = forceCallNow || insideOperatingWindow(now, timezone);
-      const nextAttemptAt = shouldDialNow
-        ? now
-        : nextValidWindow(
-            timezone,
-            now,
-            DOUG_CONFIG.preferredWindows.morning,
-            0
-          );
-      await pool.query(
-        `UPDATE ai_calls SET sequence_status = 'scheduled', next_attempt_at = $2,
-         completed_at = NULL, updated_at = NOW() WHERE call_id = $1`,
-        [call.call_id, nextAttemptAt]
-      );
-      const firstAttempt = await ensurePendingAttempt(call.call_id, {
+      const firstAttempt = await createCallAttempt(call.call_id, {
         attemptType: "initial_lead_call",
-        scheduledAt: nextAttemptAt,
         idempotencyKey: `initial_lead_call:${call.call_id}:1`
       });
-
-      if (!shouldDialNow) {
-        queueMondaySync(call.call_id, "sequence_scheduled");
-
-        return res.status(202).json({
-          success: true,
-          duplicate: false,
-          call_id: call.call_id,
-          status: "scheduled",
-          sequence_status: "scheduled",
-          next_attempt_at: nextAttemptAt.toISOString(),
-          monday_sync_queued: MONDAY_SYNC_ENABLED
-        });
+      if (!firstAttempt) {
+        throw new HttpError(409, "The initial call could not be created.");
       }
-
       const twilioCall = await placeTwilioCall(call, {
-        force: forceCallNow,
         attemptId: firstAttempt.attempt_id,
         source: "initial",
         callReason: "initial_lead_call"
@@ -7261,7 +5031,6 @@ app.post(
         status: twilioCall.status || "queued",
         sequence_status: "calling",
         attempts_used: 1,
-        max_attempts: call.max_attempts,
         twilio_call_sid: twilioCall.sid,
         monday_sync_queued: MONDAY_SYNC_ENABLED
       });
@@ -7270,95 +5039,6 @@ app.post(
     }
   }
 );
-
-app.post(
-  "/api/v1/calls/:callId/retry",
-  authenticateHelux,
-  async (req, res, next) => {
-    try {
-      const call = await getCallById(req.params.callId);
-      if (!call) throw new HttpError(404, "Call not found.");
-
-      logOutboundCallRejected(
-        call,
-        resolveOutboundCallReason(call, null),
-        "missing_permitted_call_reason"
-      );
-      throw new HttpError(
-        409,
-        "Generic retry calls are disabled. Use a confirmed scheduled second call."
-      );
-
-      if (!terminalCallStatus(call.status)) {
-        throw new HttpError(
-          409,
-          `Call cannot be retried while status is ${call.status}.`
-        );
-      }
-
-      if (callHasSuccessfulCompleteCall(call)) {
-        throw new HttpError(409, "A normally completed call cannot be retried.");
-      }
-
-      const retryResult = await pool.query(
-        `
-          UPDATE ai_calls
-          SET
-            sequence_status = 'ready',
-            last_error = NULL,
-            completed_at = NULL,
-            next_attempt_at = NOW(),
-            updated_at = NOW()
-          WHERE call_id = $1
-            AND status <> 'completed'
-            AND sequence_status NOT IN ('completed', 'suppressed', 'paused')
-            AND do_not_call = FALSE
-            AND wrong_number = FALSE
-            AND invalid_number = FALSE
-          RETURNING *
-        `,
-        [call.call_id]
-      );
-      if (!retryResult.rowCount) {
-        throw new HttpError(409, "Call is not eligible for a manual retry.");
-      }
-
-      queueMondaySync(call.call_id, "manual_retry_ready");
-      const refreshed = retryResult.rows[0];
-      const retryAttempt = await ensurePendingAttempt(call.call_id, {
-        attemptType: "cadence",
-        scheduledAt: refreshed.next_attempt_at,
-        idempotencyKey: `manual_retry:${call.call_id}:${Date.now()}`
-      });
-      if (!retryAttempt) {
-        throw new HttpError(409, "No retry attempt is available.");
-      }
-      await pool.query(
-        `UPDATE call_attempts SET scheduled_at = $2, updated_at = NOW()
-         WHERE attempt_id = $1
-           AND completed_at IS NULL
-           AND technical_status IN ('pending', 'scheduled', 'created')`,
-        [retryAttempt.attempt_id, refreshed.next_attempt_at]
-      );
-      const twilioCall = await placeTwilioCall(refreshed, {
-        force: req.body && req.body.force === true,
-        attemptId: retryAttempt.attempt_id,
-        source: "initial"
-      });
-
-      res.json({
-        success: true,
-        call_id: call.call_id,
-        status: twilioCall.status || "queued",
-        twilio_call_sid: twilioCall.sid,
-        attempts: Number(call.attempts || 0) + 1
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
 app.post(
   "/api/v1/calls/:callId/sync-monday",
   authenticateHelux,
@@ -7418,9 +5098,6 @@ app.get(
           sequence_status: call.sequence_status,
           twilio_call_sid: call.twilio_call_sid,
           attempts_used: call.attempts,
-          max_attempts: call.max_attempts,
-          next_attempt_at: call.next_attempt_at,
-          callback_at: call.callback_at,
           timezone: call.timezone,
           current_state: call.current_state,
           next_state: call.next_state,
@@ -7434,8 +5111,27 @@ app.get(
           next_action: call.next_action,
           summary: call.summary,
           transcript: call.transcript,
-          actions: call.actions,
-          result: call.result,
+          result: {
+            purchase_timeline_detail: call.result?.purchase_timeline_detail,
+            time_frame: call.result?.time_frame,
+            interest_level: call.result?.interest_level,
+            applied_with_lender: call.result?.applied_with_lender,
+            has_realtor: call.result?.has_realtor,
+            purchase_area: call.result?.purchase_area,
+            preliminary_dti_percent: call.result?.preliminary_dti_percent,
+            preliminary_dti_classification:
+              call.result?.preliminary_dti_classification,
+            application_link_sent: call.result?.application_link_sent,
+            final_outcome: call.result?.final_outcome,
+            next_action: call.result?.next_action,
+            summary: call.result?.summary,
+            normal_completion_recorded:
+              call.result?.normal_completion_recorded,
+            final_hangup_requested: call.result?.final_hangup_requested,
+            final_hangup_completed: call.result?.final_hangup_completed,
+            completion_reason: call.result?.completion_reason,
+            contact_restriction: call.result?.contact_restriction
+          },
           last_error: call.last_error,
           monday_item_id: call.monday_item_id,
           monday_group_id: call.monday_group_id,
@@ -7445,7 +5141,26 @@ app.get(
           started_at: call.started_at,
           answered_at: call.answered_at,
           completed_at: call.completed_at,
-          attempt_records: attempts
+          attempt_records: attempts.map((attempt) => ({
+            attempt_id: attempt.attempt_id,
+            attempt_number: attempt.attempt_number,
+            call_leg: attempt.call_leg,
+            dialed_at: attempt.dialed_at,
+            answered_at: attempt.answered_at,
+            completed_at: attempt.completed_at,
+            twilio_call_sid: attempt.twilio_call_sid,
+            technical_status: attempt.technical_status,
+            business_outcome: attempt.business_outcome,
+            answered_by: attempt.answered_by,
+            voicemail_left: attempt.voicemail_left,
+            sms_sent: attempt.sms_sent,
+            duration_seconds: attempt.duration_seconds,
+            disconnect_reason: attempt.disconnect_reason,
+            summary: attempt.summary,
+            last_error: attempt.last_error,
+            created_at: attempt.created_at,
+            updated_at: attempt.updated_at
+          }))
         }
       });
     } catch (error) {
@@ -7605,7 +5320,7 @@ app.post("/api/v1/twilio/status", async (req, res, next) => {
     }
 
     if (terminalCallStatus(status)) {
-      await finalizeCadenceAfterTerminal(call.call_id, status);
+      await finalizeAfterTerminal(call.call_id, status);
       const finalCall = await getCallById(call.call_id);
       queueMondaySync(call.call_id, `twilio_terminal_${status}`);
       void notifyHelux(finalCall);
@@ -7641,7 +5356,7 @@ mediaServer.on("connection", (twilioSocket) => {
   let finalPlaybackMarkName = "";
   let finalHangupInProgress = false;
   let finalHangupCompleted = false;
-  let finalHangupAttemptCount = 0; 
+  let finalHangupAttemptCount = 0;
   let finalHangupFallbackTimer = null;
   let finalAbsoluteHangupTimer = null;
   let activeTwilioCallSid = "";
@@ -8047,427 +5762,12 @@ mediaServer.on("connection", (twilioSocket) => {
       }));
       call = (await getCallById(call.call_id)) || call;
 
-const customerName =
-  cleanText(
-    call?.payload?.first_name ||
-      call?.payload?.customer_name ||
-      call?.payload?.name,
-    160
-  ) || "there";
-
-refreshActiveRealtimeInstructions();
-await endLocalWaitingState("purchase_area_confirmed");
-
-requestAssistantResponse({
-  queueIfBusy: true,
-  response: {
-    output_modalities: ["audio"],
-    instructions: `Say exactly: ${JSON.stringify(
-      `Well, that's everything for this call, and now you're one step closer to becoming a homeowner in ${confirmedPurchaseArea}. Your next step is to start the application so I can follow up with you about its status, review your debt-to-income ratio, and explore potential program options. ${customerName}, do you think you'll have time to start the application today?`
-    )} Say nothing else.`
-  }
-});
-
-return;
-    }
-if (pendingQuestionType === "application_start_plan") {
-  const explicitAnswer = normalizeExplicitYesNo(transcript);
-
-  if (explicitAnswer === null) {
-    requestAssistantResponse({
-      queueIfBusy: true,
-      allowWhileAwaiting: true,
-      preservePendingQuestion: true,
-      response: {
-        output_modalities: ["audio"],
-        instructions:
-          'Ask exactly: "Was that a yes or a no?" Say nothing else.'
-      }
-    });
-    return;
-  }
-
-  await mergeCallResult(call.call_id, {
-    application_start_plan_explicitly_answered: true,
-    application_start_today_confirmed: explicitAnswer,
-    callback_confirmation_explicitly_answered: false,
-    callback_confirmation_confirmed: false
-  });
-
-  call = (await getCallById(call.call_id)) || call;
-  await endLocalWaitingState("explicit_application_start_plan_answer");
-
-  requestAssistantResponse({
-    queueIfBusy: true,
-    response: {
-      output_modalities: ["audio"],
-      instructions: explicitAnswer
-        ? 'Ask exactly: "Excellent. What time zone are you in and what tomorrow would be best for our second call?" Say nothing else.'
-        : 'Ask exactly: "No problem. What day do you think you will have time to start it?" Say nothing else.'
-    }
-  });
-
-  return;
-    }
-if (pendingQuestionType === "application_started") {
-  const explicitAnswer = normalizeApplicationStartedAnswer(transcript);
-
-  if (explicitAnswer === null) {
-    const clarificationUsed =
-      call.result?.application_status_clarification_used === true;
-
-    if (!clarificationUsed) {
-      await mergeCallResult(call.call_id, {
-        application_status_clarification_used: true
-      });
-
-      call = (await getCallById(call.call_id)) || call;
-
-      requestAssistantResponse({
-        queueIfBusy: true,
-        allowWhileAwaiting: true,
-        preservePendingQuestion: true,
-        response: {
-          output_modalities: ["audio"],
-          instructions:
-            'Ask exactly: "Was that a yes or a no?" Say nothing else.'
-        }
-      });
-
+      refreshActiveRealtimeInstructions();
+      await endLocalWaitingState("purchase_area_confirmed");
+      requestAssistantResponse({ queueIfBusy: true });
       return;
     }
 
-    await endLocalWaitingState(
-      "application_status_unclear_after_clarification"
-    );
-
-    requestAssistantResponse({
-      queueIfBusy: true,
-      response: {
-        output_modalities: ["audio"],
-        instructions:
-          'Say exactly: "No problem. We can come back to that. Would you like me to help you calculate a preliminary debt-to-income estimate now?" Say nothing else.'
-      }
-    });
-
-    return;
-  }
-
-  if (sessionCallPhase !== "CALL_TWO") {
-    sessionCallPhase = "CALL_TWO";
-
-    await appendAction(call.call_id, {
-      action: "session_call_phase_recovered",
-      success: true,
-      recovered_phase: "CALL_TWO",
-      reason: "explicit_application_status_question"
-    });
-
-    refreshActiveRealtimeInstructions();
-  }
-
-  await mergeCallResult(call.call_id, {
-    application_status_explicitly_answered: true,
-    application_started_confirmed: explicitAnswer,
-    app_started_confirmation: explicitAnswer ? "Yes" : "No",
-    application_status_clarification_used: false
-  });
-
-  call = (await getCallById(call.call_id)) || call;
-  refreshActiveRealtimeInstructions();
-
-  await endLocalWaitingState(
-    "explicit_application_status_answer"
-  );
-
-  requestAssistantResponse({
-    queueIfBusy: true,
-    response: {
-      output_modalities: ["audio"],
-      instructions: explicitAnswer
-        ? 'Say exactly: "Excellent. That’s great to hear. Before I connect you with the next step, let’s review your preliminary debt-to-income ratio. Do you have a few minutes to do that now?" Say nothing else.'
-        : 'Say exactly: "No worries. One of the main things that can affect your homebuying options is your debt-to-income ratio. Would you like me to help you calculate a preliminary DTI estimate now?" Say nothing else.'
-    }
-  });
-
-  return;
-}
-    if (pendingQuestionType === "callback_time") {
-  const answerText = cleanText(transcript, 500);
-  const normalizedPrompt = normalizeMondayKey(pendingQuestionText);
-
-  const applicationStartDateOnly =
-    /whatday.*(?:startit|start.*application)/.test(normalizedPrompt);
-
-  if (applicationStartDateOnly) {
-    await mergeCallResult(call.call_id, {
-      application_start_date_answer: answerText,
-      callback_confirmation_explicitly_answered: false,
-      callback_confirmation_confirmed: false
-    });
-
-    call = (await getCallById(call.call_id)) || call;
-    await endLocalWaitingState("application_start_date_collected");
-
-    requestAssistantResponse({
-      queueIfBusy: true,
-      response: {
-        output_modalities: ["audio"],
-        instructions:
-          'Ask exactly: "And what time zone are you in—Eastern, Central, Mountain, or Pacific—and what time would be best for me to follow up with you the following day?" Say nothing else.'
-      }
-    });
-
-    return;
-  }
-const previousCallbackAnswer =
-  cleanText(call.result?.callback_datetime_answer, 500);
-
-const combinedAnswer = [previousCallbackAnswer, answerText]
-  .filter(Boolean)
-  .join(" ");
-
-const savedTimezone =
-  cleanText(call.callback_timezone, 100) ||
-  cleanText(call.result?.callback_timezone, 100);
-
-const timeZone = resolveCustomerTimezone(
-  combinedAnswer,
-  savedTimezone
-);
-
-const customerLocalTime =
-  parseConfirmedLocalTime(answerText) ||
-  parseConfirmedLocalTime(previousCallbackAnswer);
-
-await mergeCallResult(call.call_id, {
-  callback_datetime_answer: combinedAnswer,
-  ...(timeZone ? { callback_timezone: timeZone } : {}),
-  callback_confirmation_explicitly_answered: false,
-  callback_confirmation_confirmed: false
-});
-
-call = (await getCallById(call.call_id)) || call;
-await endLocalWaitingState("callback_datetime_collected");
-
-if (!timeZone) {
-  requestAssistantResponse({
-    queueIfBusy: true,
-    response: {
-      output_modalities: ["audio"],
-      instructions:
-        'Ask exactly: "What time zone are you in—Eastern, Central, Mountain, or Pacific?" Say nothing else.'
-    }
-  });
-  return;
-}
-
-if (!customerLocalTime) {
-  requestAssistantResponse({
-    queueIfBusy: true,
-    response: {
-      output_modalities: ["audio"],
-      instructions:
-        'Ask exactly: "What time would you like me to call you?" Say nothing else.'
-    }
-  });
-  return;
-}
-
-const applicationStartDate =
-  cleanText(call.result?.application_start_date_answer, 500);
-
-const parsedApplicationDate = applicationStartDate
-  ? parseConfirmedLocalDate(applicationStartDate, timeZone)
-  : null;
-
-const customerLocalDate = parsedApplicationDate
-  ? addDaysToLocalDateText(parsedApplicationDate, 1)
-  : parseConfirmedLocalDate(
-      `${pendingQuestionText || ""} ${combinedAnswer}`,
-      timeZone
-    );
-
-if (!customerLocalDate) {
-  requestAssistantResponse({
-    queueIfBusy: true,
-    response: {
-      output_modalities: ["audio"],
-      instructions:
-        'Ask exactly: "What date would you like me to call you?" Say nothing else.'
-    }
-  });
-  return;
-}
-
-const callbackAt = localDateTimeToUtc(
-  customerLocalDate,
-  customerLocalTime,
-  timeZone
-);
-
-if (!callbackAt || callbackAt <= new Date()) {
-  requestAssistantResponse({
-    queueIfBusy: true,
-    response: {
-      output_modalities: ["audio"],
-      instructions:
-        'Ask exactly: "That time has already passed. What future time would work better?" Say nothing else.'
-    }
-  });
-  return;
-}
-
-const callbackReason =
-  applicationStartDate ||
-  call.result?.application_start_plan_explicitly_answered === true
-    ? "Application checkpoint"
-    : "Customer requested a better time";
-
-await mergeCallResult(call.call_id, {
-  callback_at: callbackAt.toISOString(),
-  callback_local_date: customerLocalDate,
-  callback_local_time: customerLocalTime,
-  callback_timezone: timeZone,
-  callback_reason: callbackReason,
-  callback_confirmation_explicitly_answered: false,
-  callback_confirmation_confirmed: false
-});
-
-call = (await getCallById(call.call_id)) || call;
-refreshActiveRealtimeInstructions();
-
-const spokenAppointment = formatCustomerCallbackTime(
-  callbackAt,
-  timeZone
-);
-
-requestAssistantResponse({
-  queueIfBusy: true,
-  response: {
-    output_modalities: ["audio"],
-    instructions: `Ask exactly: ${JSON.stringify(
-      `I have us scheduled to speak on ${spokenAppointment}. Is that correct?`
-    )} Say nothing else.`
-  }
-});
-
-return;
-}
-  if (pendingQuestionType === "callback_confirmation") {
-  const explicitAnswer = normalizeExplicitYesNo(transcript);
-
-  if (explicitAnswer === null) {
-    requestAssistantResponse({
-      queueIfBusy: true,
-      allowWhileAwaiting: true,
-      preservePendingQuestion: true,
-      response: {
-        output_modalities: ["audio"],
-        instructions:
-          'Ask exactly: "Was that a yes or a no?" Say nothing else.'
-      }
-    });
-
-    return;
-  }
-
-  await mergeCallResult(call.call_id, {
-    callback_confirmation_explicitly_answered: true,
-    callback_confirmation_confirmed: explicitAnswer
-  });
-
-  await endLocalWaitingState(
-    "explicit_callback_confirmation_answer"
-  );
-
-  call = (await getCallById(call.call_id)) || call;
-
-  if (!explicitAnswer) {
-    requestAssistantResponse({
-      queueIfBusy: true,
-      response: {
-        output_modalities: ["audio"],
-        instructions:
-          'Ask exactly: "No problem. What date and time would work better for you?" Say nothing else.'
-      }
-    });
-
-    return;
-  }
-
-  const callbackAt =
-    cleanText(call.result?.callback_at, 100);
-
-  const customerLocalDate =
-    cleanText(call.result?.callback_local_date, 100);
-
-  const customerLocalTime =
-    cleanText(call.result?.callback_local_time, 100);
-
-  const timezone = resolveCustomerTimezone(
-    call.result?.callback_timezone,
-    call.callback_timezone
-  );
-
-  const reason =
-    cleanText(call.result?.callback_reason, 1000) ||
-    "Application checkpoint";
-
-  const scheduleResult = await executeDougTool(
-    call,
-    "schedule_callback",
-    {
-      callback_at: callbackAt,
-      customer_local_date: customerLocalDate,
-      customer_local_time: customerLocalTime,
-      timezone,
-      reason,
-      prospect_confirmed: true,
-      discussion_summary:
-        cleanText(call.summary, 4000) ||
-        cleanText(call.result?.discussion_summary, 4000)
-    },
-    sessionCallPhase
-  );
-
-  if (!scheduleResult?.success) {
-    console.error(JSON.stringify({
-      event: "confirmed_callback_schedule_failed",
-      call_id: call.call_id,
-      error: scheduleResult?.error || "unknown"
-    }));
-
-    requestAssistantResponse({
-      queueIfBusy: true,
-      response: {
-        output_modalities: ["audio"],
-        instructions:
-          "Say exactly: \"I'm sorry, I couldn't complete the scheduling. Let's verify the date and time one more time.\" Say nothing else."
-      }
-    });
-
-    return;
-  }
-
-  const confirmedAppointment =
-    formatCustomerCallbackTime(
-      scheduleResult.callback_at,
-      scheduleResult.timezone || timezone
-    );
-
-  requestAssistantResponse({
-    queueIfBusy: true,
-    response: {
-      output_modalities: ["audio"],
-      instructions: `Say exactly: ${JSON.stringify(
-        `Excellent. I have us scheduled to speak on ${confirmedAppointment}.`
-      )} Then use complete_call with outcome "follow_up_scheduled", next_action "Complete the application before Call Two", a concise summary, stop_sequence false, and pause_sequence false.`
-    }
-  });
-
-  return;
-}
     const professionalAnswerKey = ["has_realtor", "applied_with_lender"].includes(
       String(pendingQuestionType || "")
     )
@@ -8743,13 +6043,7 @@ return;
       output?.success === true &&
       output?.intent === "complete_call" &&
       output?.error === null;
-    const scheduleCallbackSucceeded =
-      name === "schedule_callback" &&
-      output?.success === true &&
-      output?.intent === "schedule_callback" &&
-      output?.error === null;
-    const terminalActionSucceeded =
-      completeCallSucceeded || scheduleCallbackSucceeded;
+    const terminalActionSucceeded = completeCallSucceeded;
 
     if (terminalActionSucceeded) {
       beginNormalCallTermination(name);
@@ -8757,21 +6051,14 @@ return;
       await pool.query(
         `
           UPDATE ai_calls
-          SET
-            next_attempt_at = CASE
-              WHEN callback_requested AND callback_at > NOW() THEN callback_at
-              ELSE NULL
-            END,
-            current_state = CASE
+          SET current_state = CASE
               WHEN current_state IN ('reconnect_pending', 'reconnect_in_progress')
                 THEN 'completed'
               ELSE current_state
             END,
             last_error = NULL,
             result = result
-              - 'unexpected_disconnect_reconnect_scheduled'
               - 'unexpected_disconnect_at'
-              - 'reconnect_at'
               - 'unexpected_disconnect_reconnect_attempted'
               - 'unexpected_disconnect_reconnect_completed',
             updated_at = NOW()
@@ -8786,9 +6073,9 @@ return;
               cancellation_reason = 'normal_call_completion', updated_at = NOW()
           WHERE call_id = $1
             AND attempt_id IS DISTINCT FROM $2
-            AND attempt_type IN ('cadence', 'disconnect_reconnect')
+            AND attempt_type = 'disconnect_reconnect'
             AND completed_at IS NULL
-            AND technical_status IN ('pending', 'scheduled', 'created')
+            AND technical_status IN ('pending', 'created')
         `,
         [call.call_id, call.last_attempt_id]
       );
@@ -9379,8 +6666,8 @@ return;
           !normalCompletionRecorded &&
           !finalHangupCompleted
         ) {
-          void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
-            console.error("Failed to schedule disconnect reconnect:", error);
+          void reconnectAfterUnexpectedDisconnect(call.call_id).catch((error) => {
+            console.error("Failed to reconnect after disconnect:", error);
           });
         } else if (call) {
           console.log(JSON.stringify({
@@ -9423,8 +6710,8 @@ return;
       !normalCompletionRecorded &&
       !finalHangupCompleted
     ) {
-      void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
-        console.error("Failed to schedule disconnect reconnect:", error);
+      void reconnectAfterUnexpectedDisconnect(call.call_id).catch((error) => {
+        console.error("Failed to reconnect after disconnect:", error);
       });
     } else if (call) {
       console.log(JSON.stringify({
@@ -9463,227 +6750,6 @@ server.on("upgrade", (request, socket, head) => {
   }
 });
 
-function logSchedulingDecision(call, attempt, decision, reason, currentTime = new Date()) {
-  console.log(JSON.stringify({
-    event: "scheduler_decision",
-    sequence_id: call?.call_id || null,
-    attempt_id: attempt?.attempt_id || null,
-    attempt_type: attempt?.attempt_type || null,
-    scheduled_at: attempt?.scheduled_at || call?.next_attempt_at || null,
-    current_time: currentTime.toISOString(),
-    stored_timezone: call?.timezone || null,
-    sequence_status: call?.sequence_status || null,
-    attempt_status: attempt?.technical_status || null,
-    decision,
-    reason
-  }));
-}
-
-async function runScheduler() {
-  if (!CALL_SCHEDULER_ENABLED || schedulerRunning) return;
-  schedulerRunning = true;
-
-  try {
-    await reconcileScheduledAttempts();
-    const due = await pool.query(
-      `
-        SELECT ca.attempt_id, ca.call_id
-        FROM call_attempts ca
-        JOIN ai_calls ac ON ac.call_id = ca.call_id
-        WHERE
-          ac.sequence_status IN (
-            'ready',
-            'active',
-            'scheduled',
-            'waiting_retry',
-            'callback_scheduled'
-          )
-          AND ca.technical_status IN ('pending', 'scheduled', 'created')
-          AND ca.completed_at IS NULL
-          AND ca.scheduled_at IS NOT NULL
-          AND ca.scheduled_at <= NOW()
-          AND ac.do_not_call = FALSE
-          AND ac.wrong_number = FALSE
-          AND ac.invalid_number = FALSE
-          AND ac.sequence_status <> 'paused'
-          AND ac.status NOT IN ('placing', 'queued', 'initiated', 'ringing', 'answered', 'in-progress', 'canceled', 'cancelled')
-          AND (
-            ac.twilio_call_sid IS NULL
-            OR ac.status IN ('busy', 'failed', 'no-answer', 'completed')
-          )
-          AND (
-            CASE
-              WHEN ca.attempt_type IN ('customer_callback', 'application_checkpoint')
-                THEN COALESCE(ac.callback_at, ac.next_attempt_at)
-              ELSE ac.next_attempt_at
-            END
-          ) IS NOT NULL
-          AND (
-            CASE
-              WHEN ca.attempt_type IN ('customer_callback', 'application_checkpoint')
-                THEN COALESCE(ac.callback_at, ac.next_attempt_at)
-              ELSE ac.next_attempt_at
-            END
-          ) <= NOW()
-          AND (
-            (
-              ca.attempt_type IN ('customer_callback', 'application_checkpoint')
-              AND ac.callback_requested = TRUE
-              AND ac.callback_at = ca.scheduled_at
-              AND ca.attempt_id IS DISTINCT FROM ac.last_attempt_id
-            )
-            OR (
-              ac.status <> 'completed'
-              AND ac.sequence_status <> 'completed'
-              AND COALESCE(ac.result->>'normal_completion_recorded', 'false') <> 'true'
-              AND COALESCE(ac.result->>'completion_reason', '') <> 'normal_completion'
-              AND NOT EXISTS (
-                SELECT 1
-                FROM jsonb_array_elements(ac.actions) AS action
-                WHERE action->>'action' = 'complete_call'
-                  AND COALESCE((action->>'success')::BOOLEAN, FALSE) = TRUE
-              )
-            )
-          )
-          AND (
-            (
-              COALESCE(ac.result->>'outbound_call_reason', ac.payload->>'outbound_call_reason', '') = 'initial_lead_call'
-              AND ca.attempt_type = 'initial_lead_call'
-              AND ac.next_attempt_at IS NOT NULL
-              AND ac.next_attempt_at <= NOW()
-              AND ac.attempts = 0
-              AND ac.last_attempt_id IS NULL
-              AND ac.result->>'initial_call_claimed_at' IS NULL
-            )
-            OR (
-              ac.result->>'outbound_call_reason' = 'scheduled_second_call'
-              AND ca.attempt_type IN ('customer_callback', 'application_checkpoint')
-              AND ac.callback_requested = TRUE
-              AND ac.callback_at IS NOT NULL
-              AND ac.callback_at <= NOW()
-              AND ac.callback_at = ca.scheduled_at
-              AND ac.result->>'scheduled_second_call_appointment_id' IS NOT NULL
-              AND ac.result->>'scheduled_second_call_source_call_id' IS NOT NULL
-              AND ac.result->>'scheduled_second_call_dialed_at' IS NULL
-            )
-            OR (
-              ac.result->>'outbound_call_reason' = 'unexpected_disconnect_reconnect'
-              AND ca.attempt_type = 'disconnect_reconnect'
-              AND ac.callback_at IS NOT NULL
-              AND ac.callback_at <= NOW()
-              AND ac.callback_at = ca.scheduled_at
-              AND COALESCE(ac.result->>'unexpected_disconnect_reconnect_scheduled', 'false') = 'true'
-              AND COALESCE(ac.result->>'unexpected_disconnect_reconnect_attempted', 'false') <> 'true'
-              AND ac.result->>'reconnect_source_call_id' IS NOT NULL
-              AND ac.result->>'reconnect_source_twilio_call_sid' IS NOT NULL
-            )
-          )
-          AND (ca.attempt_type <> 'cadence' OR ac.attempts < ac.max_attempts)
-        ORDER BY ca.scheduled_at ASC
-        LIMIT 10
-      `
-    );
-
-    for (const row of due.rows) {
-      try {
-        const call = await getCallById(row.call_id);
-        const attempt = await getAttemptById(row.attempt_id);
-        const currentTime = new Date();
-        if (!call || !attempt || !pendingAttemptStatus(attempt.technical_status)) {
-          logSchedulingDecision(call, attempt, "skip", "attempt_missing_or_already_claimed", currentTime);
-          continue;
-        }
-
-        if (call.do_not_call || call.wrong_number || call.invalid_number) {
-          logSchedulingDecision(call, attempt, "skip", "contact_suppressed", currentTime);
-          continue;
-        }
-        if (ENFORCE_CALL_CONSENT && call.consent_status !== "confirmed") {
-          logSchedulingDecision(call, attempt, "skip", "consent_not_confirmed", currentTime);
-          continue;
-        }
-
-        if (!insideOperatingWindow(currentTime, call.timezone || DEFAULT_TIMEZONE)) {
-          const nextAttemptAt = nextValidWindow(
-            call.timezone || DEFAULT_TIMEZONE,
-            currentTime,
-            DOUG_CONFIG.preferredWindows.morning,
-            0
-          );
-
-          await pool.query(
-            `
-              UPDATE call_attempts SET scheduled_at = $2, updated_at = NOW()
-              WHERE attempt_id = $1 AND technical_status IN ('pending', 'scheduled', 'created')
-            `,
-            [attempt.attempt_id, nextAttemptAt]
-          );
-          await pool.query(
-            `UPDATE ai_calls SET sequence_status = 'scheduled', next_attempt_at = $2,
-             updated_at = NOW() WHERE call_id = $1`,
-            [call.call_id, nextAttemptAt]
-          );
-          logSchedulingDecision(call, attempt, "defer", "outside_operating_window", currentTime);
-          queueMondaySync(call.call_id, "scheduler_rescheduled_window");
-          continue;
-        }
-
-        await placeTwilioCall(call, {
-          attemptId: attempt.attempt_id,
-          source: outboundCallSource(attempt)
-        });
-        const dispatched = await getCallById(call.call_id);
-        logSchedulingDecision(
-          dispatched,
-          attempt,
-          "dispatch",
-          "due_attempt_dispatched_immediately",
-          currentTime
-        );
-      } catch (error) {
-        if (error instanceof HttpError && error.statusCode === 409) {
-          const call = await getCallById(row.call_id);
-          const attempt = await getAttemptById(row.attempt_id);
-          logSchedulingDecision(call, attempt, "skip", "concurrent_worker_already_claimed");
-          continue;
-        }
-        console.error(`Scheduler failed for ${row.call_id}:`, error.message);
-
-        await pool.query(
-          `
-            UPDATE ai_calls
-            SET
-              sequence_status = 'human_action',
-              next_attempt_at = NULL,
-              last_error = $2,
-              result = result || $3::jsonb,
-              updated_at = NOW()
-            WHERE call_id = $1
-          `,
-          [
-            row.call_id,
-            cleanText(error.message, 4000),
-            JSON.stringify({ automatic_redial_disabled: true })
-          ]
-        );
-
-        await pool.query(
-          `UPDATE call_attempts SET technical_status = 'failed',
-           completed_at = NOW(),
-           updated_at = NOW() WHERE attempt_id = $1 AND completed_at IS NULL`,
-          [row.attempt_id]
-        );
-
-        queueMondaySync(row.call_id, "scheduler_failure_no_redial");
-      }
-    }
-  } catch (error) {
-    console.error("HELUX call scheduler failed:", error);
-  } finally {
-    schedulerRunning = false;
-  }
-}
-
 app.use((error, req, res, next) => {
   const statusCode = error instanceof HttpError ? error.statusCode : 500;
 
@@ -9710,10 +6776,6 @@ async function start() {
       console.log(`Agent version: ${DOUG_CONFIG.agentVersion}`);
       console.log(`Realtime model: ${OPENAI_REALTIME_MODEL}`);
       console.log(`Voice: ${OPENAI_VOICE}`);
-      console.log(`Cadence: ${DOUG_CONFIG.cadenceVersion}`);
-      console.log(
-        `Call scheduler: ${CALL_SCHEDULER_ENABLED ? "enabled" : "disabled"}`
-      );
       console.log(
         `Consent enforcement: ${ENFORCE_CALL_CONSENT ? "enabled" : "disabled"}`
       );
@@ -9731,13 +6793,6 @@ async function start() {
         );
       }
     });
-
-    if (CALL_SCHEDULER_ENABLED) {
-      schedulerTimer = setInterval(() => {
-        void runScheduler();
-      }, SCHEDULER_INTERVAL_MS);
-      void runScheduler();
-    }
 
     if (MONDAY_SYNC_ENABLED) {
       void loadMondayMetadata({ force: true })
@@ -9776,7 +6831,6 @@ async function start() {
 async function shutdown() {
   console.log("HELUX AI Workforce shutting down.");
 
-  if (schedulerTimer) clearInterval(schedulerTimer);
   for (const timer of mondaySyncTimers.values()) clearTimeout(timer);
   mondaySyncTimers.clear();
 

@@ -3,7 +3,7 @@ const STATES = Object.freeze([
   "roadmap", "need", "dpa_education", "knowledge_discovery",
   "timeline_discovery", "realtor_discovery", "lender_discovery", "urgency",
   "dti_offer", "dti_in_progress", "application_next_step",
-  "callback_scheduling", "follow_up", "nurture", "specialist_handoff",
+  "nurture", "specialist_handoff",
   "closing", "completed"
 ]);
 
@@ -11,7 +11,7 @@ const NEXT = Object.freeze({
   identity_verification: ["introduction", "closing"],
   introduction: ["trust_confirmation", "closing"],
   trust_confirmation: ["time_check", "closing"],
-  time_check: ["roadmap", "callback_scheduling", "closing"],
+  time_check: ["roadmap", "closing"],
   roadmap: ["need", "closing"],
   need: ["dpa_education", "closing"],
   dpa_education: ["knowledge_discovery", "timeline_discovery", "closing"],
@@ -20,12 +20,10 @@ const NEXT = Object.freeze({
   realtor_discovery: ["lender_discovery", "closing"],
   lender_discovery: ["urgency", "closing"],
   urgency: ["dti_offer", "application_next_step", "nurture", "closing"],
-  dti_offer: ["dti_in_progress", "callback_scheduling", "application_next_step", "closing"],
-  dti_in_progress: ["application_next_step", "callback_scheduling", "closing"],
-  application_next_step: ["callback_scheduling", "specialist_handoff", "closing"],
-  callback_scheduling: ["closing", "completed"],
-  follow_up: ["application_next_step", "callback_scheduling", "nurture", "closing"],
-  nurture: ["callback_scheduling", "closing", "completed"],
+  dti_offer: ["dti_in_progress", "application_next_step", "closing"],
+  dti_in_progress: ["application_next_step", "closing"],
+  application_next_step: ["specialist_handoff", "closing"],
+  nurture: ["closing", "completed"],
   specialist_handoff: ["closing", "completed"],
   closing: ["completed"]
 });
@@ -34,7 +32,6 @@ const LEGACY_ALIASES = Object.freeze({
   greeting: "identity_verification",
   readiness_confirmation: "trust_confirmation",
   qualification: "timeline_discovery",
-  application_checkpoint: "follow_up",
   application_link_sent: "application_next_step",
   reconnect_pending: "identity_verification",
   reconnect_in_progress: "identity_verification"
