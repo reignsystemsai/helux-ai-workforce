@@ -1781,8 +1781,83 @@ function pendingAttemptStatus(status) {
   );
 }
 
-function callHasSuccessfulCompleteCall(call) {
-  const actions = Array.isArray(call?.actions) ? call.actions : [];
+const PERMITTED_OUTBOUND_CALL_REASONS = Object.freeze([
+  "initial_lead_call",
+  "scheduled_second_call",
+  "unexpected_disconnect_reconnect"
+]);
+
+function permittedOutboundCallReason(value) {
+  return PERMITTED_OUTBOUND_CALL_REASONS.includes(
+    String(value || "").trim()
+  );
+}
+
+function internalNotificationCallReason(value) {
+  const reason = String(value || "").trim().toLowerCase();
+  return [
+    "dpa_agent_notification",
+    "specialist_notification",
+    "department_notification",
+    "internal_notification"
+  ].includes(reason) || (
+    reason.endsWith("_notification") &&
+    /(?:dpa|agent|specialist|department|internal)/.test(reason)
+  );
+}
+
+function resolveOutboundCallReason(call, attempt, options = {}) {
+  const explicitReason = cleanText(
+    options.callReason ||
+      call?.result?.outbound_call_reason ||
+      call?.payload?.outbound_call_reason,
+    100
+  );
+  if (explicitReason) return explicitReason;
+  const notificationReason =
+    call?.payload?.call_type || attempt?.attempt_type;
+  if (internalNotificationCallReason(notificationReason)) {
+    return String(notificationReason).trim().toLowerCase();
+  }
+  return null;
+}
+
+function outboundLeadId(call) {
+  return cleanText(
+    call?.lead_id || call?.payload?.lead_id || call?.case_id || call?.request_key,
+    320
+  );
+}
+
+function logOutboundCallRejected(call, resolvedCallReason, rejectionReason) {
+  console.log(JSON.stringify({
+    event: "outbound_call_rejected",
+    call_id: call?.call_id || null,
+    lead_id: outboundLeadId(call),
+    call_reason: resolvedCallReason || null,
+    reason: rejectionReason
+  }));
+}
+
+function logOutboundCallFinalEligibility(call, resolvedCallReason) {
+  console.log(JSON.stringify({
+    event: "outbound_call_final_eligibility",
+    call_id: call.call_id,
+    lead_id: outboundLeadId(call),
+    call_reason: resolvedCallReason,
+    callback_at: call.callback_at || null,
+    reconnect_source_call_id:
+      call.result?.reconnect_source_call_id || null,
+    eligible: true
+  }));
+}
+
+function callHasSuccessfulCompleteCall(call, attempt = null) {
+  const actions = Array.isArray(attempt?.actions)
+    ? attempt.actions
+    : Array.isArray(call?.actions)
+      ? call.actions
+      : [];
   return Boolean(
     actions.some(
       (action) =>
@@ -1808,23 +1883,30 @@ function outboundCallSource(attempt, requestedSource) {
   return "scheduler";
 }
 
-function outboundCallDueAt(call, attempt) {
+function outboundCallDueAt(call, resolvedCallReason) {
+  if (resolvedCallReason === "initial_lead_call") {
+    return call?.next_attempt_at || null;
+  }
   if (
-    ["customer_callback", "application_checkpoint", "disconnect_reconnect"].includes(
-      attempt?.attempt_type
+    ["scheduled_second_call", "unexpected_disconnect_reconnect"].includes(
+      resolvedCallReason
     )
   ) {
-    return call?.callback_at || call?.next_attempt_at || null;
+    return call?.callback_at || null;
   }
-  return call?.next_attempt_at || null;
+  return null;
 }
 
-function legitimateScheduledAppointment(call, attempt) {
+function legitimateScheduledAppointment(call, attempt, resolvedCallReason) {
   if (
+    resolvedCallReason !== "scheduled_second_call" ||
     !["customer_callback", "application_checkpoint"].includes(
       attempt?.attempt_type
     ) ||
-    call?.callback_requested !== true
+    call?.callback_requested !== true ||
+    !call?.result?.scheduled_second_call_appointment_id ||
+    !call?.result?.scheduled_second_call_source_call_id ||
+    call?.result?.scheduled_second_call_dialed_at
   ) {
     return false;
   }
@@ -1842,13 +1924,22 @@ function legitimateScheduledAppointment(call, attempt) {
   );
 }
 
-function outboundCallEligibility(call, attempt, currentTime = new Date()) {
-  const dueAtValue = outboundCallDueAt(call, attempt);
+function outboundCallEligibility(
+  call,
+  attempt,
+  resolvedCallReason,
+  currentTime = new Date()
+) {
+  const dueAtValue = outboundCallDueAt(call, resolvedCallReason);
   const dueAt = dueAtValue ? new Date(dueAtValue) : null;
   const attemptDueAt = attempt?.scheduled_at
     ? new Date(attempt.scheduled_at)
     : null;
-  const scheduledAppointment = legitimateScheduledAppointment(call, attempt);
+  const scheduledAppointment = legitimateScheduledAppointment(
+    call,
+    attempt,
+    resolvedCallReason
+  );
   const status = String(call?.status || "").toLowerCase();
   const sequenceStatus = String(call?.sequence_status || "").toLowerCase();
   const activeStatuses = [
@@ -1863,10 +1954,62 @@ function outboundCallEligibility(call, attempt, currentTime = new Date()) {
   let reason = "eligible_due_call";
   if (!call) reason = "call_missing";
   else if (!attempt) reason = "attempt_missing";
-  else if (!pendingAttemptStatus(attempt.technical_status)) {
+  else if (internalNotificationCallReason(resolvedCallReason)) {
+    reason = "specialist_notification_phone_calls_disabled";
+  } else if (!permittedOutboundCallReason(resolvedCallReason)) {
+    reason = "missing_permitted_call_reason";
+  } else if (
+    resolvedCallReason === "initial_lead_call" &&
+    attempt.attempt_type !== "initial_lead_call"
+  ) {
+    reason = "missing_permitted_call_reason";
+  } else if (
+    resolvedCallReason === "scheduled_second_call" &&
+    !["customer_callback", "application_checkpoint"].includes(
+      attempt.attempt_type
+    )
+  ) {
+    reason = "missing_permitted_call_reason";
+  } else if (
+    resolvedCallReason === "unexpected_disconnect_reconnect" &&
+    attempt.attempt_type !== "disconnect_reconnect"
+  ) {
+    reason = "missing_permitted_call_reason";
+  } else if (!pendingAttemptStatus(attempt.technical_status)) {
     reason = "attempt_already_claimed_or_cancelled";
   } else if (
-    callHasSuccessfulCompleteCall(call) &&
+    resolvedCallReason === "initial_lead_call" &&
+    (Number(call.attempts || 0) > 0 ||
+      call.last_attempt_id ||
+      call.result?.initial_call_claimed_at)
+  ) {
+    reason = "initial_call_already_exists";
+  } else if (
+    resolvedCallReason === "scheduled_second_call" &&
+    call.result?.scheduled_second_call_dialed_at
+  ) {
+    reason = "scheduled_second_call_already_dialed";
+  } else if (
+    resolvedCallReason === "scheduled_second_call" &&
+    !scheduledAppointment
+  ) {
+    reason = "invalid_callback_date";
+  } else if (
+    resolvedCallReason === "unexpected_disconnect_reconnect" &&
+    call.result?.unexpected_disconnect_reconnect_attempted === true
+  ) {
+    reason = "reconnect_already_attempted";
+  } else if (
+    resolvedCallReason === "unexpected_disconnect_reconnect" &&
+    (
+      call.result?.unexpected_disconnect_reconnect_scheduled !== true ||
+      !call.result?.reconnect_source_call_id ||
+      !call.result?.reconnect_source_twilio_call_sid
+    )
+  ) {
+    reason = "normal_completion_not_reconnectable";
+  } else if (
+    callHasSuccessfulCompleteCall(call, attempt) &&
     !scheduledAppointment
   ) {
     reason = "complete_call_already_succeeded";
@@ -1874,7 +2017,7 @@ function outboundCallEligibility(call, attempt, currentTime = new Date()) {
     (status === "completed" || sequenceStatus === "completed") &&
     !scheduledAppointment
   ) {
-    reason = "call_already_completed";
+    reason = "completed_call";
   } else if (["canceled", "cancelled"].includes(status)) {
     reason = "call_cancelled";
   } else if (call.do_not_call) reason = "do_not_call";
@@ -1889,12 +2032,20 @@ function outboundCallEligibility(call, attempt, currentTime = new Date()) {
     call.twilio_call_sid &&
     !["busy", "failed", "no-answer", "completed"].includes(status)
   ) {
-    reason = "active_twilio_call_sid_exists";
-  } else if (!dueAtValue) reason = "due_timestamp_missing";
-  else if (!dueAt || Number.isNaN(dueAt.getTime())) {
-    reason = "due_timestamp_invalid";
-  } else if (dueAt > currentTime) reason = "call_not_due_yet";
-  else if (!attempt?.scheduled_at) reason = "attempt_due_timestamp_missing";
+    reason = "active_twilio_call_exists";
+  } else if (!dueAtValue) {
+    reason = resolvedCallReason === "scheduled_second_call"
+      ? "invalid_callback_date"
+      : "due_timestamp_missing";
+  } else if (!dueAt || Number.isNaN(dueAt.getTime())) {
+    reason = resolvedCallReason === "scheduled_second_call"
+      ? "invalid_callback_date"
+      : "due_timestamp_invalid";
+  } else if (dueAt > currentTime) {
+    reason = resolvedCallReason === "scheduled_second_call"
+      ? "callback_not_due"
+      : "call_not_due_yet";
+  } else if (!attempt?.scheduled_at) reason = "attempt_due_timestamp_missing";
   else if (!attemptDueAt || Number.isNaN(attemptDueAt.getTime())) {
     reason = "attempt_due_timestamp_invalid";
   } else if (attemptDueAt > currentTime) reason = "attempt_not_due_yet";
@@ -1935,6 +2086,18 @@ function blockDisabledOutboundCall(call, source, dueAt = null) {
 
 function attemptTypeForCall(call, requestedType = null) {
   if (requestedType) return requestedType;
+  const outboundReason = resolveOutboundCallReason(call, null);
+  if (outboundReason === "initial_lead_call") {
+    return "initial_lead_call";
+  }
+  if (outboundReason === "scheduled_second_call") {
+    return call.current_state === "application_checkpoint"
+      ? "application_checkpoint"
+      : "customer_callback";
+  }
+  if (outboundReason === "unexpected_disconnect_reconnect") {
+    return "disconnect_reconnect";
+  }
   if (call.payload?.call_type === "dpa_agent_notification") {
     return "specialist_notification";
   }
@@ -2023,6 +2186,15 @@ async function reconcileScheduledAttempts() {
     `SELECT * FROM ai_calls
      WHERE sequence_status IN ('ready', 'active', 'scheduled', 'waiting_retry', 'callback_scheduled')
        AND next_attempt_at IS NOT NULL
+       AND COALESCE(
+         result->>'outbound_call_reason',
+         payload->>'outbound_call_reason',
+         ''
+       ) IN (
+         'initial_lead_call',
+         'scheduled_second_call',
+         'unexpected_disconnect_reconnect'
+       )
        AND do_not_call = FALSE AND wrong_number = FALSE AND invalid_number = FALSE`
   );
   for (const call of scheduled.rows) {
@@ -3887,41 +4059,36 @@ async function createDpaAgentNotification(itemId, statusLabel) {
     ]
   );
   const notificationCall = inserted.rows[0];
-  const notificationDueAt = new Date();
   const notificationAttempt = await ensurePendingAttempt(notificationCall.call_id, {
     attemptType: "specialist_notification",
-    scheduledAt: notificationDueAt,
+    scheduledAt: new Date(),
     idempotencyKey: `specialist_notification:${notificationCall.call_id}:1`
   });
-  if (insideOperatingWindow(notificationDueAt, notificationCall.timezone)) {
-    await pool.query(
-      `UPDATE ai_calls SET sequence_status = 'scheduled', next_attempt_at = $2,
-       updated_at = NOW() WHERE call_id = $1`,
-      [notificationCall.call_id, notificationDueAt]
-    );
-    await placeTwilioCall(notificationCall, {
-      force: true,
-      attemptId: notificationAttempt.attempt_id,
-      source: "initial"
-    });
-  } else {
-    const nextAttemptAt = nextValidWindow(
-      notificationCall.timezone,
-      new Date(),
-      DOUG_CONFIG.preferredWindows.morning,
-      0
-    );
-    await pool.query(
-      `UPDATE ai_calls SET sequence_status = 'scheduled', next_attempt_at = $2,
-       updated_at = NOW() WHERE call_id = $1`,
-      [notificationCall.call_id, nextAttemptAt]
-    );
-    await pool.query(
-      `UPDATE call_attempts SET scheduled_at = $2, updated_at = NOW()
-       WHERE attempt_id = $1 AND technical_status IN ('pending', 'scheduled', 'created')`,
-      [notificationAttempt.attempt_id, nextAttemptAt]
-    );
-  }
+  logOutboundCallRejected(
+    notificationCall,
+    "specialist_notification",
+    "specialist_notification_phone_calls_disabled"
+  );
+  await pool.query(
+    `UPDATE call_attempts
+     SET technical_status = 'canceled', completed_at = NOW(),
+         cancellation_reason = 'specialist_notification_phone_calls_disabled',
+         updated_at = NOW()
+     WHERE attempt_id = $1`,
+    [notificationAttempt.attempt_id]
+  );
+  await pool.query(
+    `UPDATE ai_calls
+     SET sequence_status = 'human_action', next_attempt_at = NULL,
+         result = result || $2::jsonb, updated_at = NOW()
+     WHERE call_id = $1`,
+    [
+      notificationCall.call_id,
+      JSON.stringify({
+        specialist_notification_phone_calls_disabled: true
+      })
+    ]
+  );
   await setIntegrationState(eventKey, {
     status: "notification_created",
     item_id: String(item.id),
@@ -4759,7 +4926,19 @@ async function scheduleUnexpectedReconnect(callId) {
       action.success &&
       action.completion_reason === "normal_completion"
   );
-  const alreadyScheduled = call.result?.unexpected_disconnect_reconnect_scheduled;
+  const callbackConcluded = actions.some(
+    (action) =>
+      action && action.action === "schedule_callback" && action.success
+  );
+  const alreadyScheduled = Boolean(
+    call.result?.unexpected_disconnect_reconnect_scheduled ||
+      call.result?.unexpected_disconnect_reconnect_attempted
+  );
+  const connectedCall = Boolean(
+    ["answered", "in-progress"].includes(
+      String(call.status || "").toLowerCase()
+    ) && call.twilio_call_sid
+  );
   const normalCompletion = Boolean(
     completedByTool ||
     intentionallyEnded ||
@@ -4781,10 +4960,37 @@ async function scheduleUnexpectedReconnect(callId) {
   const hasFutureCallback = Boolean(
     callbackAt && !Number.isNaN(callbackAt.getTime()) && callbackAt > new Date()
   );
-  if (hasFutureCallback) return false;
-  if (transcript.length < 2 || alreadyScheduled) return false;
+  if (
+    hasFutureCallback ||
+    callbackConcluded ||
+    call.result?.outbound_call_reason === "scheduled_second_call"
+  ) {
+    logOutboundCallRejected(
+      call,
+      "unexpected_disconnect_reconnect",
+      "normal_completion_not_reconnectable"
+    );
+    return false;
+  }
+  if (!connectedCall || transcript.length < 2) {
+    logOutboundCallRejected(
+      call,
+      "unexpected_disconnect_reconnect",
+      "normal_completion_not_reconnectable"
+    );
+    return false;
+  }
+  if (alreadyScheduled) {
+    logOutboundCallRejected(
+      call,
+      "unexpected_disconnect_reconnect",
+      "reconnect_already_attempted"
+    );
+    return false;
+  }
 
   const reconnectAt = new Date(Date.now() + 60 * 1000);
+  const reconnectSourceTwilioCallSid = call.twilio_call_sid;
   const savedSummary = cleanText(
     call.summary ||
       transcript
@@ -4800,6 +5006,7 @@ async function scheduleUnexpectedReconnect(callId) {
           next_state = COALESCE(next_state, 'resume_conversation'),
           sequence_status = 'callback_scheduled', callback_requested = TRUE,
           callback_at = $2, next_attempt_at = $2,
+          status = 'disconnected', twilio_call_sid = NULL,
           summary = COALESCE(summary, $3),
           next_action = COALESCE(next_action, 'Resume after unexpected disconnect'),
           completed_at = NULL, result = result || $4::jsonb, updated_at = NOW()
@@ -4810,6 +5017,14 @@ async function scheduleUnexpectedReconnect(callId) {
         AND COALESCE(result->>'final_hangup_completed', 'false') <> 'true'
         AND COALESCE(result->>'completion_reason', '') <> 'normal_completion'
         AND status <> 'completed'
+        AND status IN ('answered', 'in-progress')
+        AND twilio_call_sid = $5
+        AND NOT EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(actions) AS callback_action
+          WHERE callback_action->>'action' = 'schedule_callback'
+            AND COALESCE((callback_action->>'success')::BOOLEAN, FALSE) = TRUE
+        )
         AND NOT EXISTS (
           SELECT 1
           FROM jsonb_array_elements(actions) AS action
@@ -4825,8 +5040,12 @@ async function scheduleUnexpectedReconnect(callId) {
       JSON.stringify({
         unexpected_disconnect_reconnect_scheduled: true,
         unexpected_disconnect_at: new Date().toISOString(),
-        reconnect_at: reconnectAt.toISOString()
-      })
+        reconnect_at: reconnectAt.toISOString(),
+        reconnect_source_call_id: callId,
+        reconnect_source_twilio_call_sid: reconnectSourceTwilioCallSid,
+        outbound_call_reason: "unexpected_disconnect_reconnect"
+      }),
+      reconnectSourceTwilioCallSid
     ]
   );
   if (!updated.rowCount) return false;
@@ -4838,7 +5057,10 @@ async function scheduleUnexpectedReconnect(callId) {
   await appendAction(callId, {
     action: "unexpected_disconnect_reconnect_scheduled",
     success: true,
-    reconnect_at: reconnectAt.toISOString()
+    reconnect_at: reconnectAt.toISOString(),
+    reconnect_source_call_id: callId,
+    reconnect_source_twilio_call_sid: reconnectSourceTwilioCallSid,
+    outbound_call_reason: "unexpected_disconnect_reconnect"
   });
   queueMondaySync(callId, "unexpected_disconnect_reconnect");
   return true;
@@ -4863,45 +5085,32 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
     call.result?.unexpected_disconnect_reconnect_attempted &&
     !call.result?.unexpected_disconnect_reconnect_completed
   ) {
-    const attempt = call.last_attempt_id
-      ? await getAttemptById(call.last_attempt_id)
-      : null;
-    const attemptTranscript = Array.isArray(attempt?.transcript)
-      ? attempt.transcript
-      : [];
-    if (attemptTranscript.length < 2) {
-      const retryAt = nextValidWindow(
-        call.timezone || DEFAULT_TIMEZONE,
-        new Date(Date.now() + 48 * 60 * 60 * 1000),
-        DOUG_CONFIG.preferredWindows.morning,
-        0
-      );
-      await pool.query(
-        `
-          UPDATE ai_calls
-          SET sequence_status = 'waiting_retry', callback_requested = FALSE,
-              callback_at = NULL, next_attempt_at = $2,
-              current_state = 'reconnect_not_answered', completed_at = NULL,
-              result = result || $3::jsonb, updated_at = NOW()
-          WHERE call_id = $1
-        `,
-        [
-          callId,
-          retryAt,
-          JSON.stringify({
-            unexpected_disconnect_reconnect_completed: true,
-            next_customer_attempt_at: retryAt.toISOString()
-          })
-        ]
-      );
-      queueMondaySync(callId, "reconnect_not_answered_48h_retry");
-      return;
-    }
+    await pool.query(
+      `
+        UPDATE ai_calls
+        SET sequence_status = 'human_action', callback_requested = FALSE,
+            callback_at = NULL, next_attempt_at = NULL,
+            current_state = 'reconnect_attempt_completed',
+            result = result || $2::jsonb, updated_at = NOW()
+        WHERE call_id = $1
+      `,
+      [
+        callId,
+        JSON.stringify({
+          unexpected_disconnect_reconnect_completed: true,
+          automatic_redial_disabled: true
+        })
+      ]
+    );
+    queueMondaySync(callId, "reconnect_attempt_completed_no_redial");
+    return;
   }
 
   if (
     call.sequence_status === "callback_scheduled" &&
-    hasFutureCallback
+    hasFutureCallback &&
+    call.result?.outbound_call_reason === "scheduled_second_call" &&
+    call.result?.scheduled_second_call_appointment_id
   ) {
     await pool.query(
       `
@@ -4980,61 +5189,41 @@ async function finalizeCadenceAfterTerminal(callId, technicalStatus) {
     return;
   }
 
-  if (Number(call.attempts || 0) >= Number(call.max_attempts || 6)) {
-    await pool.query(
-      `
-        UPDATE ai_calls
-        SET
-          sequence_status = 'exhausted',
-          next_action = 'Human review or approved non-voice nurture',
-          next_attempt_at = NULL,
-          updated_at = NOW()
-        WHERE call_id = $1
-      `,
-      [callId]
-    );
-    queueMondaySync(callId, "cadence_exhausted");
-    return;
-  }
-
-  const nextAttemptAt = calculateNextAttemptAt(call);
   await pool.query(
     `
       UPDATE ai_calls
       SET
-        sequence_status = 'waiting_retry',
-        next_attempt_at = $2,
-        completed_at = NULL,
+        sequence_status = 'human_action',
+        next_action = COALESCE(next_action, 'Manual review required; automatic redial disabled'),
+        next_attempt_at = NULL,
+        result = result || $2::jsonb,
         updated_at = NOW()
       WHERE call_id = $1
     `,
-    [callId, nextAttemptAt]
+    [callId, JSON.stringify({ automatic_redial_disabled: true })]
   );
 
-  await ensurePendingAttempt(callId, {
-    attemptType: "cadence",
-    scheduledAt: nextAttemptAt,
-    idempotencyKey: `cadence:${callId}:${Number(call.attempts || 0) + 1}`
-  });
-
-  if (call.last_attempt_id) {
-    await pool.query(
-      `
-        UPDATE call_attempts
-        SET next_attempt_at = $2, updated_at = NOW()
-        WHERE attempt_id = $1
-      `,
-      [call.last_attempt_id, nextAttemptAt]
-    );
-  }
-
-  queueMondaySync(callId, "cadence_waiting_retry");
+  await pool.query(
+    `UPDATE call_attempts
+     SET technical_status = 'canceled', completed_at = NOW(),
+         cancellation_reason = 'automatic_redial_disabled', updated_at = NOW()
+     WHERE call_id = $1 AND completed_at IS NULL
+       AND technical_status IN ('pending', 'scheduled', 'created')
+       AND attempt_id IS DISTINCT FROM $2`,
+    [callId, call.last_attempt_id]
+  );
+  queueMondaySync(callId, "automatic_redial_disabled");
 }
 
 async function placeTwilioCall(call, options = {}) {
   let refreshedCall = await getCallById(call.call_id);
   if (!refreshedCall) throw new Error("Call sequence not found.");
   let source = outboundCallSource(null, options.source);
+  let resolvedCallReason = resolveOutboundCallReason(
+    refreshedCall,
+    null,
+    options
+  );
 
   if (!OUTBOUND_CALLS_ENABLED) {
     blockDisabledOutboundCall(
@@ -5042,7 +5231,29 @@ async function placeTwilioCall(call, options = {}) {
       source,
       refreshedCall.callback_at || refreshedCall.next_attempt_at
     );
+    logOutboundCallRejected(
+      refreshedCall,
+      resolvedCallReason,
+      "outbound_calls_disabled"
+    );
     throw new HttpError(409, "Outbound calls are disabled.");
+  }
+
+  if (internalNotificationCallReason(resolvedCallReason)) {
+    logOutboundCallRejected(
+      refreshedCall,
+      resolvedCallReason,
+      "specialist_notification_phone_calls_disabled"
+    );
+    throw new HttpError(409, "Specialist notification phone calls are disabled.");
+  }
+  if (!permittedOutboundCallReason(resolvedCallReason)) {
+    logOutboundCallRejected(
+      refreshedCall,
+      resolvedCallReason,
+      "missing_permitted_call_reason"
+    );
+    throw new HttpError(409, "A permitted outbound call reason is required.");
   }
 
   if (
@@ -5050,6 +5261,11 @@ async function placeTwilioCall(call, options = {}) {
     refreshedCall.wrong_number ||
     refreshedCall.invalid_number
   ) {
+    logOutboundCallRejected(
+      refreshedCall,
+      resolvedCallReason,
+      refreshedCall.do_not_call ? "do_not_call" : "contact_suppressed"
+    );
     throw new HttpError(409, "This contact is suppressed from future calls.");
   }
 
@@ -5058,6 +5274,11 @@ async function placeTwilioCall(call, options = {}) {
     refreshedCall.consent_status !== "confirmed" &&
     options.force !== true
   ) {
+    logOutboundCallRejected(
+      refreshedCall,
+      resolvedCallReason,
+      "consent_not_confirmed"
+    );
     throw new HttpError(409, "Confirmed AI voice consent is required.");
   }
 
@@ -5075,12 +5296,25 @@ async function placeTwilioCall(call, options = {}) {
         attemptType: options.attemptType,
         scheduledAt: refreshedCall.next_attempt_at || new Date()
       });
-  if (!pendingAttempt) throw new HttpError(409, "No pending attempt is available.");
+  if (!pendingAttempt) {
+    logOutboundCallRejected(
+      refreshedCall,
+      resolvedCallReason,
+      "atomic_claim_failed"
+    );
+    throw new HttpError(409, "No pending attempt is available.");
+  }
   source = outboundCallSource(pendingAttempt, options.source);
+  resolvedCallReason = resolveOutboundCallReason(
+    refreshedCall,
+    pendingAttempt,
+    options
+  );
 
   const initialEligibility = outboundCallEligibility(
     refreshedCall,
-    pendingAttempt
+    pendingAttempt,
+    resolvedCallReason
   );
   if (!initialEligibility.eligible) {
     logOutboundCallEligibility(
@@ -5089,6 +5323,11 @@ async function placeTwilioCall(call, options = {}) {
       source,
       initialEligibility
     );
+    logOutboundCallRejected(
+      refreshedCall,
+      resolvedCallReason,
+      initialEligibility.reason
+    );
     throw new HttpError(409, `Outbound call blocked: ${initialEligibility.reason}.`);
   }
 
@@ -5096,6 +5335,41 @@ async function placeTwilioCall(call, options = {}) {
   let claimedDueAt = initialEligibility.dueAt;
   try {
     await client.query("BEGIN");
+    if (resolvedCallReason === "initial_lead_call") {
+      const leadIdentity = outboundLeadId(refreshedCall);
+      if (!leadIdentity) {
+        throw new HttpError(409, "Initial call lead identity is unavailable.");
+      }
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        [`initial_lead_call:${leadIdentity}`]
+      );
+      const priorInitialCall = await client.query(
+        `SELECT call_id FROM ai_calls
+         WHERE call_id <> $1
+           AND COALESCE(NULLIF(lead_id, ''), NULLIF(payload->>'lead_id', ''),
+                        NULLIF(case_id, ''), request_key) = $2
+           AND COALESCE(
+             result->>'outbound_call_reason',
+             payload->>'outbound_call_reason',
+             ''
+           ) = 'initial_lead_call'
+           AND (
+             attempts > 0 OR last_attempt_id IS NOT NULL OR twilio_call_sid IS NOT NULL
+             OR result->>'initial_call_claimed_at' IS NOT NULL
+           )
+         LIMIT 1`,
+        [refreshedCall.call_id, leadIdentity]
+      );
+      if (priorInitialCall.rowCount) {
+        logOutboundCallRejected(
+          refreshedCall,
+          resolvedCallReason,
+          "initial_call_already_exists"
+        );
+        throw new HttpError(409, "An initial call already exists for this lead.");
+      }
+    }
     const lockedCallResult = await client.query(
       "SELECT * FROM ai_calls WHERE call_id = $1 FOR UPDATE",
       [refreshedCall.call_id]
@@ -5106,9 +5380,15 @@ async function placeTwilioCall(call, options = {}) {
     );
     refreshedCall = lockedCallResult.rows[0];
     pendingAttempt = lockedAttemptResult.rows[0];
+    resolvedCallReason = resolveOutboundCallReason(
+      refreshedCall,
+      pendingAttempt,
+      options
+    );
     const lockedEligibility = outboundCallEligibility(
       refreshedCall,
-      pendingAttempt
+      pendingAttempt,
+      resolvedCallReason
     );
     if (!lockedEligibility.eligible) {
       logOutboundCallEligibility(
@@ -5117,30 +5397,51 @@ async function placeTwilioCall(call, options = {}) {
         source,
         lockedEligibility
       );
+      logOutboundCallRejected(
+        refreshedCall,
+        resolvedCallReason,
+        lockedEligibility.reason
+      );
       throw new HttpError(409, `Outbound call blocked: ${lockedEligibility.reason}.`);
     }
     claimedDueAt = lockedEligibility.dueAt;
 
-    if (refreshedCall.current_state === "reconnect_pending") {
-      await client.query(
-        `UPDATE ai_calls SET current_state = 'reconnect_in_progress',
-         result = result || $2::jsonb, updated_at = NOW() WHERE call_id = $1`,
-        [
-          refreshedCall.call_id,
-          JSON.stringify({ unexpected_disconnect_reconnect_attempted: true })
-        ]
-      );
-    }
     const explicitAppointment = lockedEligibility.scheduledAppointment;
+    const lifecycleHistoryExemption = Boolean(
+      explicitAppointment ||
+        resolvedCallReason === "unexpected_disconnect_reconnect"
+    );
+    const consumesScheduledTime = [
+      "scheduled_second_call",
+      "unexpected_disconnect_reconnect"
+    ].includes(resolvedCallReason);
+    const claimedAt = new Date().toISOString();
+    const claimResultPatch = {
+      outbound_call_reason: resolvedCallReason,
+      outbound_call_claimed_at: claimedAt,
+      ...(resolvedCallReason === "initial_lead_call"
+        ? { initial_call_claimed_at: claimedAt }
+        : {}),
+      ...(resolvedCallReason === "scheduled_second_call"
+        ? { scheduled_second_call_dialed_at: claimedAt }
+        : {}),
+      ...(resolvedCallReason === "unexpected_disconnect_reconnect"
+        ? { unexpected_disconnect_reconnect_attempted: true }
+        : {})
+    };
     const claimedCallResult = await client.query(
       `UPDATE ai_calls
        SET status = 'placing', sequence_status = 'calling',
+           current_state = CASE
+             WHEN $10 = 'unexpected_disconnect_reconnect'
+               THEN 'reconnect_in_progress'
+             ELSE current_state
+           END,
            stream_token = $4, twilio_call_sid = NULL,
            attempts = attempts + 1, last_attempt_id = $2, last_attempt_at = NOW(),
-           next_attempt_at = NULL, last_error = NULL, completed_at = NULL,
+           last_error = NULL, completed_at = NULL,
            callback_requested = CASE WHEN $3::BOOLEAN THEN FALSE ELSE callback_requested END,
-           callback_at = CASE WHEN $3::BOOLEAN THEN NULL ELSE callback_at END,
-           result = CASE
+           result = (CASE
              WHEN $5::BOOLEAN THEN result
                - 'normal_completion_recorded'
                - 'normal_completion_recorded_at'
@@ -5150,7 +5451,7 @@ async function placeTwilioCall(call, options = {}) {
                - 'completion_reason'
                - 'intentional_twilio_hangup'
              ELSE result
-           END,
+           END) || $11::jsonb,
            updated_at = NOW()
        WHERE call_id = $1
          AND status = $6
@@ -5174,25 +5475,33 @@ async function placeTwilioCall(call, options = {}) {
            )
          ))
          AND $9::TIMESTAMPTZ <= NOW()
-         AND (next_attempt_at = $9::TIMESTAMPTZ OR callback_at = $9::TIMESTAMPTZ)
+         AND COALESCE(result->>'outbound_call_reason', payload->>'outbound_call_reason', '') = $10
+         AND (
+           ($10 = 'initial_lead_call' AND next_attempt_at = $9::TIMESTAMPTZ)
+           OR ($10 IN ('scheduled_second_call', 'unexpected_disconnect_reconnect')
+               AND callback_at = $9::TIMESTAMPTZ)
+         )
        RETURNING *`,
       [
         refreshedCall.call_id,
         pendingAttempt.attempt_id,
-        [
-          "customer_callback",
-          "application_checkpoint",
-          "disconnect_reconnect"
-        ].includes(pendingAttempt.attempt_type),
+        consumesScheduledTime,
         createStreamToken(),
-        explicitAppointment,
+        lifecycleHistoryExemption,
         refreshedCall.status,
         refreshedCall.sequence_status,
         refreshedCall.twilio_call_sid || null,
-        claimedDueAt
+        claimedDueAt,
+        resolvedCallReason,
+        JSON.stringify(claimResultPatch)
       ]
     );
     if (!claimedCallResult.rowCount) {
+      logOutboundCallRejected(
+        refreshedCall,
+        resolvedCallReason,
+        "atomic_claim_failed"
+      );
       throw new HttpError(409, "Call row was not eligible for atomic claim.");
     }
     const claimedAttemptResult = await client.query(
@@ -5208,6 +5517,11 @@ async function placeTwilioCall(call, options = {}) {
       [pendingAttempt.attempt_id, refreshedCall.call_id]
     );
     if (!claimedAttemptResult.rowCount) {
+      logOutboundCallRejected(
+        refreshedCall,
+        resolvedCallReason,
+        "atomic_claim_failed"
+      );
       throw new HttpError(409, "Call attempt was not eligible for atomic claim.");
     }
     refreshedCall = claimedCallResult.rows[0];
@@ -5222,6 +5536,23 @@ async function placeTwilioCall(call, options = {}) {
 
   refreshedCall = await getCallById(refreshedCall.call_id);
   pendingAttempt = await getAttemptById(pendingAttempt.attempt_id);
+  const postClaimReason = resolveOutboundCallReason(
+    refreshedCall,
+    pendingAttempt,
+    options
+  );
+  const postClaimDueAt = outboundCallDueAt(
+    refreshedCall,
+    postClaimReason
+  );
+  const claimMarkerRecorded = Boolean(
+    (postClaimReason === "initial_lead_call" &&
+      refreshedCall?.result?.initial_call_claimed_at) ||
+    (postClaimReason === "scheduled_second_call" &&
+      refreshedCall?.result?.scheduled_second_call_dialed_at) ||
+    (postClaimReason === "unexpected_disconnect_reconnect" &&
+      refreshedCall?.result?.unexpected_disconnect_reconnect_attempted === true)
+  );
   const claimedEligibility = {
     dueAt: claimedDueAt,
     eligible: Boolean(
@@ -5231,6 +5562,11 @@ async function placeTwilioCall(call, options = {}) {
         refreshedCall.sequence_status === "calling" &&
         refreshedCall.last_attempt_id === pendingAttempt.attempt_id &&
         pendingAttempt.technical_status === "placing" &&
+        postClaimReason === resolvedCallReason &&
+        permittedOutboundCallReason(postClaimReason) &&
+        postClaimDueAt &&
+        new Date(postClaimDueAt).toISOString() === claimedDueAt &&
+        claimMarkerRecorded &&
         !refreshedCall.twilio_call_sid &&
         !refreshedCall.do_not_call &&
         !refreshedCall.wrong_number &&
@@ -5245,6 +5581,11 @@ async function placeTwilioCall(call, options = {}) {
       pendingAttempt,
       source,
       claimedEligibility
+    );
+    logOutboundCallRejected(
+      refreshedCall,
+      resolvedCallReason,
+      "atomic_claim_failed"
     );
     throw new HttpError(409, "Outbound call blocked after atomic claim recheck.");
   }
@@ -5265,10 +5606,28 @@ async function placeTwilioCall(call, options = {}) {
   statusUrl.searchParams.set("token", refreshedCall.stream_token);
   queueMondaySync(refreshedCall.call_id, "attempt_created");
 
+  await appendAction(refreshedCall.call_id, {
+    action: "outbound_call_claimed",
+    success: true,
+    call_reason: resolvedCallReason,
+    attempt_id: attemptId,
+    due_at: claimedDueAt,
+    ...(resolvedCallReason === "unexpected_disconnect_reconnect"
+      ? { reconnect_source_call_id: refreshedCall.result?.reconnect_source_call_id }
+      : {})
+  });
+
   if (!OUTBOUND_CALLS_ENABLED) {
     blockDisabledOutboundCall(refreshedCall, source, claimedDueAt);
+    logOutboundCallRejected(
+      refreshedCall,
+      resolvedCallReason,
+      "outbound_calls_disabled"
+    );
     throw new HttpError(409, "Outbound calls are disabled.");
   }
+
+  logOutboundCallFinalEligibility(refreshedCall, resolvedCallReason);
 
   try {
     const twilioCall = await twilioClient.calls.create({
@@ -5286,10 +5645,30 @@ async function placeTwilioCall(call, options = {}) {
       twilioCall.status || "queued",
       { twilio_call_sid: twilioCall.sid }
     );
+    await pool.query(
+      `UPDATE ai_calls
+       SET next_attempt_at = NULL,
+           callback_at = CASE
+             WHEN $2 = 'unexpected_disconnect_reconnect' THEN NULL
+             ELSE callback_at
+           END,
+           result = result || $3::jsonb,
+           updated_at = NOW()
+       WHERE call_id = $1`,
+      [
+        refreshedCall.call_id,
+        resolvedCallReason,
+        JSON.stringify({
+          outbound_call_placed_at: new Date().toISOString(),
+          outbound_call_reason: resolvedCallReason
+        })
+      ]
+    );
 
     await appendAction(refreshedCall.call_id, {
       action: "outbound_call_placed",
       success: true,
+      call_reason: resolvedCallReason,
       attempt_number: attemptNumber,
       twilio_call_sid: twilioCall.sid
     });
@@ -5304,10 +5683,8 @@ async function placeTwilioCall(call, options = {}) {
       `
         UPDATE call_attempts
         SET
-          technical_status = 'pending',
-          scheduled_at = NOW() + INTERVAL '15 minutes',
-          dialed_at = NULL,
-          completed_at = NULL,
+          technical_status = 'failed',
+          completed_at = NOW(),
           last_error = $2,
           updated_at = NOW()
         WHERE attempt_id = $1
@@ -5320,27 +5697,36 @@ async function placeTwilioCall(call, options = {}) {
         UPDATE ai_calls
         SET
           status = 'failed',
-          sequence_status = 'waiting_retry',
-          attempts = GREATEST(attempts - 1, 0),
-          last_attempt_id = NULL,
-          next_attempt_at = NOW() + INTERVAL '15 minutes',
+          sequence_status = 'human_action',
+          next_attempt_at = NULL,
+          callback_requested = FALSE,
           last_error = $2,
+          result = result || $3::jsonb,
           updated_at = NOW()
         WHERE call_id = $1
       `,
-      [refreshedCall.call_id, safeError]
+      [
+        refreshedCall.call_id,
+        safeError,
+        JSON.stringify({
+          outbound_call_failed_at: new Date().toISOString(),
+          outbound_call_reason: resolvedCallReason,
+          automatic_redial_disabled: true
+        })
+      ]
     );
 
     await appendAction(refreshedCall.call_id, {
       action: "outbound_call_placed",
       success: false,
+      call_reason: resolvedCallReason,
       technical_failure: true,
       customer_attempt_consumed: false,
       attempt_number: attemptNumber,
       error: safeError
     });
 
-    queueMondaySync(refreshedCall.call_id, "twilio_call_failed");
+    queueMondaySync(refreshedCall.call_id, "twilio_call_failed_no_redial");
     throw error;
   }
 }
@@ -5832,6 +6218,42 @@ async function executeDougTool(call, name, args) {
       primaryConcern || holdReason
         ? "follow_up_scheduled"
         : "specialist_callback";
+    if (call.result?.scheduled_second_call_dialed_at) {
+      return {
+        success: false,
+        error: "The explicitly scheduled second call has already been dialed."
+      };
+    }
+    const isApplicationCheckpoint = normalizeMondayKey(reason).includes(
+      "applicationcheckpoint"
+    );
+    const callbackAttemptType = isApplicationCheckpoint
+      ? "application_checkpoint"
+      : "customer_callback";
+    const scheduledSecondCallSourceId =
+      cleanText(call.result?.scheduled_second_call_source_call_id, 100) ||
+      call.call_id;
+    const scheduledSecondCallAppointmentId =
+      cleanText(call.result?.scheduled_second_call_appointment_id, 100) ||
+      stableHash(`${scheduledSecondCallSourceId}:scheduled_second_call`).slice(0, 40);
+    const leadIdentity = outboundLeadId(call);
+    const existingAppointment = leadIdentity
+      ? await pool.query(
+          `SELECT * FROM ai_calls
+           WHERE call_id <> $1
+             AND COALESCE(NULLIF(lead_id, ''), NULLIF(payload->>'lead_id', ''),
+                          NULLIF(case_id, ''), request_key) = $2
+             AND result->>'scheduled_second_call_source_call_id' = $3
+             AND result->>'outbound_call_reason' = 'scheduled_second_call'
+             AND callback_at > NOW()
+             AND sequence_status IN ('callback_scheduled', 'calling', 'completed')
+           ORDER BY updated_at DESC
+           LIMIT 1`,
+          [call.call_id, leadIdentity, scheduledSecondCallSourceId]
+        )
+      : { rows: [] };
+    const appointmentCall = existingAppointment.rows[0] || call;
+    const appointmentCallId = appointmentCall.call_id;
 
     await pool.query(
       `
@@ -5849,7 +6271,7 @@ async function executeDougTool(call, name, args) {
         WHERE call_id = $1
       `,
       [
-        call.call_id,
+        appointmentCallId,
         callbackAt,
         timezone,
         reason,
@@ -5858,14 +6280,15 @@ async function executeDougTool(call, name, args) {
       ]
     );
 
-    const isApplicationCheckpoint = normalizeMondayKey(reason).includes(
-      "applicationcheckpoint"
-    );
-    await mergeCallResult(call.call_id, {
+    await mergeCallResult(appointmentCallId, {
       callback_at: callbackAt.toISOString(),
       callback_timezone: timezone,
       callback_local_date: customerLocalDate,
       callback_local_time: customerLocalTime,
+      outbound_call_reason: "scheduled_second_call",
+      scheduled_second_call_source_call_id: scheduledSecondCallSourceId,
+      scheduled_second_call_appointment_id: scheduledSecondCallAppointmentId,
+      scheduled_second_call_purpose: callbackAttemptType,
       ...(safeArgs.application_local_date
         ? {
             application_local_date: parseConfirmedLocalDate(
@@ -5894,31 +6317,31 @@ async function executeDougTool(call, name, args) {
         `UPDATE ai_calls SET current_state = 'application_checkpoint',
          next_state = 'application_checkpoint', updated_at = NOW()
          WHERE call_id = $1`,
-        [call.call_id]
+        [appointmentCallId]
       );
     }
 
-    const callbackAttemptType = isApplicationCheckpoint
-      ? "application_checkpoint"
-      : "customer_callback";
     await pool.query(
       `UPDATE call_attempts SET technical_status = 'canceled', completed_at = NOW(),
        cancellation_reason = 'explicit_callback_rescheduled', updated_at = NOW()
        WHERE call_id = $1 AND attempt_type = $2 AND completed_at IS NULL
          AND technical_status IN ('pending', 'scheduled', 'created')
          AND scheduled_at IS DISTINCT FROM $3`,
-      [call.call_id, callbackAttemptType, callbackAt]
+      [appointmentCallId, callbackAttemptType, callbackAt]
     );
 
-    await ensurePendingAttempt(call.call_id, {
+    await ensurePendingAttempt(appointmentCallId, {
       attemptType: callbackAttemptType,
       scheduledAt: callbackAt,
-      idempotencyKey: `${callbackAttemptType}:${call.call_id}:${callbackAt.toISOString()}`
+      idempotencyKey: `${callbackAttemptType}:${scheduledSecondCallAppointmentId}:${callbackAt.toISOString()}`
     });
 
-    await appendAction(call.call_id, {
+    await appendAction(appointmentCallId, {
       action: name,
       success: true,
+      outbound_call_reason: "scheduled_second_call",
+      scheduled_second_call_source_call_id: scheduledSecondCallSourceId,
+      scheduled_second_call_appointment_id: scheduledSecondCallAppointmentId,
       callback_at: callbackAt.toISOString(),
       customer_local_date: customerLocalDate,
       customer_local_time: customerLocalTime,
@@ -6553,7 +6976,10 @@ app.post(
           cleanText(payload.lead_id, 150),
           phone,
           streamToken,
-          JSON.stringify(payload),
+          JSON.stringify({
+            ...payload,
+            outbound_call_reason: "initial_lead_call"
+          }),
           maxAttempts,
           timezone,
           consentStatus,
@@ -6584,7 +7010,10 @@ app.post(
           tentative_meeting_availability:
             payload.tentative_meeting_availability ?? null,
           application_link_sent: false,
-          application_follow_up_at: null
+          application_follow_up_at: null,
+          outbound_call_reason: "initial_lead_call",
+          initial_call_source_lead_id:
+            cleanText(payload.lead_id || payload.case_id, 150) || requestKey
         })
       );
       queueMondaySync(call.call_id, "sequence_created");
@@ -6605,9 +7034,9 @@ app.post(
         [call.call_id, nextAttemptAt]
       );
       const firstAttempt = await ensurePendingAttempt(call.call_id, {
-        attemptType: "cadence",
+        attemptType: "initial_lead_call",
         scheduledAt: nextAttemptAt,
-        idempotencyKey: `cadence:${call.call_id}:1`
+        idempotencyKey: `initial_lead_call:${call.call_id}:1`
       });
 
       if (!shouldDialNow) {
@@ -6627,7 +7056,8 @@ app.post(
       const twilioCall = await placeTwilioCall(call, {
         force: forceCallNow,
         attemptId: firstAttempt.attempt_id,
-        source: "initial"
+        source: "initial",
+        callReason: "initial_lead_call"
       });
 
       res.status(201).json({
@@ -6654,6 +7084,16 @@ app.post(
     try {
       const call = await getCallById(req.params.callId);
       if (!call) throw new HttpError(404, "Call not found.");
+
+      logOutboundCallRejected(
+        call,
+        resolveOutboundCallReason(call, null),
+        "missing_permitted_call_reason"
+      );
+      throw new HttpError(
+        409,
+        "Generic retry calls are disabled. Use a confirmed scheduled second call."
+      );
 
       if (!terminalCallStatus(call.status)) {
         throw new HttpError(
@@ -8350,6 +8790,39 @@ async function runScheduler() {
               )
             )
           )
+          AND (
+            (
+              COALESCE(ac.result->>'outbound_call_reason', ac.payload->>'outbound_call_reason', '') = 'initial_lead_call'
+              AND ca.attempt_type = 'initial_lead_call'
+              AND ac.next_attempt_at IS NOT NULL
+              AND ac.next_attempt_at <= NOW()
+              AND ac.attempts = 0
+              AND ac.last_attempt_id IS NULL
+              AND ac.result->>'initial_call_claimed_at' IS NULL
+            )
+            OR (
+              ac.result->>'outbound_call_reason' = 'scheduled_second_call'
+              AND ca.attempt_type IN ('customer_callback', 'application_checkpoint')
+              AND ac.callback_requested = TRUE
+              AND ac.callback_at IS NOT NULL
+              AND ac.callback_at <= NOW()
+              AND ac.callback_at = ca.scheduled_at
+              AND ac.result->>'scheduled_second_call_appointment_id' IS NOT NULL
+              AND ac.result->>'scheduled_second_call_source_call_id' IS NOT NULL
+              AND ac.result->>'scheduled_second_call_dialed_at' IS NULL
+            )
+            OR (
+              ac.result->>'outbound_call_reason' = 'unexpected_disconnect_reconnect'
+              AND ca.attempt_type = 'disconnect_reconnect'
+              AND ac.callback_at IS NOT NULL
+              AND ac.callback_at <= NOW()
+              AND ac.callback_at = ca.scheduled_at
+              AND COALESCE(ac.result->>'unexpected_disconnect_reconnect_scheduled', 'false') = 'true'
+              AND COALESCE(ac.result->>'unexpected_disconnect_reconnect_attempted', 'false') <> 'true'
+              AND ac.result->>'reconnect_source_call_id' IS NOT NULL
+              AND ac.result->>'reconnect_source_twilio_call_sid' IS NOT NULL
+            )
+          )
           AND (ca.attempt_type <> 'cadence' OR ac.attempts < ac.max_attempts)
         ORDER BY ca.scheduled_at ASC
         LIMIT 10
@@ -8425,23 +8898,28 @@ async function runScheduler() {
           `
             UPDATE ai_calls
             SET
-              sequence_status = 'waiting_retry',
-              next_attempt_at = NOW() + INTERVAL '15 minutes',
+              sequence_status = 'human_action',
+              next_attempt_at = NULL,
               last_error = $2,
+              result = result || $3::jsonb,
               updated_at = NOW()
             WHERE call_id = $1
           `,
-          [row.call_id, cleanText(error.message, 4000)]
+          [
+            row.call_id,
+            cleanText(error.message, 4000),
+            JSON.stringify({ automatic_redial_disabled: true })
+          ]
         );
 
         await pool.query(
-          `UPDATE call_attempts SET technical_status = 'pending',
-           scheduled_at = NOW() + INTERVAL '15 minutes', completed_at = NULL,
+          `UPDATE call_attempts SET technical_status = 'failed',
+           completed_at = NOW(),
            updated_at = NOW() WHERE attempt_id = $1 AND completed_at IS NULL`,
           [row.attempt_id]
         );
 
-        queueMondaySync(row.call_id, "scheduler_failure");
+        queueMondaySync(row.call_id, "scheduler_failure_no_redial");
       }
     }
   } catch (error) {
