@@ -2522,6 +2522,12 @@ if (
   if (/send.*link|text.*link|want.*link|receive.*link/.test(text)) {
     return "application_link_permission";
   }
+  if (
+  /scheduledtospeakon.*isthatcorrect/.test(text) ||
+  /call.*on.*at.*isthatcorrect/.test(text)
+) {
+  return "callback_confirmation";
+}
   if (/when|whatday|whattime|timezone|followup|callback/.test(text)) {
     return "callback_time";
   }
@@ -6312,7 +6318,16 @@ async function executeDougTool(call, name, args, sessionCallPhase) {
         error: "The callback time must be confirmed by the customer."
       };
     }
-
+if (
+  call.result?.callback_confirmation_explicitly_answered !== true ||
+  call.result?.callback_confirmation_confirmed !== true
+) {
+  return {
+    success: false,
+    error:
+      "The customer must explicitly confirm the exact callback date, time, and timezone during the live conversation."
+  };
+}
     const confirmedCallback = resolveConfirmedCallbackDateTime(safeArgs, call);
     if (!confirmedCallback) {
       return {
@@ -6360,6 +6375,32 @@ async function executeDougTool(call, name, args, sessionCallPhase) {
     const isApplicationCheckpoint = normalizeMondayKey(reason).includes(
       "applicationcheckpoint"
     );
+    if (
+  isApplicationCheckpoint &&
+  sessionCallPhase === "CALL_ONE" &&
+  call.result?.application_start_plan_explicitly_answered !== true
+) {
+  return {
+    success: false,
+    error:
+      "Call One must reach and answer the application-start planning question before scheduling Call Two."
+  };
+}
+
+if (
+  isApplicationCheckpoint &&
+  sessionCallPhase === "CALL_TWO" &&
+  (
+    call.result?.application_status_explicitly_answered !== true ||
+    call.result?.application_started_confirmed !== false
+  )
+) {
+  return {
+    success: false,
+    error:
+      "A Call Two application checkpoint may only be scheduled after the customer explicitly says the application was not started."
+  };
+}
     const callbackAttemptType = isApplicationCheckpoint
       ? "application_checkpoint"
       : "customer_callback";
@@ -6418,6 +6459,8 @@ async function executeDougTool(call, name, args, sessionCallPhase) {
       callback_local_date: customerLocalDate,
       callback_local_time: customerLocalTime,
       callback_timezone: timezone,
+      callback_confirmation_explicitly_answered: false,
+callback_confirmation_confirmed: false,
       outbound_call_reason: "scheduled_second_call",
       scheduled_second_call_source_call_id: scheduledSecondCallSourceId,
       scheduled_second_call_appointment_id: scheduledSecondCallAppointmentId,
@@ -7923,47 +7966,240 @@ mediaServer.on("connection", (twilioSocket) => {
         purchase_area: confirmedPurchaseArea
       }));
       call = (await getCallById(call.call_id)) || call;
-      refreshActiveRealtimeInstructions();
-      await endLocalWaitingState("purchase_area_confirmed");
-      requestAssistantResponse({ queueIfBusy: true });
-      return;
-    }
 
-    if (pendingQuestionType === "application_started") {
-      const explicitAnswer = normalizeExplicitYesNo(transcript);
-      if (explicitAnswer === null) {
-        requestAssistantResponse({
-          queueIfBusy: true,
-          allowWhileAwaiting: true,
-          preservePendingQuestion: true,
-          response: {
-            output_modalities: ["audio"],
-            instructions:
-              'Ask exactly: "Did you have a chance to start the application?" Say nothing else.'
-          }
-        });
-        return;
+const customerName =
+  cleanText(
+    call?.payload?.first_name ||
+      call?.payload?.customer_name ||
+      call?.payload?.name,
+    160
+  ) || "there";
+
+refreshActiveRealtimeInstructions();
+await endLocalWaitingState("purchase_area_confirmed");
+
+requestAssistantResponse({
+  queueIfBusy: true,
+  response: {
+    output_modalities: ["audio"],
+    instructions: `Say exactly: ${JSON.stringify(
+      `Well, that's everything for this call, and now you're one step closer to becoming a homeowner in ${confirmedPurchaseArea}. Your next step is to start the application so I can follow up with you about its status, review your debt-to-income ratio, and explore potential program options. ${customerName}, do you think you'll have time to start the application today?`
+    )} Say nothing else.`
+  }
+});
+
+return;
+    }
+if (pendingQuestionType === "application_start_plan") {
+  const explicitAnswer = normalizeExplicitYesNo(transcript);
+
+  if (explicitAnswer === null) {
+    requestAssistantResponse({
+      queueIfBusy: true,
+      allowWhileAwaiting: true,
+      preservePendingQuestion: true,
+      response: {
+        output_modalities: ["audio"],
+        instructions:
+          'Ask exactly: "Was that a yes or a no?" Say nothing else.'
       }
-      if (sessionCallPhase !== "CALL_TWO") {
-        console.error(JSON.stringify({
-          event: "application_status_rejected",
-          call_id: call.call_id,
-          session_call_phase: sessionCallPhase,
-          reason: "application_status_answer_outside_call_two"
-        }));
-        return;
+    });
+    return;
+  }
+
+  await mergeCallResult(call.call_id, {
+    application_start_plan_explicitly_answered: true,
+    application_start_today_confirmed: explicitAnswer,
+    callback_confirmation_explicitly_answered: false,
+    callback_confirmation_confirmed: false
+  });
+
+  call = (await getCallById(call.call_id)) || call;
+  await endLocalWaitingState("explicit_application_start_plan_answer");
+
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions: explicitAnswer
+        ? 'Ask exactly: "Excellent. What time tomorrow would be best for our second call?" Say nothing else.'
+        : 'Ask exactly: "No problem. What day do you think you will have time to start it?" Say nothing else.'
+    }
+  });
+
+  return;
+}
+    if (pendingQuestionType === "application_start_plan") {
+  const explicitAnswer = normalizeExplicitYesNo(transcript);
+
+  if (explicitAnswer === null) {
+    requestAssistantResponse({
+      queueIfBusy: true,
+      allowWhileAwaiting: true,
+      preservePendingQuestion: true,
+      response: {
+        output_modalities: ["audio"],
+        instructions:
+          'Ask exactly: "Was that a yes or a no?" Say nothing else.'
       }
+    });
+    return;
+  }
+
+  await mergeCallResult(call.call_id, {
+    application_start_plan_explicitly_answered: true,
+    application_start_today_confirmed: explicitAnswer,
+    callback_confirmation_explicitly_answered: false,
+    callback_confirmation_confirmed: false
+  });
+
+  call = (await getCallById(call.call_id)) || call;
+  await endLocalWaitingState("explicit_application_start_plan_answer");
+
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions: explicitAnswer
+        ? 'Ask exactly: "Excellent. What time tomorrow would be best for our second call?" Say nothing else.'
+        : 'Ask exactly: "No problem. What day do you think you will have time to start it?" Say nothing else.'
+    }
+  });
+
+  return;
+}
+    }
+if (pendingQuestionType === "application_started") {
+  const explicitAnswer = normalizeApplicationStartedAnswer(transcript);
+
+  if (explicitAnswer === null) {
+    const clarificationUsed =
+      call.result?.application_status_clarification_used === true;
+
+    if (!clarificationUsed) {
       await mergeCallResult(call.call_id, {
-        application_status_explicitly_answered: true,
-        application_started_confirmed: explicitAnswer,
-        app_started_confirmation: explicitAnswer ? "Yes" : "No"
+        application_status_clarification_used: true
       });
+
       call = (await getCallById(call.call_id)) || call;
-      await endLocalWaitingState("explicit_application_status_answer");
-      requestAssistantResponse({ queueIfBusy: true });
+
+      requestAssistantResponse({
+        queueIfBusy: true,
+        allowWhileAwaiting: true,
+        preservePendingQuestion: true,
+        response: {
+          output_modalities: ["audio"],
+          instructions:
+            'Ask exactly: "Was that a yes or a no?" Say nothing else.'
+        }
+      });
+
       return;
     }
 
+    await endLocalWaitingState(
+      "application_status_unclear_after_clarification"
+    );
+
+    requestAssistantResponse({
+      queueIfBusy: true,
+      response: {
+        output_modalities: ["audio"],
+        instructions:
+          'Say exactly: "No problem. We can come back to that. Would you like me to help you calculate a preliminary debt-to-income estimate now?" Say nothing else.'
+      }
+    });
+
+    return;
+  }
+
+  if (sessionCallPhase !== "CALL_TWO") {
+    sessionCallPhase = "CALL_TWO";
+
+    await appendAction(call.call_id, {
+      action: "session_call_phase_recovered",
+      success: true,
+      recovered_phase: "CALL_TWO",
+      reason: "explicit_application_status_question"
+    });
+
+    refreshActiveRealtimeInstructions();
+  }
+
+  await mergeCallResult(call.call_id, {
+    application_status_explicitly_answered: true,
+    application_started_confirmed: explicitAnswer,
+    app_started_confirmation: explicitAnswer ? "Yes" : "No",
+    application_status_clarification_used: false
+  });
+
+  call = (await getCallById(call.call_id)) || call;
+  refreshActiveRealtimeInstructions();
+
+  await endLocalWaitingState(
+    "explicit_application_status_answer"
+  );
+
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions: explicitAnswer
+        ? 'Say exactly: "Excellent. That’s great to hear. Before I connect you with the next step, let’s review your preliminary debt-to-income ratio. Do you have a few minutes to do that now?" Say nothing else.'
+        : 'Say exactly: "No worries. One of the main things that can affect your homebuying options is your debt-to-income ratio. Would you like me to help you calculate a preliminary DTI estimate now?" Say nothing else.'
+    }
+  });
+
+  return;
+}
+  if (pendingQuestionType === "callback_confirmation") {
+  const explicitAnswer = normalizeExplicitYesNo(transcript);
+
+  if (explicitAnswer === null) {
+    requestAssistantResponse({
+      queueIfBusy: true,
+      allowWhileAwaiting: true,
+      preservePendingQuestion: true,
+      response: {
+        output_modalities: ["audio"],
+        instructions:
+          'Ask exactly: "Was that a yes or a no?" Say nothing else.'
+      }
+    });
+    return;
+  }
+
+  await mergeCallResult(call.call_id, {
+    callback_confirmation_explicitly_answered: true,
+    callback_confirmation_confirmed: explicitAnswer
+  });
+
+  call = (await getCallById(call.call_id)) || call;
+  await endLocalWaitingState("explicit_callback_confirmation_answer");
+
+  if (!explicitAnswer) {
+    requestAssistantResponse({
+      queueIfBusy: true,
+      response: {
+        output_modalities: ["audio"],
+        instructions:
+          'Say exactly: "No problem. What date and time would work better for you?" Say nothing else.'
+      }
+    });
+    return;
+  }
+
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions:
+        "The customer explicitly confirmed the callback appointment. Use schedule_callback now with the exact confirmed date, time, timezone, reason, and prospect_confirmed set to true. Do not ask another question."
+    }
+  });
+
+  return;
+}
     const professionalAnswerKey = ["has_realtor", "applied_with_lender"].includes(
       String(pendingQuestionType || "")
     )
