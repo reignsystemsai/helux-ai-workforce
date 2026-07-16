@@ -900,7 +900,7 @@ WAIT.
 IF THE CUSTOMER SAYS YES
 
 Daisy asks:
-"Excellent. What time tomorrow would be best for our second call?"
+"Excellent. What time zone are you in, and what time tomorrow would be best for our second call?"
 
 WAIT.
 
@@ -5938,16 +5938,30 @@ function localDateTimeToUtc(dateText, timeText, timeZone) {
 }
 
 function resolveConfirmedCallbackDateTime(args, call) {
-  const requestedTimezone = cleanText(args.timezone, 100);
-  if (!requestedTimezone) return null;
-  let timeZone;
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: requestedTimezone }).format(
-      new Date()
-    );
-    timeZone = requestedTimezone;
-  } catch {
-    return null;
+  const requestedTimezone =
+  cleanText(args.timezone, 100) ||
+  cleanText(call?.callback_timezone, 100) ||
+  cleanText(call?.result?.callback_timezone, 100);
+
+if (!requestedTimezone) return null;
+
+const timezoneKey = normalizeMondayKey(requestedTimezone);
+
+const timeZone =
+  ["eastern", "easterntime", "et", "est", "edt"].includes(timezoneKey)
+    ? "America/New_York"
+    : ["central", "centraltime", "ct", "cst", "cdt"].includes(timezoneKey)
+      ? "America/Chicago"
+      : ["mountain", "mountaintime", "mt", "mst", "mdt"].includes(timezoneKey)
+        ? "America/Denver"
+        : ["pacific", "pacifictime", "pt", "pst", "pdt"].includes(timezoneKey)
+          ? "America/Los_Angeles"
+          : requestedTimezone;
+
+try {
+  new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
+} catch {
+  return null;
   }
   const customerLocalDate = parseConfirmedLocalDate(
     args.customer_local_date,
@@ -8022,7 +8036,7 @@ if (pendingQuestionType === "application_start_plan") {
     response: {
       output_modalities: ["audio"],
       instructions: explicitAnswer
-        ? 'Ask exactly: "Excellent. What time tomorrow would be best for our second call?" Say nothing else.'
+        ? 'Ask exactly: "Excellent. What time zone are you in and what tomorrow would be best for our second call?" Say nothing else.'
         : 'Ask exactly: "No problem. What day do you think you will have time to start it?" Say nothing else.'
     }
   });
@@ -8107,6 +8121,96 @@ if (pendingQuestionType === "application_started") {
       instructions: explicitAnswer
         ? 'Say exactly: "Excellent. That’s great to hear. Before I connect you with the next step, let’s review your preliminary debt-to-income ratio. Do you have a few minutes to do that now?" Say nothing else.'
         : 'Say exactly: "No worries. One of the main things that can affect your homebuying options is your debt-to-income ratio. Would you like me to help you calculate a preliminary DTI estimate now?" Say nothing else.'
+    }
+  });
+
+  return;
+}
+    if (pendingQuestionType === "callback_time") {
+  const answerText = cleanText(transcript, 500);
+  const normalizedPrompt = normalizeMondayKey(pendingQuestionText);
+
+  const applicationStartDateOnly =
+    /whatday.*(?:startit|start.*application)/.test(normalizedPrompt);
+
+  if (applicationStartDateOnly) {
+    await mergeCallResult(call.call_id, {
+      application_start_date_answer: answerText,
+      callback_confirmation_explicitly_answered: false,
+      callback_confirmation_confirmed: false
+    });
+
+    call = (await getCallById(call.call_id)) || call;
+    await endLocalWaitingState("application_start_date_collected");
+
+    requestAssistantResponse({
+      queueIfBusy: true,
+      response: {
+        output_modalities: ["audio"],
+        instructions:
+          'Ask exactly: "And what time zone are you in—Eastern, Central, Mountain, or Pacific—and what time would be best for me to follow up with you the following day?" Say nothing else.'
+      }
+    });
+
+    return;
+  }
+
+  const previousCallbackAnswer =
+    cleanText(call.result?.callback_datetime_answer, 500);
+
+  const savedTimezone =
+    cleanText(call.callback_timezone, 100) ||
+    cleanText(call.result?.callback_timezone, 100);
+
+  const normalizedAnswer = normalizeCustomerUtterance(answerText);
+
+  const answerIncludesTimezone =
+    /\b(eastern|central|mountain|pacific|et|est|edt|ct|cst|cdt|mt|mst|mdt|pt|pst|pdt)\b/.test(
+      normalizedAnswer
+    );
+
+  await mergeCallResult(call.call_id, {
+    callback_datetime_answer: answerText,
+    callback_confirmation_explicitly_answered: false,
+    callback_confirmation_confirmed: false
+  });
+
+  call = (await getCallById(call.call_id)) || call;
+  await endLocalWaitingState("callback_datetime_collected");
+
+  if (!savedTimezone && !answerIncludesTimezone) {
+    requestAssistantResponse({
+      queueIfBusy: true,
+      response: {
+        output_modalities: ["audio"],
+        instructions:
+          'Ask exactly: "What time zone are you in—Eastern, Central, Mountain, or Pacific?" Say nothing else.'
+      }
+    });
+
+    return;
+  }
+
+  const combinedAnswer = [previousCallbackAnswer, answerText]
+    .filter(Boolean)
+    .join(" ");
+
+  const applicationStartDate =
+    cleanText(call.result?.application_start_date_answer, 500);
+
+  requestAssistantResponse({
+    queueIfBusy: true,
+    response: {
+      output_modalities: ["audio"],
+      instructions: `The customer provided these callback details: ${JSON.stringify(
+        combinedAnswer
+      )}.${
+        applicationStartDate
+          ? ` The customer plans to start the application on ${JSON.stringify(
+              applicationStartDate
+            )}, so the callback must be scheduled for the following day.`
+          : ""
+      } Do not call schedule_callback yet. Resolve the exact callback date, local time, and timezone. Ask exactly one confirmation question in this format: "I have us scheduled to speak on [exact date] at [exact time] [timezone]. Is that correct?" Say nothing else.`
     }
   });
 
