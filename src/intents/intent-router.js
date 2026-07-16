@@ -7,11 +7,13 @@ const handlers = Object.freeze({
   send_resource_link: require("../actions/send-resource-link"),
   save_call_progress: require("../actions/save-call-progress"), calculate_preliminary_dti: require("../actions/calculate-dti"),
   create_specialist_handoff: require("../actions/specialist-handoff"), transfer_to_specialist: require("../actions/transfer-specialist"),
-  mark_contact_restriction: require("../actions/contact-restriction"), complete_call: require("../actions/complete-call")
+  mark_contact_restriction: require("../actions/contact-restriction"),
+  complete_call: require("../actions/complete-call"),
+  create_confirmed_appointment: require("../actions/create-confirmed-appointment")
 });
 
 function publicData(result = {}) {
-  const allowed = ["resource_type", "preliminary_dti_percent", "preliminary_dti_classification", "timezone", "outcome", "sequence_status", "saved_fields", "current_state", "next_state", "confirmation_sms_sent"];
+  const allowed = ["resource_type", "preliminary_dti_percent", "preliminary_dti_classification", "timezone", "timezone_label", "outcome", "sequence_status", "saved_fields", "current_state", "next_state", "confirmation_sms_sent", "callback_at", "customer_local_date", "customer_local_time", "callback_type", "callback_reason", "appointment_id", "next_action"];
   return Object.fromEntries(allowed.filter((key) => result[key] !== undefined).map((key) => [key, result[key]]));
 }
 

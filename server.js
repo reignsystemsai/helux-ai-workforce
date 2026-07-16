@@ -15,6 +15,10 @@ const { isListeningAcknowledgement } = require("./src/realtime/interruption-mana
 const { semanticTurnDelay } = require("./src/realtime/turn-manager");
 const { DEFAULTS: REALTIME_DEFAULTS } = require("./src/realtime/latency-manager");
 const { buildRealtimeSession } = require("./src/realtime/openai-session");
+const {
+  SchedulingError,
+  createConfirmedAppointment
+} = require("./src/scheduling/confirmed-appointment");
 
 /*
  * HELUX AI WORKFORCE - DAISY 3.2.0
@@ -604,6 +608,9 @@ Saved purchase timeline: {purchase_timeframe}
 Saved purchase area: {purchase_area}
 Saved lender status: {has_lender}
 Saved Realtor status: {has_realtor}
+Confirmed customer timezone: {customer_timezone_label}
+Current source call ID: {source_call_id}
+Current UTC datetime: {current_utc_datetime}
 Previous call summary: {previous_call_summary}
 
 Never speak "not provided" as though it were customer data. When a value is unavailable, use a natural generic version of the sentence.
@@ -711,14 +718,38 @@ Save corrections without asking the customer to repeat information that remains 
 CONFIRM AVAILABILITY
 
 Daisy says:
-"Wonderful, {customer_name}. It sounds like you're ready to explore down payment assistance and take the next step toward becoming a homeowner. Do you have a minute or two so I can ask a few quick questions?"
+"Wonderful. {customer_name}, it really sounds like you're ready to secure down payment assistance funds and become a homeowner. Do you have a minute or two so I can explain our two-call process?"
 
 WAIT.
+
+IF ANOTHER TIME IS BETTER
+
+Daisy says:
+"No problem. What date and time would work better for you?"
+
+WAIT. Require a specific calendar date and exact time. Ask only for a missing detail. Never accept "later," "sometime tomorrow," "in the afternoon," "next week," or "whenever" as complete.
+
+If Confirmed customer timezone is Eastern, Central, Mountain, or Pacific, reuse it and do not ask for it. Otherwise ask exactly:
+"Oh, by the way, {customer_name}, is that Eastern, Central, Mountain, or Pacific time?"
+
+WAIT.
+
+Repeat the exact complete appointment:
+"Excellent. I'll call you on {callback_date} at {callback_time} {callback_timezone}. Is that correct?"
+
+WAIT. Only a clear yes confirms it. If the customer corrects the timezone, use the correction, recalculate, repeat the complete appointment, and require confirmation again.
+
+After clear confirmation call create_confirmed_appointment with callback_type "call_one_rescheduled", callback_reason "Customer requested another time to complete Call One", prospect_confirmed true, and Current source call ID. Do not call it with incomplete or inferred values. Do not claim scheduling succeeded unless the tool returns success true.
+
+After success, use complete_call. The server then plays this final closing:
+"Perfect. I have us scheduled to speak again. Thank you for your time, {customer_name}. I'll speak with you then. Have a great day."
+
+End normally after the closing. The server physically disconnects the current call.
 
 EXPLAIN THE CALL
 
 When the customer can continue, Daisy says:
-"Perfect, this will be quick. I'll cover your purchase timeline, whether you're working with a lender or Realtor, and the area where you'd like to purchase. How does that sound?"
+"Perfect, this will be quick. Our two-call process is simple. Call One, which is now, quickly covers your purchase timeline, whether you're working with a lender or Realtor, and the area where you'd like to purchase. On Call Two, we'll review your application status, debt-to-income ratio, and potential program options, and make sure you're connected with DPA lender and Realtor specialists when needed. How does that sound?"
 
 WAIT.
 
@@ -768,24 +799,53 @@ Save has_realtor as Yes or No.
 QUESTION FOUR — PURCHASE AREA
 
 Daisy says:
-"And one more question: what area would you like to purchase a home in?"
+"And one more question before we schedule your second call: what area would you like to purchase a home in?"
 
 WAIT.
 
 Save the customer's exact meaningful answer as purchase_area without changing its spelling or location. Never infer it from lead city, ZIP code, intake data, Monday.com, another lead, or a nearby city. If the answer is unclear, ask exactly: "What city or area would you like to purchase in?" Do not guess.
 
-END CALL ONE
+SCHEDULE CALL TWO
 
 After saving the exact purchase area, Daisy says:
 "{purchase_area_closing}"
 
-Then:
-- Save all captured answers and the summary.
-- Use complete_call.
-- After complete_call succeeds, play the existing final closing.
-- Ask no additional questions.
-- End the call normally and allow the server to physically disconnect it.
-- A successfully completed call must not trigger a reconnect.
+Then Daisy says:
+"Your next step is to start the application so I can follow up with you about its status, explore potential program options, and review your preliminary debt-to-income ratio. How does that sound?"
+
+WAIT.
+
+Then ask:
+"{customer_name}, do you think you'll have time to start the application today?"
+
+WAIT.
+
+If yes, ask:
+"Excellent. Would it be okay if I scheduled our second call for approximately 24 hours from now?"
+
+WAIT. Using Current UTC datetime and the confirmed customer timezone, propose the exact calendar date approximately 24 hours later. Ask for the exact callback time when it has not been provided. Approximately 24 hours is only a proposal and is never complete scheduling information. Ask only for missing details.
+
+If the customer cannot start today, ask:
+"That's understandable. When do you think you'll have time to get started?"
+
+WAIT. Propose the exact calendar date approximately 24 hours after that point, then collect the exact time. Ask only for missing details.
+
+For either path, reuse Confirmed customer timezone when valid and do not ask again. If it is not available, ask exactly:
+"Oh, by the way, {customer_name}, is that Eastern, Central, Mountain, or Pacific time?"
+
+WAIT.
+
+Repeat the exact complete appointment:
+"I have us confirmed to speak on {callback_date} at {callback_time} {callback_timezone}. Is that correct?"
+
+WAIT. Only a clear yes confirms it. A timezone correction requires recalculation, a complete corrected repetition, and confirmation again.
+
+After clear confirmation call create_confirmed_appointment with callback_type "call_two_application_follow_up", callback_reason "Application status, program options, and preliminary DTI follow-up", prospect_confirmed true, and Current source call ID. Never call it from an assumed, vague, incomplete, or inferred answer. Do not claim scheduling succeeded unless the tool returns success true.
+
+After success, save all captured answers and the summary, then use complete_call. The server plays this final closing:
+"Excellent. Thank you for your time, {customer_name}. I look forward to speaking with you then. If there's nothing else, please feel free to disconnect the call. Have a great day."
+
+Allow the closing to finish and end normally. The server physically disconnects the current call. A successful normal completion must not trigger reconnect.
 
 ==================================================
 6. REQUIRED RHYTHM
@@ -899,6 +959,13 @@ income_submitted:
    purchase_area_closing: confirmedPurchaseArea
   ? `Well, that's everything for this call, and now you're one step closer to becoming a homeowner in ${confirmedPurchaseArea}.`
   : "Well, that's everything for this call, and now you're one step closer to becoming a homeowner.",
+    customer_timezone_label:
+      result.customer_timezone_confirmed === true &&
+      ["Eastern", "Central", "Mountain", "Pacific"].includes(result.customer_timezone_label)
+        ? result.customer_timezone_label
+        : "not confirmed",
+    source_call_id: call.call_id,
+    current_utc_datetime: new Date().toISOString(),
     previous_call_summary:
       cleanText(
         call.summary ??
@@ -1250,6 +1317,13 @@ async function initializeDatabase() {
     ["attempt_type", "VARCHAR(50) NOT NULL DEFAULT 'initial_lead_call'"],
     ["idempotency_key", "VARCHAR(255)"],
     ["cancellation_reason", "TEXT"],
+    ["scheduled_for", "TIMESTAMPTZ"],
+    ["appointment_id", "VARCHAR(100)"],
+    ["callback_type", "VARCHAR(80)"],
+    ["callback_reason", "TEXT"],
+    ["callback_timezone", "VARCHAR(100)"],
+    ["callback_timezone_label", "VARCHAR(30)"],
+    ["source_call_id", "VARCHAR(100)"],
     ["created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"],
     ["updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"]
   ];
@@ -1260,6 +1334,33 @@ async function initializeDatabase() {
       `ALTER TABLE call_attempts ADD COLUMN IF NOT EXISTS ${columnName} ${definition}`
     );
   }
+
+  await runMigrationStep(
+    "create scheduled_appointments",
+    `
+      CREATE TABLE IF NOT EXISTS scheduled_appointments (
+        id BIGSERIAL PRIMARY KEY,
+        appointment_id VARCHAR(100) UNIQUE NOT NULL,
+        customer_key VARCHAR(400) NOT NULL,
+        source_call_id VARCHAR(100) NOT NULL,
+        case_id VARCHAR(150),
+        lead_id VARCHAR(150),
+        callback_at TIMESTAMPTZ NOT NULL,
+        customer_local_date DATE NOT NULL,
+        customer_local_time TIME NOT NULL,
+        timezone VARCHAR(100) NOT NULL,
+        timezone_label VARCHAR(30) NOT NULL,
+        callback_type VARCHAR(80) NOT NULL,
+        callback_reason TEXT NOT NULL,
+        discussion_summary TEXT,
+        prospect_confirmed BOOLEAN NOT NULL CHECK (prospect_confirmed = TRUE),
+        next_action TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (customer_key, callback_type, callback_at)
+      )
+    `
+  );
 
   await runMigrationStep(
     "create integration_state",
@@ -1324,6 +1425,14 @@ async function initializeDatabase() {
     [
       "idx_call_attempts_idempotency_key",
       "CREATE UNIQUE INDEX IF NOT EXISTS idx_call_attempts_idempotency_key ON call_attempts(idempotency_key) WHERE idempotency_key IS NOT NULL"
+    ],
+    [
+      "idx_call_attempts_appointment",
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_call_attempts_appointment ON call_attempts(appointment_id) WHERE appointment_id IS NOT NULL"
+    ],
+    [
+      "idx_call_attempts_scheduled_for",
+      "CREATE INDEX IF NOT EXISTS idx_call_attempts_scheduled_for ON call_attempts(scheduled_for) WHERE technical_status = 'pending'"
     ],
     [
       "idx_sms_deliveries_call_id",
@@ -2579,6 +2688,16 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
   );
   assignMondayValue(values, board, ["Do Not Call"], call.do_not_call === true);
   assignMondayValue(values, board, ["Next Action"], call.next_action);
+  assignMondayValue(values, board, ["Customer Timezone", "Customer Time Zone"], result.customer_timezone);
+  assignMondayValue(values, board, ["Customer Timezone Label", "Customer Time Zone Label"], result.customer_timezone_label);
+  assignMondayValue(values, board, ["Callback At", "Appointment At"], result.callback_at);
+  assignMondayValue(values, board, ["Callback Local Date", "Appointment Date"], result.callback_local_date);
+  assignMondayValue(values, board, ["Callback Local Time", "Appointment Time"], result.callback_local_time);
+  assignMondayValue(values, board, ["Callback Timezone", "Appointment Timezone"], result.callback_timezone);
+  assignMondayValue(values, board, ["Callback Timezone Label"], result.callback_timezone_label);
+  assignMondayValue(values, board, ["Callback Reason", "Appointment Reason"], result.callback_reason);
+  assignMondayValue(values, board, ["Callback Type", "Appointment Type"], result.callback_type);
+  assignMondayValue(values, board, ["Appointment ID"], result.appointment_id);
   assignMondayValue(
     values,
     board,
@@ -3652,7 +3771,12 @@ function publicCallResult(result = {}) {
     "final_hangup_requested",
     "final_hangup_completed",
     "completion_reason",
-    "contact_restriction"
+    "contact_restriction",
+    "customer_timezone", "customer_timezone_label", "customer_timezone_confirmed",
+    "customer_timezone_confirmed_at", "callback_at", "callback_local_date",
+    "callback_local_time", "callback_timezone", "callback_timezone_label",
+    "callback_reason", "callback_type", "callback_confirmed", "callback_created_at",
+    "callback_source_call_id", "appointment_id"
   ];
   return Object.fromEntries(
     fields
@@ -4255,6 +4379,25 @@ async function executeDougTool(call, name, args, sessionCallPhase) {
         ? "call_ended_contact_restriction"
         : `call_ended_${cleanText(safeArgs.outcome, 80) || "complete_call"}`
     );
+  }
+
+  if (name === "create_confirmed_appointment") {
+    if (cleanText(safeArgs.source_call_id, 100) !== call.call_id) {
+      return { success: false, error: "The appointment must use the current source call." };
+    }
+    try {
+      const appointment = await createConfirmedAppointment({
+        pool,
+        input: { ...safeArgs, source_call_id: call.call_id }
+      });
+      queueMondaySync(call.call_id, "confirmed_appointment_created");
+      return appointment;
+    } catch (error) {
+      if (error instanceof SchedulingError) {
+        return { success: false, error: error.message, error_code: error.code };
+      }
+      throw error;
+    }
   }
 
   if (name === "save_call_progress") {
@@ -4860,6 +5003,36 @@ app.post(
         inbound_sync_enabled: MONDAY_INBOUND_SYNC_ENABLED,
         webhook_ids: webhookIds
       });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+app.post(
+  "/api/v1/scheduling/confirmed-appointments",
+  authenticateHelux,
+  async (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const acceptedFields = new Set([
+        "customer_local_date",
+        "customer_local_time",
+        "timezone",
+        "timezone_label",
+        "callback_type",
+        "callback_reason",
+        "prospect_confirmed",
+        "source_call_id",
+        "discussion_summary"
+      ]);
+      const unexpected = Object.keys(body).filter((field) => !acceptedFields.has(field));
+      if (unexpected.length) {
+        throw new HttpError(422, `Unsupported scheduling fields: ${unexpected.join(", ")}.`);
+      }
+      const appointment = await createConfirmedAppointment({ pool, input: body });
+      queueMondaySync(body.source_call_id, "confirmed_appointment_api_created");
+      res.status(201).json(appointment);
     } catch (error) {
       next(error);
     }
@@ -6113,12 +6286,18 @@ mediaServer.on("connection", (twilioSocket) => {
           lead.first_name || lead.customer_name || lead.name,
           160
         ) || "the customer";
+      const callbackType = call.result?.callback_type;
+      const finalClosing = callbackType === "call_one_rescheduled"
+        ? `Perfect. I have us scheduled to speak again. Thank you for your time, ${customerName}. I'll speak with you then. Have a great day.`
+        : callbackType === "call_two_application_follow_up"
+          ? `Excellent. Thank you for your time, ${customerName}. I look forward to speaking with you then. If there's nothing else, please feel free to disconnect the call. Have a great day.`
+          : `If there's nothing else, thank you for your time, ${customerName}. Have a great day.`;
       requestAssistantResponse({
         queueIfBusy: true,
         allowTerminalClosing: true,
         response: {
           output_modalities: ["audio"],
-          instructions: `Say exactly: "If there's nothing else, thank you for your time, ${customerName}. Have a great day." Then stop speaking. Do not ask a question. Do not wait for another response. Do not call another tool. Do not add any other sentence.`
+          instructions: `Say exactly: "${finalClosing}" Then stop speaking. Do not ask a question. Do not wait for another response. Do not call another tool. Do not add any other sentence.`
         }
       });
     } else {
@@ -6751,7 +6930,10 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 app.use((error, req, res, next) => {
-  const statusCode = error instanceof HttpError ? error.statusCode : 500;
+  const statusCode =
+    error instanceof HttpError || error instanceof SchedulingError
+      ? error.statusCode
+      : 500;
 
   if (statusCode >= 500) {
     console.error("HELUX AI Workforce request failed:", error);
@@ -6763,7 +6945,8 @@ app.use((error, req, res, next) => {
 
   res.status(statusCode).json({
     success: false,
-    error: statusCode >= 500 ? "Internal server error." : error.message
+    error: statusCode >= 500 ? "Internal server error." : error.message,
+    ...(error instanceof SchedulingError ? { code: error.code } : {})
   });
 });
 
