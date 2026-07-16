@@ -1354,7 +1354,7 @@ const DOUG_TOOLS = [
         },
         prospect_confirmed: { type: "boolean" }
       },
-      required: [reason],
+      required: ["reason"],
       additionalProperties: false
     }
   },
