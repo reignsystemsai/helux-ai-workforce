@@ -287,7 +287,6 @@ function normalizeExplicitYesNo(value) {
   if (positivePatterns.some((pattern) => pattern.test(normalized))) return true;
   return null;
 }
-
 function wholeNumberToWords(value) {
   const number = Math.trunc(Number(value));
   if (!Number.isSafeInteger(number) || number < 0) return null;
@@ -565,7 +564,7 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - If the customer asks a separate question, answer it briefly, then return to the one pending script question.
 - Use submitted information. Confirm it instead of repeating the intake form.
 - Never manufacture, infer, or complete an answer for the customer.
-- Never narrate internal thinking, planning, tool execution, retries, calculations, or next-step selection. Do not say "let me think," "let me figure that out," "let me line that up," "one moment," or similar filler. Either ask the next scripted question or provide the confirmed result.
+- Never narrate internal thinking, planning, tool execution, retries, calculations, or next-step selection. Never say "Okay, let's line up your next step," "Let's line up your next step," "Let me line that up," "Okay, let me line up the next step," "let me think," "let me figure that out," "one moment," or similar filler.
 - After a customer answers, transition directly to the next scripted sentence.
 - Do not fill tool-execution time with narration.
 - If a tool fails, do not narrate a retry.
@@ -596,6 +595,7 @@ When the current call has no remaining question or action:
 Runtime mode: {call_mode}
 Customer: {customer_name}
 Estimated assistance: {estimated_dpa}
+Submitted credit score:  {credit_score_submitted}
 Submitted income: {income_submitted}
 Submitted work history: {work_history_submitted}
 Submitted tax-return information: {tax_return_submitted}
@@ -698,7 +698,7 @@ When the customer corrects the amount or first-time-homebuyer status:
 CONFIRM SUBMITTED INFORMATION
 
 When all submitted values are available, Daisy says:
-"Excellent. Based on your submitted income of {income_submitted}, your work history of {work_history_submitted}, and your tax-return information of {tax_return_submitted}, reviewing down payment assistance options should be straightforward. Is all of that information still correct?"
+"Excellent. Based on your submitted credit score of (credit_score_submitted}, income of {income_submitted}, your work history of {work_history_submitted}, and your tax-return information of {tax_return_submitted}, reviewing down payment assistance options should be in your favor. Is all of that information correct?"
 
 When one or more values are unavailable:
 - Confirm only the values that are available.
@@ -856,10 +856,18 @@ function buildDouglasDaisyInstructions(call, sessionCallPhase) {
     internal_customer_name:
       cleanText(lead.customer_name, 160) || "the customer",
     estimated_dpa:
-      formatAssistanceAmount(lead.estimated_dpa) || "not provided",
-    income_submitted:
-      formatIncomeForDaisy(lead.household_income ?? lead.income) ||
-      "not provided",
+  formatAssistanceAmount(lead.estimated_dpa) || "not provided",
+credit_score_submitted:
+  cleanText(
+    lead.credit_score ??
+      lead.mid_fico ??
+      lead.fico_score ??
+      lead.fico,
+    50
+  ) || "not provided",
+income_submitted:
+  formatIncomeForDaisy(lead.household_income ?? lead.income) ||
+  "not provided",
     work_history_submitted:
       cleanText(
         lead.employment_history ?? lead.employment,
@@ -888,9 +896,9 @@ function buildDouglasDaisyInstructions(call, sessionCallPhase) {
       "not provided",
     purchase_area:
       confirmedPurchaseArea || "not provided",
-    purchase_area_closing: confirmedPurchaseArea
-      ? `Well, that's everything for this call, and now you're one step closer to becoming a homeowner in ${confirmedPurchaseArea}.`
-      : "Well, that's everything for this call, and now you're one step closer to becoming a homeowner.",
+   purchase_area_closing: confirmedPurchaseArea
+  ? `Well, that's everything for this call, and now you're one step closer to becoming a homeowner in ${confirmedPurchaseArea}.`
+  : "Well, that's everything for this call, and now you're one step closer to becoming a homeowner.",
     previous_call_summary:
       cleanText(
         call.summary ??
@@ -1655,9 +1663,6 @@ function pendingQuestionType(value) {
   if (/what.*(?:city|area).*purchase|area.*purchase.*home/.test(text)) {
     return "purchase_area";
   }
-  if (/start.*application|application.*start/.test(text)) {
-    return "application_started";
-  }
   if (/send.*link|text.*link|want.*link|receive.*link/.test(text)) {
     return "application_link_permission";
   }
@@ -2386,7 +2391,6 @@ function businessOutcomeLabel(outcome) {
     application_link_sent: "Application Sent",
     dti_calculator_sent: "DTI Sent",
     agent_notified: "Agent Notified",
-    application_started_hot_lead: "Application Started — Hot Lead",
     needs_review: "Needs Review",
     nurture: "Nurture",
     not_interested: "Not Interested",
@@ -5352,6 +5356,7 @@ mediaServer.on("connection", (twilioSocket) => {
   let finalPlaybackMarkName = "";
   let finalHangupInProgress = false;
   let finalHangupCompleted = false;
+  let finalHangupAttemptCount = 0;
   let finalHangupFallbackTimer = null;
   let finalAbsoluteHangupTimer = null;
   let activeTwilioCallSid = "";
@@ -5756,6 +5761,7 @@ mediaServer.on("connection", (twilioSocket) => {
         purchase_area: confirmedPurchaseArea
       }));
       call = (await getCallById(call.call_id)) || call;
+
       refreshActiveRealtimeInstructions();
       await endLocalWaitingState("purchase_area_confirmed");
       requestAssistantResponse({ queueIfBusy: true });
@@ -5892,7 +5898,8 @@ mediaServer.on("connection", (twilioSocket) => {
     if (
       !normalEndRequested ||
       finalHangupInProgress ||
-      finalHangupCompleted
+      finalHangupCompleted ||
+      finalHangupAttemptCount >= 3
     ) {
       return false;
     }
@@ -5918,20 +5925,26 @@ mediaServer.on("connection", (twilioSocket) => {
 
       let updatedCall = null;
       let lastUpdateError = null;
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        try {
-          updatedCall = await twilioClient
-            .calls(twilioCallSid)
-            .update({
-              status: "completed"
-            });
-          lastUpdateError = null;
-          break;
-        } catch (error) {
-          lastUpdateError = error;
-          if (attempt < 3) await sleep(attempt === 1 ? 500 : 1000);
-        }
-      }
+      while (finalHangupAttemptCount < 3) {
+  finalHangupAttemptCount += 1;
+
+  try {
+    updatedCall = await twilioClient
+      .calls(twilioCallSid)
+      .update({
+        status: "completed"
+      });
+
+    lastUpdateError = null;
+    break;
+  } catch (error) {
+    lastUpdateError = error;
+
+    if (finalHangupAttemptCount < 3) {
+      await sleep(finalHangupAttemptCount === 1 ? 500 : 1000);
+    }
+  }
+}
       if (lastUpdateError) throw lastUpdateError;
 
       finalHangupCompleted = true;
