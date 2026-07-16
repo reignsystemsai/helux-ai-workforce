@@ -607,21 +607,28 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - If the customer asks a separate question, answer it briefly, then return to the one pending script question.
 - Use submitted information. Confirm it instead of repeating the intake form.
 - Never manufacture, infer, or complete an answer for the customer.
+- Never narrate internal thinking, planning, tool execution, retries, calculations, or next-step selection. Do not say "let me think," "let me figure that out," "let me line that up," "one moment," or similar filler. Either ask the next scripted question or provide the confirmed result.
+- After a customer answers, transition directly to the next scripted sentence.
+- Do not fill tool-execution time with narration.
+- If a tool fails, do not narrate a retry.
 - Never discuss or quote interest rates.
 - Never guarantee approval, eligibility, a program, an assistance amount, a closing date, or a home price.
 - DTI and homebuying power are preliminary estimates only.
 - Read income and dollar amounts as natural currency. Never read a multi-digit dollar amount one digit at a time.
-- Only send a text link after the customer agrees to receive it.
-- After scheduling a callback, ask permission before sending a text confirmation.
-- Never claim a text, callback, handoff, or other action succeeded until the tool confirms success.
+- Daisy cannot offer, send, or claim to have sent text messages.
+- Do not ask for SMS consent.
+- Do not call or mention send_resource_link.
+- After a confirmed callback, proceed directly to the closing.
+- Never claim a callback, handoff, or other action succeeded until the tool confirms success.
 - Before ending a connected call, save the outcome, confirm the next step, use complete_call, give one brief closing, and end normally.
 
-When the current call has no remaining question or action, Daisy says:
-"If there's nothing else, thank you for your time, {customer_name}. Have a great day."
-
-Then:
+When the current call has no remaining question or action:
 - Use complete_call.
+- After the tool succeeds, say exactly: "If there's nothing else, thank you for your time, {customer_name}. Have a great day."
 - Allow the full closing audio to play.
+- The server controls the physical hangup.
+- Do not decide whether the telephone line should remain connected.
+- Do not continue after the final closing.
 - Disconnect the telephone line.
 - Do not wait silently on the line.
 - Do not restart the conversation.
@@ -765,25 +772,16 @@ Collect:
 - Customer timezone
 - Callback reason
 
-After collecting the date, time, and timezone, Daisy says:
+After collecting the date, time, and timezone, Daisy asks:
 "Excellent. I'll call you on {callback_date} at {callback_time} in your time zone. Is that correct?"
 
 WAIT.
 
-Daisy asks:
-"Would you like me to text you a confirmation?"
+After confirmation, Daisy says:
+"Excellent. I have us scheduled to speak on {callback_date} at {callback_time} in your time zone."
 
-WAIT.
-
-After confirmation:
+Then:
 - Use schedule_callback with reason "Customer requested a better time."
-- Pass the correct sms_confirmation_consent value.
-- Use complete_call with outcome follow_up_scheduled.
-- Set stop_sequence false.
-- Set pause_sequence false.
-
-After the callback tool succeeds, Daisy says:
-"Perfect. I have us scheduled to speak again. Thank you for your time, {customer_name}. I'll speak with you then. Have a great day."
 
 END THE CALL AND HANG UP.
 DO NOT CONTINUE CALL ONE.
@@ -845,12 +843,12 @@ Daisy says:
 
 WAIT.
 
-Save the customer's answer as purchase_area.
+Save the customer's exact meaningful answer as purchase_area without changing its spelling or location. Never infer it from lead city, ZIP code, intake data, Monday.com, another lead, or a nearby city. If the answer is unclear, ask exactly: "What city or area would you like to purchase in?" Do not guess.
 
 SCHEDULE CALL TWO
 
 Daisy says:
-"Well, that's everything for this call, and now you're one step closer to becoming a homeowner in {purchase_area}."
+"{purchase_area_closing}"
 
 Daisy says:
 "Your next step is to start the application so I can follow up with you about its status, review your debt-to-income ratio, and explore potential program options."
@@ -892,26 +890,14 @@ Daisy says:
 
 WAIT.
 
-After confirmation, Daisy asks:
-"Would you like me to text you a confirmation?"
+After confirmation, Daisy says:
+"Excellent. I have us scheduled to speak on {callback_date} at {callback_time} in your time zone."
 
-WAIT.
-
-Use schedule_callback with:
+Then use schedule_callback with:
 - reason: "Application checkpoint"
 - prospect_confirmed: true
 - the correct callback_at
 - the correct timezone
-- the correct sms_confirmation_consent
-
-Then use complete_call with:
-- outcome: follow_up_scheduled
-- stop_sequence: false
-- pause_sequence: false
-- requested_next_call_at set to the confirmed callback time
-
-After the callback tool succeeds, Daisy says:
-"Excellent. I have our second call scheduled. Thank you for your time, {customer_name}. I look forward to speaking with you then. Have a great day."
 
 END THE CALL AND HANG UP.
 A SUCCESSFULLY COMPLETED CALL MUST NOT TRIGGER A RECONNECT.
@@ -976,16 +962,7 @@ Do not tell the customer that a specialist will contact them before completing o
 IF THE APPLICATION WAS NOT STARTED
 
 Daisy says:
-"No worries. Would you like me to text you the application link now?"
-
-WAIT.
-
-When the customer agrees:
-- Use send_resource_link.
-- Set resource_type to "application".
-- Set consent_confirmed to true.
-- Do not ask permission twice.
-- Do not claim the link was sent until the tool returns success.
+"No worries."
 
 DTI REVIEW
 
@@ -1029,17 +1006,6 @@ After the DTI review is completed, Daisy says:
 Daisy says:
 "A DPA specialist should reach out within 24 to 48 hours to help you continue with the next step."
 
-IF THE CUSTOMER PREFERS THE CALCULATOR
-
-Ask once whether the customer wants the calculator by text.
-
-After an affirmative answer:
-- Use send_resource_link.
-- Set resource_type to "dti_calculator".
-- Set consent_confirmed to true.
-- Do not ask permission twice.
-- Do not claim it was sent until the tool returns success.
-
 PROFESSIONAL CONNECTIONS
 
 Use the saved lender and Realtor answers.
@@ -1067,21 +1033,14 @@ Collect:
 - Specific date
 - Specific time
 - Timezone
-- SMS confirmation permission
 
 Repeat and confirm the appointment.
 
-Use schedule_callback with reason:
-"Application checkpoint"
-
-Use complete_call with:
-- outcome: follow_up_scheduled
-- stop_sequence: false
-- pause_sequence: false
-- requested_next_call_at set to the confirmed time
-
 Daisy says:
-"Perfect. I'll follow up with you on {callback_date} at {callback_time}. Thank you for your time, {customer_name}. Have a great day."
+"Excellent. I have us scheduled to speak on {callback_date} at {callback_time} in your time zone."
+
+Then use schedule_callback with reason:
+"Application checkpoint"
 
 End normally.
 
@@ -1116,6 +1075,7 @@ function buildDouglasDaisyInstructions(call) {
   const lead = call.payload || {};
   const result = normalizeDaisyAnswers(call.result || {});
   const currentState = cleanText(call.current_state, 80) || "greeting";
+  const confirmedPurchaseArea = cleanText(result.purchase_area, 1000);
 
   let callMode = "CALL ONE";
 
@@ -1173,10 +1133,10 @@ function buildDouglasDaisyInstructions(call) {
       lead.time_frame ??
       "not provided",
     purchase_area:
-      result.purchase_area ??
-      lead.purchase_area ??
-      lead.city ??
-      "not provided",
+      confirmedPurchaseArea || "not provided",
+    purchase_area_closing: confirmedPurchaseArea
+      ? `Well, that's everything for this call, and now you're one step closer to becoming a homeowner in ${confirmedPurchaseArea}.`
+      : "Well, that's everything for this call, and now you're one step closer to becoming a homeowner.",
     previous_call_summary:
       cleanText(
         call.summary ??
@@ -1322,16 +1282,14 @@ const DOUG_TOOLS = [
         discussion_summary: { type: "string" },
         preferred_contact_method: {
           type: "string",
-          enum: ["phone", "sms", "email"]
+          enum: ["phone", "email"]
         },
-        sms_confirmation_consent: { type: "boolean" },
         prospect_confirmed: { type: "boolean" }
       },
       required: [
         "callback_at",
         "timezone",
         "reason",
-        "sms_confirmation_consent",
         "prospect_confirmed"
       ],
       additionalProperties: false
@@ -1461,25 +1419,21 @@ const LOCAL_SCHEDULE_CALLBACK_TOOL = DOUG_TOOLS.find(
   (toolDefinition) => toolDefinition.name === "schedule_callback"
 );
 const REALTIME_TOOLS = Object.freeze(
-  BASE_REALTIME_TOOLS.map((toolDefinition) =>
+  BASE_REALTIME_TOOLS
+    .filter((toolDefinition) => toolDefinition.name !== "send_resource_link")
+    .map((toolDefinition) =>
     toolDefinition.name === "schedule_callback"
       ? {
           ...toolDefinition,
           parameters: {
-            ...toolDefinition.parameters,
+            ...LOCAL_SCHEDULE_CALLBACK_TOOL.parameters,
             properties: {
-              ...toolDefinition.parameters.properties,
-              customer_local_date:
-                LOCAL_SCHEDULE_CALLBACK_TOOL.parameters.properties.customer_local_date,
-              customer_local_time:
-                LOCAL_SCHEDULE_CALLBACK_TOOL.parameters.properties.customer_local_time,
-              application_local_date:
-                LOCAL_SCHEDULE_CALLBACK_TOOL.parameters.properties.application_local_date
+              ...LOCAL_SCHEDULE_CALLBACK_TOOL.parameters.properties
             }
           }
         }
       : toolDefinition
-  )
+    )
 );
 
 async function runMigrationStep(name, sql, options = {}) {
@@ -2477,6 +2431,9 @@ function pendingQuestionType(value) {
   if (/speakwith|isthis/.test(text)) return "identity_confirmation";
   if (/realtor|realestateagent/.test(text)) return "has_realtor";
   if (/lender|preapproved|preapproval/.test(text)) return "applied_with_lender";
+  if (/what.*(?:city|area).*purchase|area.*purchase.*home/.test(text)) {
+    return "purchase_area";
+  }
   if (/start.*application|application.*start/.test(text)) {
     return "application_started";
   }
@@ -2493,6 +2450,19 @@ function pendingQuestionType(value) {
     return "qualification";
   }
   return "general_question";
+}
+
+function exactMeaningfulPurchaseArea(value) {
+  const area = cleanText(value, 1000);
+  if (!area) return null;
+  if (
+    /\b(i don'?t know|not sure|unsure|anywhere|no preference|whatever|doesn'?t matter)\b/i.test(
+      area
+    )
+  ) {
+    return null;
+  }
+  return cleanText(area.replace(/[.!?]+$/, ""), 1000);
 }
 
 function normalizeCustomerUtterance(value) {
@@ -4922,9 +4892,16 @@ async function scheduleUnexpectedReconnect(callId) {
   const intentionallyEnded = actions.some(
     (action) =>
       action &&
-      ["twilio_call_hangup", "twilio_final_hangup"].includes(action.action) &&
+      [
+        "twilio_call_hangup",
+        "twilio_final_hangup",
+        "twilio_physical_hangup"
+      ].includes(action.action) &&
       action.success &&
-      action.completion_reason === "normal_completion"
+      (
+        action.action === "twilio_physical_hangup" ||
+        action.completion_reason === "normal_completion"
+      )
   );
   const callbackConcluded = actions.some(
     (action) =>
@@ -4952,7 +4929,7 @@ async function scheduleUnexpectedReconnect(callId) {
     console.log(JSON.stringify({
       event: "unexpected_reconnect_skipped",
       call_id: call.call_id,
-      reason: "normal_completion_or_intentional_hangup"
+      reason: "normal_terminal_call"
     }));
     return false;
   }
@@ -5924,6 +5901,17 @@ async function executeDougTool(call, name, args) {
     const sentiment = cleanText(safeArgs.sentiment, 50);
     const answers = normalizeDaisyAnswers(safeArgs.answers || {});
     const existingAnswers = normalizeDaisyAnswers(call.result || {});
+    const confirmedPurchaseArea = Object.prototype.hasOwnProperty.call(
+      safeArgs.answers || {},
+      "purchase_area"
+    )
+      ? exactMeaningfulPurchaseArea(safeArgs.answers.purchase_area)
+      : null;
+    if (confirmedPurchaseArea) {
+      answers.purchase_area = confirmedPurchaseArea;
+    } else if (Object.prototype.hasOwnProperty.call(answers, "purchase_area")) {
+      delete answers.purchase_area;
+    }
     for (const key of ["has_realtor", "applied_with_lender", "has_lender"]) {
       if (existingAnswers[key] !== undefined && answers[key] !== undefined) {
         answers[key] = existingAnswers[key];
@@ -5959,6 +5947,14 @@ async function executeDougTool(call, name, args) {
         })
       ]
     );
+
+    if (confirmedPurchaseArea) {
+      console.log(JSON.stringify({
+        event: "purchase_area_confirmed",
+        call_id: call.call_id,
+        purchase_area: confirmedPurchaseArea
+      }));
+    }
 
     await appendAction(call.call_id, {
       action: name,
@@ -6352,64 +6348,6 @@ async function executeDougTool(call, name, args) {
       outcome: callbackOutcome
     });
 
-    let confirmationSmsSent = false;
-    let confirmationMessageSid = null;
-    let confirmationSmsError = null;
-
-    if (safeArgs.sms_confirmation_consent === true) {
-      try {
-        const formattedCallback = formatCustomerCallbackTime(
-          callbackAt,
-          timezone
-        );
-        const confirmation = await twilioClient.messages.create({
-          to: call.phone,
-          from: TWILIO_FROM_NUMBER,
-          body: `Your follow-up call with Daisy is scheduled for ${formattedCallback}. Reply STOP to opt out.`,
-          statusCallback: smsStatusCallbackUrl(call)
-        });
-        await trackSmsMessage(
-          call.call_id,
-          confirmation,
-          "callback_confirmation"
-        );
-        console.log(
-          JSON.stringify({
-            event: "outbound_sms_accepted",
-            call_id: call.call_id,
-            message_type: "callback_confirmation",
-            message_sid: confirmation.sid,
-            message_status: confirmation.status || "accepted",
-            destination_last_four: String(call.phone || "").slice(-4)
-          })
-        );
-        confirmationSmsSent = true;
-        confirmationMessageSid = confirmation.sid;
-      } catch (error) {
-        confirmationSmsError = cleanText(error.message, 1000);
-        console.error(
-          `Callback confirmation SMS failed for ${call.call_id}:`,
-          confirmationSmsError
-        );
-      }
-    }
-
-    await mergeCallResult(call.call_id, {
-      callback_confirmation_sms_sent: confirmationSmsSent,
-      callback_confirmation_message_sid: confirmationMessageSid,
-      callback_confirmation_sms_error: confirmationSmsError
-    });
-
-    await appendAction(call.call_id, {
-      action: "callback_confirmation_sms",
-      success:
-        confirmationSmsSent || safeArgs.sms_confirmation_consent !== true,
-      skipped: safeArgs.sms_confirmation_consent !== true,
-      consent_confirmed: safeArgs.sms_confirmation_consent === true,
-      message_sid: confirmationMessageSid,
-      error: confirmationSmsError
-    });
-
     queueMondaySync(call.call_id, "callback_scheduled");
 
     return {
@@ -6417,8 +6355,7 @@ async function executeDougTool(call, name, args) {
       callback_at: callbackAt.toISOString(),
       timezone,
       outcome: callbackOutcome,
-      sequence_status: "callback_scheduled",
-      confirmation_sms_sent: confirmationSmsSent
+      sequence_status: "callback_scheduled"
     };
   }
 
@@ -7440,14 +7377,16 @@ mediaServer.on("connection", (twilioSocket) => {
   let activeResponsePreservesQuestion = false;
   let assistantResponseFinished = true;
   let normalCompletionRecorded = false;
-  let finalHangupRequested = false;
-  let finalHangupMarkName = "";
+  let normalEndRequested = false;
+  let finalClosingRequested = false;
+  let finalClosingResponseId = "";
+  let finalPlaybackMarkName = "";
   let finalHangupInProgress = false;
   let finalHangupCompleted = false;
   let finalHangupFallbackTimer = null;
   let activeTwilioCallSid = "";
+  let activeTwilioStreamSid = "";
   let assistantAudioQueuedForResponse = false;
-  let finalClosingAudioQueued = false;
   let sustainedSpeechTimer = null;
   let speechCandidateStartedAt = 0;
   let speechCandidateConfirmed = false;
@@ -7497,6 +7436,7 @@ mediaServer.on("connection", (twilioSocket) => {
 
   function currentCallIsTerminal() {
     return (
+      normalEndRequested ||
       normalCompletionRecorded ||
       finalHangupCompleted ||
       String(call?.status || "").toLowerCase() === "completed"
@@ -7544,27 +7484,34 @@ mediaServer.on("connection", (twilioSocket) => {
 
   function sendFinalHangupMark() {
     if (
-      !normalCompletionRecorded ||
-      !finalHangupRequested ||
-      finalHangupMarkName ||
+      !normalEndRequested ||
+      finalPlaybackMarkName ||
       finalHangupCompleted ||
-      !streamSid
+      !activeTwilioStreamSid
     ) return false;
 
-    const name = `daisy_final_hangup_${Date.now()}_${randomUUID()}`;
-    if (!sendToTwilio({ event: "mark", streamSid, mark: { name } })) {
+    finalPlaybackMarkName =
+      "daisy_final_hangup_" +
+      Date.now() +
+      "_" +
+      Math.random().toString(36).slice(2, 8);
+    if (!sendToTwilio({
+      event: "mark",
+      streamSid: activeTwilioStreamSid,
+      mark: { name: finalPlaybackMarkName }
+    })) {
+      finalPlaybackMarkName = "";
       return false;
     }
-    finalHangupMarkName = name;
-    pendingMarkNames.add(name);
+    pendingMarkNames.add(finalPlaybackMarkName);
+    console.log(JSON.stringify({
+      event: "final_hangup_mark_sent",
+      call_id: call.call_id,
+      mark_name: finalPlaybackMarkName,
+      stream_sid: activeTwilioStreamSid
+    }));
     finalHangupFallbackTimer = setTimeout(() => {
-      if (
-        normalCompletionRecorded &&
-        finalHangupRequested &&
-        !finalHangupCompleted
-      ) {
-        void finishAndHangupTwilioCall("final_playback_timeout_fallback");
-      }
+      void physicallyEndActiveTwilioCall("final_mark_timeout");
     }, 8000);
     return true;
   }
@@ -7597,7 +7544,10 @@ mediaServer.on("connection", (twilioSocket) => {
   }
 
   function requestAssistantResponse(options = {}) {
-    if (currentCallIsTerminal()) return false;
+    if (
+      currentCallIsTerminal() &&
+      options.allowTerminalClosing !== true
+    ) return false;
     if (awaitingCustomerResponse && options.allowWhileAwaiting !== true) {
       return false;
     }
@@ -7779,6 +7729,35 @@ mediaServer.on("connection", (twilioSocket) => {
       return;
     }
 
+    if (pendingQuestionType === "purchase_area") {
+      const confirmedPurchaseArea = exactMeaningfulPurchaseArea(transcript);
+      if (!confirmedPurchaseArea) {
+        requestAssistantResponse({
+          queueIfBusy: true,
+          allowWhileAwaiting: true,
+          preservePendingQuestion: true,
+          response: {
+            output_modalities: ["audio"],
+            instructions:
+              'Say exactly: "What city or area would you like to purchase in?" Say nothing else.'
+          }
+        });
+        return;
+      }
+      await mergeCallResult(call.call_id, {
+        purchase_area: confirmedPurchaseArea
+      });
+      console.log(JSON.stringify({
+        event: "purchase_area_confirmed",
+        call_id: call.call_id,
+        purchase_area: confirmedPurchaseArea
+      }));
+      call = (await getCallById(call.call_id)) || call;
+      await endLocalWaitingState("purchase_area_confirmed");
+      requestAssistantResponse({ queueIfBusy: true });
+      return;
+    }
+
     const professionalAnswerKey = ["has_realtor", "applied_with_lender"].includes(
       String(pendingQuestionType || "")
     )
@@ -7905,13 +7884,11 @@ mediaServer.on("connection", (twilioSocket) => {
     await handleInterruption();
   }
 
-  async function finishAndHangupTwilioCall(reason) {
+  async function physicallyEndActiveTwilioCall(reason) {
     if (
-      !normalCompletionRecorded ||
-      !finalHangupRequested ||
+      !normalEndRequested ||
       finalHangupInProgress ||
-      finalHangupCompleted ||
-      !call
+      finalHangupCompleted
     ) {
       return false;
     }
@@ -7923,104 +7900,67 @@ mediaServer.on("connection", (twilioSocket) => {
         (await getCallById(call.call_id)) || call;
       const twilioCallSid =
         activeTwilioCallSid ||
-        refreshedCall.twilio_call_sid ||
-        call.twilio_call_sid;
+        String(
+          refreshedCall?.twilio_call_sid ||
+          call?.twilio_call_sid ||
+          ""
+        ).trim();
 
       if (!twilioCallSid) {
         throw new Error(
-          "Active Twilio Call SID unavailable."
+          "No live Twilio Call SID is available."
         );
       }
 
-      await pool.query(
-        `
-          UPDATE ai_calls
-          SET
-            status = 'completed',
-            sequence_status = CASE
-              WHEN callback_requested AND callback_at > NOW()
-                THEN 'callback_scheduled'
-              ELSE 'completed'
-            END,
-            next_attempt_at = CASE
-              WHEN callback_requested AND callback_at > NOW()
-                THEN callback_at
-              ELSE NULL
-            END,
-            last_error = NULL,
-            result = result || $2::jsonb,
-            updated_at = NOW()
-          WHERE call_id = $1
-        `,
-        [
-          call.call_id,
-          JSON.stringify({
-            normal_completion_recorded: true,
-            completion_reason: "normal_completion",
-            intentional_twilio_hangup: true
-          })
-        ]
-      );
-
-      await twilioClient.calls(twilioCallSid).update({
-        status: "completed"
-      });
+      const updatedCall =
+        await twilioClient
+          .calls(twilioCallSid)
+          .update({
+            status: "completed"
+          });
 
       finalHangupCompleted = true;
       if (finalHangupFallbackTimer) {
         clearTimeout(finalHangupFallbackTimer);
         finalHangupFallbackTimer = null;
       }
-      await mergeCallResult(call.call_id, {
-        final_hangup_completed: true,
-        final_hangup_completed_at: new Date().toISOString()
-      });
-      call = (await getCallById(call.call_id)) || {
-        ...call,
-        status: "completed"
-      };
-
       await appendAction(call.call_id, {
-        action: "twilio_final_hangup",
+        action: "twilio_physical_hangup",
         success: true,
         reason,
         twilio_call_sid: twilioCallSid,
-        completion_reason: "normal_completion"
+        twilio_status: updatedCall?.status || "completed"
       });
 
-      console.log(
-        JSON.stringify({
-          event: "twilio_final_hangup",
-          call_id: call.call_id,
-          twilio_call_sid: twilioCallSid,
-          reason,
-          success: true,
-        })
-      );
+      console.log(JSON.stringify({
+        event: "twilio_physical_hangup",
+        call_id: call.call_id,
+        twilio_call_sid: twilioCallSid,
+        twilio_status: updatedCall?.status || null,
+        reason,
+        success: true
+      }));
 
       return true;
     } catch (error) {
       const safeError =
         cleanText(error.message, 1000) ||
-        "Twilio final hangup failed.";
+        "Twilio physical hangup failed.";
 
       await appendAction(call.call_id, {
-        action: "twilio_final_hangup",
+        action: "twilio_physical_hangup",
         success: false,
         reason,
-        completion_reason: "normal_completion",
         error: safeError
       });
 
-      console.error(
-        JSON.stringify({
-          event: "twilio_final_hangup",
-          call_id: call.call_id,
-          reason,
-          success: false,
-          error: safeError
-        })
-      );
+      console.error(JSON.stringify({
+        event: "twilio_physical_hangup",
+        call_id: call.call_id,
+        reason,
+        success: false,
+        error: safeError
+      }));
 
       return false;
     } finally {
@@ -8065,10 +8005,18 @@ mediaServer.on("connection", (twilioSocket) => {
       output?.success === true &&
       output?.intent === "complete_call" &&
       output?.error === null;
+    const scheduleCallbackSucceeded =
+      name === "schedule_callback" &&
+      output?.success === true &&
+      output?.intent === "schedule_callback" &&
+      output?.error === null;
+    const terminalActionSucceeded =
+      completeCallSucceeded || scheduleCallbackSucceeded;
 
-    if (completeCallSucceeded) {
+    if (terminalActionSucceeded) {
       normalCompletionRecorded = true;
-      finalHangupRequested = true;
+      normalEndRequested = true;
+      finalClosingRequested = true;
       stopCurrentCallAutomation();
       await pool.query(
         `
@@ -8112,6 +8060,7 @@ mediaServer.on("connection", (twilioSocket) => {
         normal_completion_recorded: true,
         final_hangup_requested: true,
         completion_reason: "normal_completion",
+        terminal_action: name,
         normal_completion_recorded_at: new Date().toISOString()
       });
       call = (await getCallById(call.call_id)) || call;
@@ -8125,7 +8074,24 @@ mediaServer.on("connection", (twilioSocket) => {
         output: JSON.stringify(output)
       }
     });
-    requestAssistantResponse({ queueIfBusy: true });
+    if (terminalActionSucceeded) {
+      const lead = call.payload || {};
+      const customerName =
+        cleanText(
+          lead.first_name || lead.customer_name || lead.name,
+          160
+        ) || "the customer";
+      requestAssistantResponse({
+        queueIfBusy: true,
+        allowTerminalClosing: true,
+        response: {
+          output_modalities: ["audio"],
+          instructions: `Say exactly: "If there's nothing else, thank you for your time, ${customerName}. Have a great day." Then stop speaking. Do not ask a question. Do not wait for another response. Do not call another tool. Do not add any other sentence.`
+        }
+      });
+    } else {
+      requestAssistantResponse({ queueIfBusy: true });
+    }
   }
 
   function connectToOpenAI() {
@@ -8200,6 +8166,16 @@ mediaServer.on("connection", (twilioSocket) => {
           responseCreatePending = false;
           assistantResponseActive = true;
           assistantResponseFinished = false;
+          if (
+            normalEndRequested &&
+            finalClosingRequested &&
+            !finalClosingResponseId
+          ) {
+            finalClosingResponseId = cleanText(
+              event.response?.id || event.response_id,
+              160
+            ) || "";
+          }
           activeResponsePreservesQuestion = pendingResponsePreservesQuestion;
           pendingResponsePreservesQuestion = false;
           activeResponseWaitingPromptKind = pendingResponseWaitingPromptKind;
@@ -8434,6 +8410,10 @@ mediaServer.on("connection", (twilioSocket) => {
         }
 
         if (event.type === "response.done") {
+          const completedResponseId = cleanText(
+            event.response?.id || event.response_id,
+            160
+          ) || "";
           assistantResponseActive = false;
           responseCreatePending = false;
           assistantResponseFinished = true;
@@ -8451,12 +8431,6 @@ mediaServer.on("connection", (twilioSocket) => {
               extractPrimaryQuestion(assistantTranscriptBuffer)
             );
           }
-          if (
-            assistantAudioQueuedForResponse &&
-            exactFinalClosingSpoken(assistantTranscriptBuffer)
-          ) {
-            finalClosingAudioQueued = true;
-          }
           for (const item of event.response?.output || []) {
             if (item && item.type === "function_call") {
               await handleToolCall(
@@ -8467,10 +8441,11 @@ mediaServer.on("connection", (twilioSocket) => {
             }
           }
           if (
-            normalCompletionRecorded &&
-            finalHangupRequested &&
-            finalClosingAudioQueued &&
-            !finalHangupMarkName &&
+            normalEndRequested &&
+            completedResponseId &&
+            completedResponseId === finalClosingResponseId &&
+            assistantAudioQueuedForResponse &&
+            !finalPlaybackMarkName &&
             !finalHangupCompleted
           ) {
             sendFinalHangupMark();
@@ -8484,7 +8459,7 @@ mediaServer.on("connection", (twilioSocket) => {
             requestAssistantResponse(options);
           }
           complianceRecoveryActive = false;
-          scheduleSilenceReminder();
+          if (!normalEndRequested) scheduleSilenceReminder();
           return;
         }
 
@@ -8553,12 +8528,20 @@ mediaServer.on("connection", (twilioSocket) => {
           return;
         }
 
-        streamSid = message.start?.streamSid || message.streamSid;
-        activeTwilioCallSid = cleanText(message?.start?.callSid, 100) || "";
+        activeTwilioCallSid =
+          String(message?.start?.callSid || "").trim();
+        activeTwilioStreamSid =
+          String(
+            message?.start?.streamSid ||
+            message?.streamSid ||
+            ""
+          ).trim();
+        streamSid = activeTwilioStreamSid;
         console.log(JSON.stringify({
-          event: "active_twilio_call_sid_captured",
-          call_id: call.call_id,
-          twilio_call_sid: activeTwilioCallSid || null
+          event: "twilio_live_call_captured",
+          call_id: call?.call_id || null,
+          twilio_call_sid: activeTwilioCallSid || null,
+          twilio_stream_sid: activeTwilioStreamSid || null
         }));
         await updateCallStatus(
           call.call_id,
@@ -8588,10 +8571,21 @@ mediaServer.on("connection", (twilioSocket) => {
       }
 
       if (message.event === "mark") {
-        const name = cleanText(message.mark?.name, 100);
-        if (name) pendingMarkNames.delete(name);
-        if (name && name === finalHangupMarkName) {
-          void finishAndHangupTwilioCall("final_audio_playback_complete");
+        const returnedMarkName =
+          String(message?.mark?.name || "").trim();
+        if (returnedMarkName) pendingMarkNames.delete(returnedMarkName);
+        if (
+          returnedMarkName &&
+          returnedMarkName === finalPlaybackMarkName
+        ) {
+          console.log(JSON.stringify({
+            event: "final_hangup_mark_received",
+            call_id: call.call_id,
+            mark_name: returnedMarkName
+          }));
+          void physicallyEndActiveTwilioCall(
+            "final_audio_playback_complete"
+          );
         }
         if (!pendingMarkNames.size) {
           scheduleSilenceReminder();
@@ -8623,8 +8617,11 @@ mediaServer.on("connection", (twilioSocket) => {
         }
         if (
           call &&
+          !normalEndRequested &&
+          !finalClosingRequested &&
+          !finalPlaybackMarkName &&
+          !finalHangupInProgress &&
           !normalCompletionRecorded &&
-          !finalHangupRequested &&
           !finalHangupCompleted
         ) {
           void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
@@ -8634,7 +8631,7 @@ mediaServer.on("connection", (twilioSocket) => {
           console.log(JSON.stringify({
             event: "unexpected_reconnect_skipped",
             call_id: call.call_id,
-            reason: "normal_completion_or_intentional_hangup"
+            reason: "normal_terminal_call"
           }));
         }
         if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
@@ -8664,8 +8661,11 @@ mediaServer.on("connection", (twilioSocket) => {
     if (sustainedSpeechTimer) clearTimeout(sustainedSpeechTimer);
     if (
       call &&
+      !normalEndRequested &&
+      !finalClosingRequested &&
+      !finalPlaybackMarkName &&
+      !finalHangupInProgress &&
       !normalCompletionRecorded &&
-      !finalHangupRequested &&
       !finalHangupCompleted
     ) {
       void scheduleUnexpectedReconnect(call.call_id).catch((error) => {
@@ -8675,7 +8675,7 @@ mediaServer.on("connection", (twilioSocket) => {
       console.log(JSON.stringify({
         event: "unexpected_reconnect_skipped",
         call_id: call.call_id,
-        reason: "normal_completion_or_intentional_hangup"
+        reason: "normal_terminal_call"
       }));
     }
     if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
