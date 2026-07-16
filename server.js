@@ -5939,47 +5939,79 @@ function localDateTimeToUtc(dateText, timeText, timeZone) {
 
 function resolveConfirmedCallbackDateTime(args, call) {
   const requestedTimezone =
-  cleanText(args.timezone, 100) ||
-  cleanText(call?.callback_timezone, 100) ||
-  cleanText(call?.result?.callback_timezone, 100);
+    cleanText(args.timezone, 100) ||
+    cleanText(call?.callback_timezone, 100) ||
+    cleanText(call?.result?.callback_timezone, 100);
 
-if (!requestedTimezone) return null;
+  if (!requestedTimezone) return null;
 
-const timezoneKey = normalizeMondayKey(requestedTimezone);
+  const timezoneKey = normalizeMondayKey(requestedTimezone);
 
-const timeZone =
-  ["eastern", "easterntime", "et", "est", "edt"].includes(timezoneKey)
-    ? "America/New_York"
-    : ["central", "centraltime", "ct", "cst", "cdt"].includes(timezoneKey)
-      ? "America/Chicago"
-      : ["mountain", "mountaintime", "mt", "mst", "mdt"].includes(timezoneKey)
-        ? "America/Denver"
-        : ["pacific", "pacifictime", "pt", "pst", "pdt"].includes(timezoneKey)
-          ? "America/Los_Angeles"
-          : requestedTimezone;
+  const timeZone =
+    timezoneKey.includes("eastern") ||
+    ["et", "est", "edt"].includes(timezoneKey)
+      ? "America/New_York"
+      : timezoneKey.includes("central") ||
+          ["ct", "cst", "cdt"].includes(timezoneKey)
+        ? "America/Chicago"
+        : timezoneKey.includes("mountain") ||
+            ["mt", "mst", "mdt"].includes(timezoneKey)
+          ? "America/Denver"
+          : timezoneKey.includes("pacific") ||
+              ["pt", "pst", "pdt"].includes(timezoneKey)
+            ? "America/Los_Angeles"
+            : requestedTimezone;
 
-try {
-  new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
-} catch {
-  return null;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format(new Date());
+  } catch {
+    return null;
   }
-  const customerLocalDate = parseConfirmedLocalDate(
+
+  let customerLocalDate = parseConfirmedLocalDate(
     args.customer_local_date,
     timeZone
   );
-  const customerLocalTime = parseConfirmedLocalTime(
+
+  let customerLocalTime = parseConfirmedLocalTime(
     args.customer_local_time
   );
-  if (!customerLocalDate || !customerLocalTime) return null;
-  const callbackAt = localDateTimeToUtc(
+
+  let callbackAt =
+    customerLocalDate && customerLocalTime
+      ? localDateTimeToUtc(
+          customerLocalDate,
+          customerLocalTime,
+          timeZone
+        )
+      : null;
+
+  if (!callbackAt) {
+    const directCallbackAt = new Date(args.callback_at);
+
+    if (Number.isNaN(directCallbackAt.getTime())) {
+      return null;
+    }
+
+    const localParts = localDateParts(directCallbackAt, timeZone);
+
+    customerLocalDate =
+      `${localParts.year}-${localParts.month}-${localParts.day}`;
+
+    customerLocalTime =
+      `${localParts.hour}:${localParts.minute}`;
+
+    callbackAt = directCallbackAt;
+  }
+
+  return {
+    callbackAt,
     customerLocalDate,
     customerLocalTime,
     timeZone
-  );
-  return callbackAt
-    ? { callbackAt, customerLocalDate, customerLocalTime, timeZone }
-    : null;
+  };
 }
+
 
 function smsStatusCallbackUrl(call) {
   const url = new URL(`${PUBLIC_BASE_URL}/api/v1/twilio/sms-status`);
