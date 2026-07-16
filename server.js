@@ -1071,23 +1071,44 @@ Daisy must never:
 - End normally and then call back as though the call disconnected.
 `;
 
-function buildDouglasDaisyInstructions(call) {
+function resolveSessionCallPhase(call, attempt = null) {
+  const callType = normalizeMondayKey(call?.payload?.call_type);
+  const outboundReason = normalizeMondayKey(
+    call?.result?.outbound_call_reason || call?.payload?.outbound_call_reason
+  );
+  const attemptType = normalizeMondayKey(attempt?.attempt_type);
+  const scheduledPurpose = normalizeMondayKey(
+    call?.result?.scheduled_second_call_purpose
+  );
+
+  if (
+    callType === "dpaagentnotification" ||
+    attemptType === "specialistnotification"
+  ) return "SPECIALIST_NOTIFICATION";
+  if (
+    outboundReason === "unexpecteddisconnectreconnect" ||
+    attemptType === "disconnectreconnect" ||
+    call?.result?.reconnect_source_call_id
+  ) return "RECONNECT";
+  if (
+    callType === "calltwo" ||
+    outboundReason === "calltwo" ||
+    attemptType === "applicationcheckpoint" ||
+    scheduledPurpose === "applicationcheckpoint"
+  ) return "CALL_TWO";
+  return "CALL_ONE";
+}
+
+function buildDouglasDaisyInstructions(call, sessionCallPhase) {
   const lead = call.payload || {};
   const result = normalizeDaisyAnswers(call.result || {});
-  const currentState = cleanText(call.current_state, 80) || "greeting";
   const confirmedPurchaseArea = cleanText(result.purchase_area, 1000);
-
-  let callMode = "CALL ONE";
-
-  if (lead.call_type === "dpa_agent_notification") {
-    callMode = "INTERNAL SPECIALIST NOTIFICATION";
-  } else if (
-    ["reconnect_pending", "reconnect_in_progress"].includes(currentState)
-  ) {
-    callMode = "RECONNECT";
-  } else if (currentState === "application_checkpoint") {
-    callMode = "CALL TWO";
-  }
+  const callMode = {
+    CALL_ONE: "CALL ONE",
+    CALL_TWO: "CALL TWO",
+    RECONNECT: "RECONNECT",
+    SPECIALIST_NOTIFICATION: "INTERNAL SPECIALIST NOTIFICATION"
+  }[sessionCallPhase] || "CALL ONE";
 
   const values = {
     call_mode: callMode,
@@ -1288,6 +1309,8 @@ const DOUG_TOOLS = [
       },
       required: [
         "callback_at",
+        "customer_local_date",
+        "customer_local_time",
         "timezone",
         "reason",
         "prospect_confirmed"
@@ -3258,69 +3281,105 @@ function leadDisplayName(call) {
   );
 }
 
-function buildStructuredMondayCallSummary(call) {
+function terminalCompletionValidation(call, sessionCallPhase) {
   const result = normalizeDaisyAnswers(call.result || {});
-  const actions = Array.isArray(call.actions) ? call.actions : [];
-  const completed =
-    actions.some((action) => action?.action === "complete_call" && action.success) ||
-    String(call.status || "").toLowerCase() === "completed";
-  const callTwo =
-    ["application_checkpoint", "application_started"].includes(call.current_state) ||
-    result.preliminary_dti_percent !== undefined;
-  const parts = [`Call ${callTwo ? "Two" : "One"} ${completed ? "completed" : "progress"}.`];
-  const add = (label, value) => {
-    const cleaned = cleanText(value, 220);
-    if (cleaned) parts.push(`${label}: ${cleaned}.`);
-  };
   const lender = normalizeExplicitYesNo(
     result.applied_with_lender ?? result.has_lender
   );
   const realtor = normalizeExplicitYesNo(result.has_realtor);
-  const applicationRaw = cleanText(result.app_started_confirmation, 80);
-  const application = applicationRaw
-    ? /start/i.test(applicationRaw) && !/not/i.test(applicationRaw)
-      ? "Yes"
-      : /not|no/i.test(applicationRaw)
-        ? "No"
-        : applicationRaw
-    : null;
+  const missing = [];
 
-  if (callTwo) {
-    add("Application started", application);
-    if (Number.isFinite(Number(result.preliminary_dti_percent))) {
-      add("Preliminary DTI", `${Number(result.preliminary_dti_percent)}%`);
+  if (sessionCallPhase === "CALL_ONE") {
+    if (!cleanText(result.purchase_timeline_detail || result.time_frame, 220)) {
+      missing.push("timeline");
     }
-    if (lender !== null) add("Lender needed", lender ? "No" : "Yes");
-    if (realtor !== null) add("Realtor needed", realtor ? "No" : "Yes");
-  } else {
-    add("Timeline", result.purchase_timeline_detail || result.time_frame);
-    if (lender !== null) add("Lender", lender ? "Yes" : "No");
-    if (realtor !== null) add("Realtor", realtor ? "Yes" : "No");
-    add("Purchase area", result.purchase_area);
-    add(
-      "Application",
-      application ? (application === "Yes" ? "Started" : "Not started") : null
+    if (lender === null) missing.push("lender");
+    if (realtor === null) missing.push("realtor");
+    if (!cleanText(result.purchase_area, 220)) missing.push("purchase area");
+    if (!cleanText(result.callback_local_date, 100)) missing.push("callback date");
+    if (!cleanText(result.callback_local_time, 100)) missing.push("callback time");
+    if (!cleanText(result.callback_timezone || call.callback_timezone, 100)) {
+      missing.push("callback timezone");
+    }
+  } else if (sessionCallPhase === "CALL_TWO") {
+    if (
+      result.application_status_explicitly_answered !== true ||
+      typeof result.application_started_confirmed !== "boolean"
+    ) missing.push("application started");
+    if (lender === null) missing.push("lender");
+    if (realtor === null) missing.push("realtor");
+    if (!cleanText(call.next_action || result.conversation_state?.next_best_action, 220)) {
+      missing.push("next step");
+    }
+  }
+
+  return { complete: missing.length === 0, missing, lender, realtor };
+}
+
+function buildStructuredMondayCallSummary(call, sessionCallPhase) {
+  const result = normalizeDaisyAnswers(call.result || {});
+  const validation = terminalCompletionValidation(call, sessionCallPhase);
+  const actions = Array.isArray(call.actions) ? call.actions : [];
+  const terminalRecorded =
+    actions.some((action) =>
+      ["complete_call", "schedule_callback"].includes(action?.action) &&
+      action?.success === true
+    ) || call.result?.normal_completion_recorded === true;
+  const completed = terminalRecorded && validation.complete;
+
+  if (sessionCallPhase === "CALL_TWO") {
+    const dti = Number.isFinite(Number(result.preliminary_dti_percent))
+      ? `${Number(result.preliminary_dti_percent)}%`
+      : "Not completed";
+    const nextStep = cleanText(
+      call.next_action || result.conversation_state?.next_best_action,
+      220
+    ) || "Not confirmed";
+    return cleanText(
+      `Call Two ${completed ? "completed" : "incomplete"}. ` +
+      `Application started: ${typeof result.application_started_confirmed === "boolean" ? (result.application_started_confirmed ? "Yes" : "No") : "Not confirmed"}. ` +
+      `Preliminary DTI: ${dti}. ` +
+      `Lender needed: ${validation.lender === null ? "Not confirmed" : (validation.lender ? "No" : "Yes")}. ` +
+      `Realtor needed: ${validation.realtor === null ? "Not confirmed" : (validation.realtor ? "No" : "Yes")}. ` +
+      `Next step: ${nextStep}.`,
+      800
     );
   }
 
-  const nextCall = call.callback_at || call.next_attempt_at;
-  if (nextCall) {
-    add(
-      "Next call",
-      formatCustomerCallbackTime(
-        nextCall,
-        call.callback_timezone || call.timezone
+  const timeline = cleanText(
+    result.purchase_timeline_detail || result.time_frame,
+    220
+  ) || "Not confirmed";
+  const purchaseArea = cleanText(result.purchase_area, 220) || "Not confirmed";
+  const secondCall = call.callback_at
+    ? formatCustomerCallbackTime(
+        call.callback_at,
+        result.callback_timezone || call.callback_timezone || call.timezone
       )
-    );
-  }
-  add("Next step", call.next_action || result.conversation_state?.next_best_action);
-  return cleanText(parts.join(" ").replace(/\.\./g, "."), 800);
+    : null;
+  return cleanText(
+    `Call One ${completed ? "completed" : "incomplete"}. ` +
+    `Timeline: ${timeline}. ` +
+    `Lender: ${validation.lender === null ? "Not confirmed" : (validation.lender ? "Yes" : "No")}. ` +
+    `Realtor: ${validation.realtor === null ? "Not confirmed" : (validation.realtor ? "Yes" : "No")}. ` +
+    `Purchase area: ${purchaseArea}. ` +
+    `Second call: ${secondCall || "Not confirmed"}. ` +
+    "Next step: Start application.",
+    800
+  );
 }
 
 function buildMainMondayValues(call, latestAttempt, metadata) {
   const values = {};
   const board = metadata.main;
   const result = normalizeDaisyAnswers(call.result || {});
+  const recordedSessionPhase = [...(Array.isArray(call.actions) ? call.actions : [])]
+    .reverse()
+    .find((action) =>
+      ["CALL_ONE", "CALL_TWO", "RECONNECT", "SPECIALIST_NOTIFICATION"].includes(
+        action?.session_call_phase
+      )
+    )?.session_call_phase;
 
   assignMondayValue(values, board, ["Lead ID"], call.lead_id);
   assignMondayValue(values, board, ["Case ID"], call.case_id);
@@ -3377,7 +3436,10 @@ function buildMainMondayValues(call, latestAttempt, metadata) {
     values,
     board,
     ["Call Summary"],
-    buildStructuredMondayCallSummary(call)
+    buildStructuredMondayCallSummary(
+      call,
+      recordedSessionPhase || resolveSessionCallPhase(call, latestAttempt)
+    )
   );
   assignMondayValue(values, board, ["Owner"], call.human_owner_id);
   assignMondayValue(values, board, ["Cadence Version"], call.cadence_version);
@@ -5746,18 +5808,14 @@ function addDaysToLocalDateText(dateText, days) {
   return date.toISOString().slice(0, 10);
 }
 
-function parseConfirmedLocalDate(value, timeZone, applicationLocalDate = null) {
+function parseConfirmedLocalDate(value, timeZone) {
   const raw = cleanText(value, 160);
   if (!raw) return null;
   const normalized = normalizeCustomerUtterance(raw);
   const nowParts = localDateParts(new Date(), timeZone);
   const today = `${nowParts.year}-${nowParts.month}-${nowParts.day}`;
   if (/\bfollowing day\b/.test(normalized)) {
-    const applicationDate = parseConfirmedLocalDate(
-      applicationLocalDate,
-      timeZone
-    );
-    return applicationDate ? addDaysToLocalDateText(applicationDate, 1) : null;
+    return addDaysToLocalDateText(today, 1);
   }
   if (/\btomorrow\b/.test(normalized)) return addDaysToLocalDateText(today, 1);
   if (/\btoday\b/.test(normalized)) return today;
@@ -5815,21 +5873,24 @@ function localDateTimeToUtc(dateText, timeText, timeZone) {
 }
 
 function resolveConfirmedCallbackDateTime(args, call) {
-  const timeZone = normalizeTimezone(args.timezone || call.timezone);
-  const rawCallback = cleanText(args.callback_at, 200);
-  const parsedInstant = rawCallback ? new Date(rawCallback) : null;
-  const validInstant = Boolean(
-    parsedInstant && !Number.isNaN(parsedInstant.getTime())
-  );
-  const instantParts = validInstant ? localDateParts(parsedInstant, timeZone) : null;
+  const requestedTimezone = cleanText(args.timezone, 100);
+  if (!requestedTimezone) return null;
+  let timeZone;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: requestedTimezone }).format(
+      new Date()
+    );
+    timeZone = requestedTimezone;
+  } catch {
+    return null;
+  }
   const customerLocalDate = parseConfirmedLocalDate(
-    args.customer_local_date || rawCallback,
-    timeZone,
-    args.application_local_date || call.result?.application_local_date
-  ) || (instantParts ? `${instantParts.year}-${instantParts.month}-${instantParts.day}` : null);
+    args.customer_local_date,
+    timeZone
+  );
   const customerLocalTime = parseConfirmedLocalTime(
-    args.customer_local_time || rawCallback
-  ) || (instantParts ? `${instantParts.hour}:${instantParts.minute}` : null);
+    args.customer_local_time
+  );
   if (!customerLocalDate || !customerLocalTime) return null;
   const callbackAt = localDateTimeToUtc(
     customerLocalDate,
@@ -5868,7 +5929,7 @@ async function trackSmsMessage(callId, message, messageType) {
 
 }
 
-async function executeDougTool(call, name, args) {
+async function executeDougTool(call, name, args, sessionCallPhase) {
   const safeArgs = args && typeof args === "object" ? args : {};
   const permittedWaitingEnd =
     name === "mark_contact_restriction" ||
@@ -5967,7 +6028,8 @@ async function executeDougTool(call, name, args) {
       success: true,
       current_state: currentState,
       next_state: nextState,
-      saved_fields: Object.keys(answers)
+      saved_fields: Object.keys(answers),
+      confirmed_purchase_area: confirmedPurchaseArea
     };
   }
 
@@ -6006,10 +6068,24 @@ async function executeDougTool(call, name, args) {
   }
 
   if (name === "record_application_checkpoint") {
-    if (safeArgs.started !== true) {
+    const confirmedStarted = call.result?.application_started_confirmed;
+    if (
+      sessionCallPhase !== "CALL_TWO" ||
+      call.result?.application_status_explicitly_answered !== true ||
+      typeof confirmedStarted !== "boolean" ||
+      safeArgs.started !== confirmedStarted
+    ) {
       return {
         success: false,
-        error: "Confirm a new callback date, time, and timezone, then use schedule_callback."
+        error:
+          "Application status can only be recorded in Call Two after the customer explicitly answers the application-status question."
+      };
+    }
+    if (confirmedStarted !== true) {
+      return {
+        success: true,
+        app_started_confirmation: "No",
+        application_started: false
       };
     }
 
@@ -6038,7 +6114,9 @@ async function executeDougTool(call, name, args) {
         call.call_id,
         summary,
         JSON.stringify({
-          app_started_confirmation: "Started",
+          app_started_confirmation: "Yes",
+          application_started_confirmed: true,
+          application_status_explicitly_answered: true,
           interest_level: "Hot",
           business_outcome: "Application Started — Hot Lead"
         })
@@ -6047,13 +6125,13 @@ async function executeDougTool(call, name, args) {
     await appendAction(call.call_id, {
       action: name,
       success: true,
-      app_started_confirmation: "Started",
+      app_started_confirmation: "Yes",
       priority: "urgent"
     });
     queueMondaySync(call.call_id, "application_started_hot_lead");
     return {
       success: true,
-      app_started_confirmation: "Started",
+      app_started_confirmation: "Yes",
       interest_level: "Hot",
       priority: "Urgent",
       business_outcome: "Application Started — Hot Lead",
@@ -6278,9 +6356,9 @@ async function executeDougTool(call, name, args) {
 
     await mergeCallResult(appointmentCallId, {
       callback_at: callbackAt.toISOString(),
-      callback_timezone: timezone,
       callback_local_date: customerLocalDate,
       callback_local_time: customerLocalTime,
+      callback_timezone: timezone,
       outbound_call_reason: "scheduled_second_call",
       scheduled_second_call_source_call_id: scheduledSecondCallSourceId,
       scheduled_second_call_appointment_id: scheduledSecondCallAppointmentId,
@@ -6301,21 +6379,9 @@ async function executeDougTool(call, name, args) {
       preferred_contact_method:
         cleanText(safeArgs.preferred_contact_method, 30) || "phone",
       ...(isApplicationCheckpoint
-        ? {
-            application_follow_up_at: callbackAt.toISOString(),
-            app_started_confirmation: "Agreed to Start"
-          }
+        ? { application_follow_up_at: callbackAt.toISOString() }
         : {})
     });
-
-    if (isApplicationCheckpoint) {
-      await pool.query(
-        `UPDATE ai_calls SET current_state = 'application_checkpoint',
-         next_state = 'application_checkpoint', updated_at = NOW()
-         WHERE call_id = $1`,
-        [appointmentCallId]
-      );
-    }
 
     await pool.query(
       `UPDATE call_attempts SET technical_status = 'canceled', completed_at = NOW(),
@@ -6335,6 +6401,7 @@ async function executeDougTool(call, name, args) {
     await appendAction(appointmentCallId, {
       action: name,
       success: true,
+      session_call_phase: sessionCallPhase,
       outbound_call_reason: "scheduled_second_call",
       scheduled_second_call_source_call_id: scheduledSecondCallSourceId,
       scheduled_second_call_appointment_id: scheduledSecondCallAppointmentId,
@@ -6561,6 +6628,10 @@ async function executeDougTool(call, name, args) {
     const stopSequence = safeArgs.stop_sequence === true;
     const pauseSequence = safeArgs.pause_sequence === true;
     const requestedNext = cleanText(safeArgs.requested_next_call_at, 100);
+    const completionValidation = terminalCompletionValidation(
+      call,
+      sessionCallPhase
+    );
 
     const hardTerminalOutcome = [
       "qualified",
@@ -6674,6 +6745,7 @@ async function executeDougTool(call, name, args) {
       pause_sequence_requested: pauseSequence,
       actual_sequence_status: sequenceStatus,
       callback_preserved: sequenceStatus === "callback_scheduled",
+      completion_validation: completionValidation,
       requested_next_call_at: nextAttemptAt
         ? nextAttemptAt.toISOString()
         : null
@@ -6686,6 +6758,8 @@ async function executeDougTool(call, name, args) {
       stop_sequence_requested: stopSequence,
       pause_sequence_requested: pauseSequence,
       actual_sequence_status: sequenceStatus,
+      session_call_phase: sessionCallPhase,
+      completion_validation: completionValidation,
       next_attempt_at: nextAttemptAt ? nextAttemptAt.toISOString() : null
     });
 
@@ -6695,6 +6769,7 @@ async function executeDougTool(call, name, args) {
       success: true,
       outcome,
       sequence_status: sequenceStatus,
+      completion_validation: completionValidation,
       callback_preserved: sequenceStatus === "callback_scheduled",
       next_attempt_at: nextAttemptAt ? nextAttemptAt.toISOString() : null
     };
@@ -7378,12 +7453,14 @@ mediaServer.on("connection", (twilioSocket) => {
   let assistantResponseFinished = true;
   let normalCompletionRecorded = false;
   let normalEndRequested = false;
+  let sessionCallPhase = "";
   let finalClosingRequested = false;
   let finalClosingResponseId = "";
   let finalPlaybackMarkName = "";
   let finalHangupInProgress = false;
   let finalHangupCompleted = false;
   let finalHangupFallbackTimer = null;
+  let finalAbsoluteHangupTimer = null;
   let activeTwilioCallSid = "";
   let activeTwilioStreamSid = "";
   let assistantAudioQueuedForResponse = false;
@@ -7434,6 +7511,22 @@ mediaServer.on("connection", (twilioSocket) => {
     return false;
   }
 
+  function lockSessionCallPhase(loadedCall, attempt) {
+    if (sessionCallPhase) return sessionCallPhase;
+    sessionCallPhase = resolveSessionCallPhase(loadedCall, attempt);
+    return sessionCallPhase;
+  }
+
+  function refreshActiveRealtimeInstructions() {
+    if (!call || !sessionCallPhase) return false;
+    return sendToOpenAI({
+      type: "session.update",
+      session: {
+        instructions: buildDouglasDaisyInstructions(call, sessionCallPhase)
+      }
+    });
+  }
+
   function currentCallIsTerminal() {
     return (
       normalEndRequested ||
@@ -7469,6 +7562,23 @@ mediaServer.on("connection", (twilioSocket) => {
     pendingCustomerTranscripts = [];
     pendingTranscriptWasWhileAssistantSpeaking = false;
     queuedResponseOptions = null;
+  }
+
+  function beginNormalCallTermination(reason) {
+    if (normalEndRequested) return false;
+    normalEndRequested = true;
+    finalClosingRequested = true;
+    stopCurrentCallAutomation();
+    finalAbsoluteHangupTimer = setTimeout(() => {
+      void physicallyEndActiveTwilioCall("absolute_normal_end_timeout");
+    }, 15000);
+    console.log(JSON.stringify({
+      event: "normal_call_termination_started",
+      call_id: call?.call_id || null,
+      reason,
+      absolute_timeout_ms: 15000
+    }));
+    return true;
   }
 
   function sendMark() {
@@ -7753,7 +7863,43 @@ mediaServer.on("connection", (twilioSocket) => {
         purchase_area: confirmedPurchaseArea
       }));
       call = (await getCallById(call.call_id)) || call;
+      refreshActiveRealtimeInstructions();
       await endLocalWaitingState("purchase_area_confirmed");
+      requestAssistantResponse({ queueIfBusy: true });
+      return;
+    }
+
+    if (pendingQuestionType === "application_started") {
+      const explicitAnswer = normalizeExplicitYesNo(transcript);
+      if (explicitAnswer === null) {
+        requestAssistantResponse({
+          queueIfBusy: true,
+          allowWhileAwaiting: true,
+          preservePendingQuestion: true,
+          response: {
+            output_modalities: ["audio"],
+            instructions:
+              'Ask exactly: "Did you have a chance to start the application?" Say nothing else.'
+          }
+        });
+        return;
+      }
+      if (sessionCallPhase !== "CALL_TWO") {
+        console.error(JSON.stringify({
+          event: "application_status_rejected",
+          call_id: call.call_id,
+          session_call_phase: sessionCallPhase,
+          reason: "application_status_answer_outside_call_two"
+        }));
+        return;
+      }
+      await mergeCallResult(call.call_id, {
+        application_status_explicitly_answered: true,
+        application_started_confirmed: explicitAnswer,
+        app_started_confirmation: explicitAnswer ? "Yes" : "No"
+      });
+      call = (await getCallById(call.call_id)) || call;
+      await endLocalWaitingState("explicit_application_status_answer");
       requestAssistantResponse({ queueIfBusy: true });
       return;
     }
@@ -7912,17 +8058,32 @@ mediaServer.on("connection", (twilioSocket) => {
         );
       }
 
-      const updatedCall =
-        await twilioClient
-          .calls(twilioCallSid)
-          .update({
-            status: "completed"
-          });
+      let updatedCall = null;
+      let lastUpdateError = null;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          updatedCall = await twilioClient
+            .calls(twilioCallSid)
+            .update({
+              status: "completed"
+            });
+          lastUpdateError = null;
+          break;
+        } catch (error) {
+          lastUpdateError = error;
+          if (attempt < 3) await sleep(attempt === 1 ? 500 : 1000);
+        }
+      }
+      if (lastUpdateError) throw lastUpdateError;
 
       finalHangupCompleted = true;
       if (finalHangupFallbackTimer) {
         clearTimeout(finalHangupFallbackTimer);
         finalHangupFallbackTimer = null;
+      }
+      if (finalAbsoluteHangupTimer) {
+        clearTimeout(finalAbsoluteHangupTimer);
+        finalAbsoluteHangupTimer = null;
       }
       await appendAction(call.call_id, {
         action: "twilio_physical_hangup",
@@ -7987,7 +8148,13 @@ mediaServer.on("connection", (twilioSocket) => {
         toolName: name,
         args,
         call: refreshed || call,
-        execute: executeDougTool
+        execute: (activeCall, toolName, toolArgs) =>
+          executeDougTool(
+            activeCall,
+            toolName,
+            toolArgs,
+            sessionCallPhase
+          )
       });
     } catch (error) {
       console.error(`Daisy tool ${name} failed for ${call.call_id}:`, error);
@@ -8014,10 +8181,8 @@ mediaServer.on("connection", (twilioSocket) => {
       completeCallSucceeded || scheduleCallbackSucceeded;
 
     if (terminalActionSucceeded) {
+      beginNormalCallTermination(name);
       normalCompletionRecorded = true;
-      normalEndRequested = true;
-      finalClosingRequested = true;
-      stopCurrentCallAutomation();
       await pool.query(
         `
           UPDATE ai_calls
@@ -8066,6 +8231,15 @@ mediaServer.on("connection", (twilioSocket) => {
       call = (await getCallById(call.call_id)) || call;
     }
 
+    if (
+      name === "save_call_progress" &&
+      output?.success === true &&
+      exactMeaningfulPurchaseArea(args?.answers?.purchase_area)
+    ) {
+      call = (await getCallById(call.call_id)) || call;
+      refreshActiveRealtimeInstructions();
+    }
+
     sendToOpenAI({
       type: "conversation.item.create",
       item: {
@@ -8111,7 +8285,7 @@ mediaServer.on("connection", (twilioSocket) => {
         model: OPENAI_REALTIME_MODEL,
         voice: OPENAI_VOICE,
         transcriptionModel: OPENAI_TRANSCRIPTION_MODEL,
-        instructions: buildDouglasDaisyInstructions(call),
+        instructions: buildDouglasDaisyInstructions(call, sessionCallPhase),
         tools: REALTIME_TOOLS
       });
 
@@ -8527,6 +8701,16 @@ mediaServer.on("connection", (twilioSocket) => {
           twilioSocket.close(1008, "Invalid stream token");
           return;
         }
+
+        const activeAttempt = call.last_attempt_id
+          ? await getAttemptById(call.last_attempt_id)
+          : null;
+        lockSessionCallPhase(call, activeAttempt);
+        console.log(JSON.stringify({
+          event: "media_session_phase_locked",
+          call_id: call.call_id,
+          session_call_phase: sessionCallPhase
+        }));
 
         activeTwilioCallSid =
           String(message?.start?.callSid || "").trim();
