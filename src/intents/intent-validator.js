@@ -8,11 +8,15 @@ function validateIntent(toolName, args = {}, context = {}) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return fail("INVALID_ARGUMENTS");
   if (toolName === "send_resource_link" && args.consent_confirmed !== true) return fail("SMS_CONSENT_REQUIRED");
   if (toolName === "transfer_to_specialist" && args.prospect_confirmed !== true) return fail("TRANSFER_CONFIRMATION_REQUIRED");
-  if (toolName === "schedule_callback") {
-    if (args.prospect_confirmed !== true) return fail("CALLBACK_CONFIRMATION_REQUIRED");
-    const date = new Date(args.callback_at);
-    if (!args.timezone || Number.isNaN(date.getTime()) || date <= new Date()) return fail("INVALID_CALLBACK_TIME");
+ if (toolName === "schedule_callback") {
+  if (args.prospect_confirmed !== true) {
+    return fail("CALLBACK_CONFIRMATION_REQUIRED");
   }
+
+  if (!args.timezone) {
+    return fail("CALLBACK_TIMEZONE_REQUIRED", true);
+  }
+}
   if (toolName === "save_call_progress" && !canTransition(context.current_state || args.current_state, args.next_state, { allowLegacy: true })) return fail("INVALID_STATE_TRANSITION");
   return { valid: true, intent: TOOL_TO_INTENT[toolName], error: null };
 }
