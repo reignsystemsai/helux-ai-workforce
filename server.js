@@ -5969,6 +5969,7 @@ function resolveCustomerTimezone(value, fallback = null) {
     return timeZone;
   } catch {
     return null;
+   }
   }
 function resolveConfirmedCallbackDateTime(args, call) {
   const requestedTimezone =
