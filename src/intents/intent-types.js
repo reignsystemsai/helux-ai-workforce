@@ -1,9 +1,7 @@
 const INTENTS = Object.freeze({
-  RECORD_APPLICATION_CHECKPOINT: "record_application_checkpoint",
   SAVE_CALL_PROGRESS: "save_call_progress",
   CALCULATE_PRELIMINARY_DTI: "calculate_preliminary_dti",
   SEND_RESOURCE_LINK: "send_resource_link",
-  SCHEDULE_CALLBACK: "schedule_callback",
   CREATE_SPECIALIST_HANDOFF: "create_specialist_handoff",
   TRANSFER_TO_SPECIALIST: "transfer_to_specialist",
   MARK_CONTACT_RESTRICTION: "mark_contact_restriction",
@@ -15,9 +13,6 @@ const TOOL_TO_INTENT = Object.freeze(Object.fromEntries(
 ));
 
 const REALTIME_TOOLS = Object.freeze([
-  tool("record_application_checkpoint", "Record a confirmed application checkpoint.", {
-    started: { type: "boolean" }, summary: { type: "string" }
-  }, ["started", "summary"]),
   tool("save_call_progress", "Save confirmed progress and an allowed conversation transition.", {
     current_state: { type: "string" }, next_state: { type: "string" }, answers: { type: "object" },
     sentiment: { type: "string", enum: ["positive", "neutral", "skeptical", "confused", "frustrated", "urgent", "excited", "hesitant", "fearful", "disappointed"] },
@@ -30,12 +25,8 @@ const REALTIME_TOOLS = Object.freeze([
     resource_type: { type: "string", enum: ["application", "dti_calculator", "prephub", "credit_readiness", "tax_readiness", "employment_readiness"] },
     consent_confirmed: { type: "boolean" }
   }, ["resource_type", "consent_confirmed"]),
-  tool("schedule_callback", "Schedule a customer-confirmed callback.", {
-    callback_at: { type: "string" }, timezone: { type: "string" }, reason: { type: "string" }, primary_concern: { type: "string" }, hold_reason: { type: "string" }, discussion_summary: { type: "string" },
-    preferred_contact_method: { type: "string", enum: ["phone", "sms", "email"] }, sms_confirmation_consent: { type: "boolean" }, prospect_confirmed: { type: "boolean" }
-  }, ["callback_at", "timezone", "reason", "sms_confirmation_consent", "prospect_confirmed"]),
   tool("create_specialist_handoff", "Create a structured specialist handoff.", {
-    reason: { type: "string" }, priority: { type: "string", enum: ["normal", "high", "urgent"] }, summary: { type: "string" }, requested_callback_at: { type: "string" }
+    reason: { type: "string" }, priority: { type: "string", enum: ["normal", "high", "urgent"] }, summary: { type: "string" }
   }, ["reason", "priority", "summary"]),
   tool("transfer_to_specialist", "Attempt a live transfer only after explicit agreement.", {
     reason: { type: "string" }, priority: { type: "string", enum: ["normal", "high", "urgent"] }, prospect_confirmed: { type: "boolean" }
@@ -44,8 +35,8 @@ const REALTIME_TOOLS = Object.freeze([
     restriction_type: { type: "string", enum: ["wrong_number", "invalid_number", "do_not_call", "not_interested"] }, reason: { type: "string" }, stop_voice: { type: "boolean" }, stop_sms: { type: "boolean" }, stop_email: { type: "boolean" }
   }, ["restriction_type", "reason", "stop_voice", "stop_sms", "stop_email"]),
   tool("complete_call", "Record the connected-call result and sequence instruction.", {
-    outcome: { type: "string", enum: ["qualified", "hot_transfer", "specialist_handoff", "specialist_callback", "follow_up_scheduled", "application_link_sent", "dti_calculator_sent", "needs_review", "nurture", "voicemail", "no_answer", "busy", "not_interested", "wrong_number", "opt_out", "disconnected", "technical_failure", "agent_notified"] },
-    next_action: { type: "string" }, summary: { type: "string" }, stop_sequence: { type: "boolean" }, pause_sequence: { type: "boolean" }, requested_next_call_at: { type: "string" }
+    outcome: { type: "string", enum: ["qualified", "hot_transfer", "specialist_handoff", "application_link_sent", "dti_calculator_sent", "needs_review", "nurture", "voicemail", "no_answer", "busy", "not_interested", "wrong_number", "opt_out", "disconnected", "technical_failure", "agent_notified"] },
+    next_action: { type: "string" }, summary: { type: "string" }, stop_sequence: { type: "boolean" }, pause_sequence: { type: "boolean" }
   }, ["outcome", "next_action", "summary", "stop_sequence", "pause_sequence"])
 ]);
 

@@ -1,6 +1,6 @@
 # HELUX AI Workforce - Daisy 3.0
 
-Production outbound calling service for the DPA Help Center. Daisy 3.0 separates the customer conversation from HELUX background operations while preserving the existing Express, PostgreSQL, Twilio, OpenAI Realtime, Monday.com, callback, retry, transfer, and reporting behavior.
+Production outbound calling service for the DPA Help Center. Daisy 3.0 separates the customer conversation from HELUX background operations while preserving the existing Express, PostgreSQL, Twilio, OpenAI Realtime, Monday.com, transfer, and reporting behavior.
 
 ## Run
 

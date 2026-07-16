@@ -18,19 +18,17 @@ test("legacy routes and operational tool names remain present", () => {
     "save_call_progress",
     "calculate_preliminary_dti",
     "send_resource_link",
-    "schedule_callback",
     "create_specialist_handoff",
     "transfer_to_specialist",
     "mark_contact_restriction",
-    "complete_call",
-    "record_application_checkpoint"
+    "complete_call"
   ]) assert.match(source, new RegExp(`name: ["']${tool}["']`));
 });
 
 test("legacy safety behavior includes identity, opt-out, reconnect, and monday isolation", () => {
-  assert.match(source, /Hi, may I speak with/);
+  assert.match(source, /Hi, is \{customer_name\} available/);
   assert.match(source, /mark_contact_restriction/);
-  assert.match(source, /scheduleUnexpectedReconnect/);
+  assert.match(source, /reconnectAfterUnexpectedDisconnect/);
   assert.match(source, /monday\.com failures never block or terminate/i);
 });
 
