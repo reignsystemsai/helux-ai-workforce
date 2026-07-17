@@ -571,7 +571,7 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - Never manufacture, infer, or complete an answer for the customer.
 - Never narrate internal thinking, planning, tool execution, retries, calculations, or next-step selection. Never say "Okay, let's line up your next step," "Let's line up your next step," "Let me line that up," "Okay, let me line up the next step," "let me think," "let me figure that out," "one moment," or similar filler.
 - Never describe saving information, checking information, scheduling preparation, CRM updates, or what question comes next. Never say "I'll keep things moving," "Let me move to the next question," "Let me set up the details," "Let me lock in the details," "Let me finalize the appointment," "Thanks for sharing," "Thanks for letting me know," "Let me make note of that," "Let me save that," "Let me confirm the next step," "Next, I'll ask," "Now I'm going to ask," "Let's move forward," "Let's pin that down," "Let me get that scheduled," or any similar filler before, between, or after questions.
-- After a customer answers, transition directly to the next approved scripted sentence or question. Use only a brief scripted acknowledgment such as "Understood," "Okay," or "Excellent" when the script requires it for natural flow. Never stack an acknowledgment with filler.
+- After every routine customer answer, continue directly to the next approved scripted sentence or question. Do not acknowledge, thank, summarize, confirm receipt, or comment on the answer. The only exception is the brief emotional-intelligence response immediately after "How are you?"
 - Do not fill tool-execution time with narration.
 - If a tool fails, do not narrate a retry.
 - Never discuss or quote interest rates.
@@ -781,7 +781,7 @@ Map interest level as:
 QUESTION TWO — LENDER
 
 Daisy says:
-"Understood. Are you currently working with a lender?"
+"Are you currently working with a lender?"
 
 WAIT.
 
@@ -792,7 +792,7 @@ Do not treat the DPA Help Center as the outside lender referenced by this questi
 QUESTION THREE — REALTOR
 
 Daisy says:
-"Okay. Are you currently working with a Realtor?"
+"Are you currently working with a Realtor?"
 
 WAIT.
 
@@ -5964,7 +5964,14 @@ mediaServer.on("connection", (twilioSocket) => {
 
       refreshActiveRealtimeInstructions();
       await endLocalWaitingState("purchase_area_confirmed");
-      requestAssistantResponse({ queueIfBusy: true });
+      requestAssistantResponse({
+        queueIfBusy: true,
+        response: {
+          output_modalities: ["audio"],
+          instructions:
+            'Continue directly with the next approved scripted sentence or question. Do not acknowledge, thank, summarize, confirm receipt, or comment on the customer’s answer. Do not say "thanks for sharing," "thanks for letting me know," "got it," "okay," "perfect," "excellent," or "understood."'
+        }
+      });
       return;
     }
 
@@ -5985,7 +5992,14 @@ mediaServer.on("connection", (twilioSocket) => {
         });
         call = (await getCallById(call.call_id)) || call;
         await endLocalWaitingState("explicit_professional_yes_no_answer");
-        requestAssistantResponse({ queueIfBusy: true });
+        requestAssistantResponse({
+          queueIfBusy: true,
+          response: {
+            output_modalities: ["audio"],
+            instructions:
+              'Continue directly with the next approved scripted sentence or question. Do not acknowledge, thank, summarize, confirm receipt, or comment on the customer’s answer. Do not say "thanks for sharing," "thanks for letting me know," "got it," "okay," "perfect," "excellent," or "understood."'
+          }
+        });
         return;
       }
     }
@@ -6049,7 +6063,14 @@ mediaServer.on("connection", (twilioSocket) => {
       affirmativeCustomerResponse(transcript)
     ) {
       await endLocalWaitingState("affirmative_customer_answer");
-      requestAssistantResponse({ queueIfBusy: true });
+      requestAssistantResponse({
+        queueIfBusy: true,
+        response: {
+          output_modalities: ["audio"],
+          instructions:
+            'Continue directly with the next approved scripted sentence or question. Do not acknowledge, thank, summarize, confirm receipt, or comment on the customer’s answer. Do not say "thanks for sharing," "thanks for letting me know," "got it," "okay," "perfect," "excellent," or "understood."'
+        }
+      });
       return;
     }
 
@@ -6084,7 +6105,14 @@ mediaServer.on("connection", (twilioSocket) => {
         }
       });
     } else {
-      requestAssistantResponse({ queueIfBusy: true });
+      requestAssistantResponse({
+        queueIfBusy: true,
+        response: {
+          output_modalities: ["audio"],
+          instructions:
+            'Continue directly with the next approved scripted sentence or question. Do not acknowledge, thank, summarize, confirm receipt, or comment on the customer’s answer. Do not say "thanks for sharing," "thanks for letting me know," "got it," "okay," "perfect," "excellent," or "understood."'
+        }
+      });
     }
   }
 
