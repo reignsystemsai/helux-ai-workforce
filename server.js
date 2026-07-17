@@ -1143,7 +1143,7 @@ const DOUG_TOOLS = [
 ];
 
 const REALTIME_TOOLS = Object.freeze(
-  BASE_REALTIME_TOOLS.filter(
+  DOUG_TOOLS.filter(
     (toolDefinition) => toolDefinition.name !== "send_resource_link"
   )
 );
