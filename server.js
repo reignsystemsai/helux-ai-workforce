@@ -570,8 +570,8 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - Use submitted information. Confirm it instead of repeating the intake form.
 - Never manufacture, infer, or complete an answer for the customer.
 - Never narrate internal thinking, planning, tool execution, retries, calculations, or next-step selection. Never say "Okay, let's line up your next step," "Let's line up your next step," "Let me line that up," "Okay, let me line up the next step," "let me think," "let me figure that out," "one moment," or similar filler.
-- Never describe saving information, checking information, scheduling preparation, CRM updates, or what question comes next. Never say "I'll keep things moving," "Let me make note of that," "Next, I'll ask about timing," "Let's pin down a time," "Let me check," or "Okay, moving forward."
-- After a customer answers, transition directly to the next scripted sentence.
+- Never describe saving information, checking information, scheduling preparation, CRM updates, or what question comes next. Never say "I'll keep things moving," "Let me move to the next question," "Let me set up the details," "Let me lock in the details," "Let me finalize the appointment," "Thanks for sharing," "Thanks for letting me know," "Let me make note of that," "Let me save that," "Let me confirm the next step," "Next, I'll ask," "Now I'm going to ask," "Let's move forward," "Let's pin that down," "Let me get that scheduled," or any similar filler before, between, or after questions.
+- After a customer answers, transition directly to the next approved scripted sentence or question. Use only a brief scripted acknowledgment such as "Understood," "Okay," or "Excellent" when the script requires it for natural flow. Never stack an acknowledgment with filler.
 - Do not fill tool-execution time with narration.
 - If a tool fails, do not narrate a retry.
 - Never discuss or quote interest rates.
@@ -744,7 +744,7 @@ WAIT. Only a clear yes confirms it. If the customer corrects the timezone, use t
 After clear confirmation call create_confirmed_appointment with callback_type "call_one_rescheduled", callback_reason "Customer requested another time to complete Call One", prospect_confirmed true, and Current source call ID. Do not call it with incomplete or inferred values. Do not claim scheduling succeeded unless the tool returns success true.
 
 After success, use complete_call. The server then plays this final closing:
-"Perfect. I have us scheduled to speak again. Thank you for your time, {customer_name}. I'll speak with you then. Have a great day."
+"Excellent. Thank you for your time, {customer_name}. I look forward to speaking with you then. If there's nothing else, please feel free to disconnect the call. Have a great day."
 
 End normally after the closing. The server physically disconnects the current call.
 
@@ -6314,11 +6314,13 @@ mediaServer.on("connection", (twilioSocket) => {
           160
         ) || "the customer";
       const callbackType = call.result?.callback_type;
-      const finalClosing = callbackType === "call_one_rescheduled"
-        ? `Perfect. I have us scheduled to speak again. Thank you for your time, ${customerName}. I'll speak with you then. Have a great day.`
-        : callbackType === "call_two_application_follow_up"
-          ? `Excellent. Thank you for your time, ${customerName}. I look forward to speaking with you then. If there's nothing else, please feel free to disconnect the call. Have a great day.`
-          : `If there's nothing else, thank you for your time, ${customerName}. Have a great day.`;
+      const appointmentConfirmed = [
+        "call_one_rescheduled",
+        "call_two_application_follow_up"
+      ].includes(callbackType);
+      const finalClosing = appointmentConfirmed
+        ? `Excellent. Thank you for your time, ${customerName}. I look forward to speaking with you then. If there's nothing else, please feel free to disconnect the call. Have a great day.`
+        : `If there's nothing else, thank you for your time, ${customerName}. Have a great day.`;
       requestAssistantResponse({
         queueIfBusy: true,
         allowTerminalClosing: true,
