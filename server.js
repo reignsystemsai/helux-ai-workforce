@@ -1129,7 +1129,7 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - If the customer asks a separate question, answer it briefly, then return to the one pending script question.
 - Use submitted information. Confirm it instead of repeating the intake form.
 - Never manufacture, infer, or complete an answer for the customer.
-- Never narrate internal thinking, planning, tool execution, retries, calculations, saving, CRM updates, or next-step selection.
+-- Never narrate internal thinking, planning, tool execution, retries, calculations, saving, CRM updates, or next-step selection.
 - After every routine customer answer, do not acknowledge, thank, summarize, confirm receipt, comment, or elaborate. Never say "got it," "thanks," "thank you for that," "understood," "okay," "perfect," "excellent," "let me think," "let me figure that out," or any similar filler.
 - Silently save the answer when appropriate and immediately continue with the next exact scripted sentence or question.
 - The only exceptions are the brief emotional response immediately after "How are you?", acknowledging a customer correction, a brief apology after a genuine system failure, and the final departing message.
@@ -1248,23 +1248,35 @@ WAIT.
 
 Listen to the completed response, then reply with at most one very brief natural sentence appropriate to the customer's mood: positive, "I'm glad to hear that"; neutral, "Good to hear"; negative, "I'm sorry to hear that"; busy or distracted, "I understand." Do not ask how they feel, start a side conversation, overreact, or repeat their words. Immediately continue to the next scripted sentence.
 
-CONFIRM THE REQUEST AND SUBMITTED INFORMATION
+CONFIRM THE REQUEST
 
-When the assistance estimate and all submitted values are available, Daisy says:
-"I see you're a first-time homebuyer looking for up to {estimated_dpa} in down payment assistance to purchase a home. Based on your submitted credit score of {credit_score_submitted}, your submitted income of {income_submitted}, your work history of {work_history_submitted}, and your tax return information of {tax_return_submitted}, reviewing down payment assistance options should be in your favor. Is all of that information still correct?"
+When the assistance estimate is available, Daisy says:
+"I see you're a first-time homebuyer looking for up to {estimated_dpa} in down payment assistance to purchase a home. Is that correct?"
 
-When one or more values are unavailable:
-- Mention only the information that is available.
-- Ask exactly once: "Is all of that information still correct?"
+When the assistance estimate is unavailable, Daisy says:
+"I see you're a first-time homebuyer looking for down payment assistance to purchase a home. Is that correct?"
 
 WAIT.
 
-When the customer corrects any submitted information:
-- Briefly acknowledge only the correction.
-- Save the updated information.
-- Do not repeat information that remains correct.
+The words "Is that correct?" are required and must not be omitted.
 
-This confirmation question must be asked only once.
+When the customer corrects the amount or first-time-homebuyer status:
+- Acknowledge the correction.
+- Save the updated information.
+- Do not argue or repeat the original information.
+
+CONFIRM SUBMITTED INFORMATION
+
+When all submitted values are available, Daisy says:
+"Excellent. Based on your submitted credit score of {credit_score_submitted}, your submitted income of {income_submitted}, your work history of {work_history_submitted}, and your tax return information of {tax_return_submitted}, reviewing down payment assistance options should be in your favor. Is all of that information still correct?"
+
+When one or more values are unavailable:
+- Confirm only the values that are available.
+- End with: "Is that information still correct?"
+
+WAIT.
+
+Save corrections without asking the customer to repeat information that remains correct.
 
 CONFIRM AVAILABILITY
 
@@ -1300,7 +1312,7 @@ End normally after the closing. The server physically disconnects the current ca
 EXPLAIN THE CALL
 
 When the customer can continue, Daisy says:
-"Our two-call process is simple. Call One, which is now, quickly covers your purchase timeline, whether you're working with a lender or Realtor, and the area where you'd like to purchase. On Call Two, we'll review your application status, debt-to-income ratio, and potential program options, and make sure you're connected with DPA lender and Realtor specialists when needed. How does that sound?"
+"Perfect, this will be quick. Our two-call process is simple. Call One, which is now, quickly covers your purchase timeline, whether you're working with a lender or Realtor, and the area where you'd like to purchase. On Call Two, we'll review your application status, debt-to-income ratio, and potential program options, and make sure you're connected with DPA lender and Realtor specialists when needed. How does that sound?"
 
 WAIT.
 
@@ -1330,7 +1342,7 @@ Map interest level as:
 QUESTION TWO — LENDER
 
 Daisy says:
-"Are you currently working with a lender?"
+"Understood. Are you currently working with a lender?"
 
 WAIT.
 
@@ -1341,7 +1353,7 @@ Do not treat the DPA Help Center as the outside lender referenced by this questi
 QUESTION THREE — REALTOR
 
 Daisy says:
-"Are you currently working with a Realtor?"
+"Okay. Are you currently working with a Realtor?"
 
 WAIT.
 
@@ -1374,7 +1386,7 @@ Then ask:
 WAIT.
 
 If yes, ask:
-"Would it be okay if I scheduled our second call for approximately 24 hours from now?"
+"Excellent. Would it be okay if I scheduled our second call for approximately 24 hours from now?"
 
 WAIT. If the customer agrees, do not ask what time works, do not ask them to repeat the current time, and do not collect another callback time. Add exactly 24 hours to Current call timestamp. Convert that resulting UTC instant to the customer's confirmed saved timezone and use its exact local date and time. When a valid confirmed timezone is saved, proceed directly to the complete appointment confirmation without asking for the timezone again.
 
@@ -6482,14 +6494,7 @@ mediaServer.on("connection", (twilioSocket) => {
     }
 
     if (!awaitingCustomerResponse) {
-      requestAssistantResponse({
-        queueIfBusy: true,
-        response: {
-          output_modalities: ["audio"],
-          instructions:
-            'Continue with only the next exact scripted sentence or question. Do not acknowledge, thank, summarize, explain, narrate, plan, or add transition words. Never say "okay," "alright," "got it," "understood," "perfect," "excellent," "thanks," "let me," "I will note that," "I will ask the next question," "let us keep moving," or anything similar. Say nothing before or after the exact scripted sentence or question.'
-        }
-      });
+      requestAssistantResponse({ queueIfBusy: true });
       return;
     }
 
@@ -6548,19 +6553,14 @@ mediaServer.on("connection", (twilioSocket) => {
         });
         call = (await getCallById(call.call_id)) || call;
         await endLocalWaitingState("explicit_professional_yes_no_answer");
-        const nextProfessionalQuestion =
-          professionalAnswerKey === "applied_with_lender"
-            ? "Are you currently working with a Realtor?"
-            : "And one more question before we schedule your second call: what area would you like to purchase a home in?";
-
         requestAssistantResponse({
-          queueIfBusy: true,
-          response: {
-            output_modalities: ["audio"],
-            instructions:
-              `Say exactly: ${JSON.stringify(nextProfessionalQuestion)} Say nothing else.`
-          }
-        });
+  queueIfBusy: true,
+  response: {
+    output_modalities: ["audio"],
+    instructions:
+      'Continue immediately with the next exact scripted question. Do not acknowledge, thank, summarize, comment on, or elaborate on the customer’s answer. Do not say "got it," "thanks," "thank you for that," "understood," "okay," "perfect," "excellent," "let me think," or any similar filler.'
+  }
+});
         return;
       }
     }
@@ -6611,8 +6611,9 @@ mediaServer.on("connection", (twilioSocket) => {
         preservePendingQuestion: true,
         response: {
           output_modalities: ["audio"],
-          instructions:
-            `Answer the customer's separate question in one brief sentence. Then say exactly: ${JSON.stringify(pendingQuestionText)} Say nothing else.`
+          instructions: `Answer the customer's separate question briefly and accurately. Then return naturally to this still-pending question, ask it once, and stop: ${JSON.stringify(
+            pendingQuestionText
+          )}`
         }
       });
       return;
@@ -6623,14 +6624,7 @@ mediaServer.on("connection", (twilioSocket) => {
       affirmativeCustomerResponse(transcript)
     ) {
       await endLocalWaitingState("affirmative_customer_answer");
-      requestAssistantResponse({
-        queueIfBusy: true,
-        response: {
-          output_modalities: ["audio"],
-          instructions:
-            'Continue with only the next exact scripted sentence or question. Do not acknowledge, thank, summarize, explain, narrate, plan, or add transition words. Never say "okay," "alright," "got it," "understood," "perfect," "excellent," "thanks," "let me," "I will note that," "I will ask the next question," "let us keep moving," or anything similar. Say nothing before or after the exact scripted sentence or question.'
-        }
-      });
+      requestAssistantResponse({ queueIfBusy: true });
       return;
     }
 
@@ -6659,19 +6653,13 @@ mediaServer.on("connection", (twilioSocket) => {
         queueIfBusy: true,
         response: {
           output_modalities: ["audio"],
-          instructions:
-            `Say exactly: ${JSON.stringify(suspended.pending_question_text)} Say nothing else.`
+          instructions: `Continue the identity-confirmed introduction briefly without asking another question. Then return to this previously pending question, ask it once, and stop: ${JSON.stringify(
+            suspended.pending_question_text
+          )}`
         }
       });
     } else {
-      requestAssistantResponse({
-        queueIfBusy: true,
-        response: {
-          output_modalities: ["audio"],
-          instructions:
-            'Continue with only the next exact scripted sentence or question. Do not acknowledge, thank, summarize, explain, narrate, plan, or add transition words. Never say "okay," "alright," "got it," "understood," "perfect," "excellent," "thanks," "let me," "I will note that," "I will ask the next question," "let us keep moving," or anything similar. Say nothing before or after the exact scripted sentence or question.'
-        }
-      });
+      requestAssistantResponse({ queueIfBusy: true });
     }
   }
 
@@ -6915,14 +6903,7 @@ mediaServer.on("connection", (twilioSocket) => {
         }
       });
     } else {
-      requestAssistantResponse({
-        queueIfBusy: true,
-        response: {
-          output_modalities: ["audio"],
-          instructions:
-            'Continue with only the next exact scripted sentence or question. Do not acknowledge, thank, summarize, explain, narrate, plan, or add transition words. Never say "okay," "alright," "got it," "understood," "perfect," "excellent," "thanks," "let me," "I will note that," "I will ask the next question," "let us keep moving," or anything similar. Say nothing before or after the exact scripted sentence or question.'
-        }
-      });
+      requestAssistantResponse({ queueIfBusy: true });
     }
   }
 
