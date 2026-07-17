@@ -5,13 +5,6 @@ const { Pool } = require("pg");
 const twilio = require("twilio");
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
-
-/*
- * HELUX AI WORKFORCE - DAISY 3.2.0
- * Daisy, Doug's assistant: calling, resources, and two-way monday.com control.
- * monday.com failures never block or terminate a customer call.
- */
-
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL;
 const HELUX_API_KEY = process.env.HELUX_API_KEY;
