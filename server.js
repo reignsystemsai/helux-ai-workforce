@@ -6230,12 +6230,12 @@ mediaServer.on("connection", (twilioSocket) => {
     stopCurrentCallAutomation();
     finalAbsoluteHangupTimer = setTimeout(() => {
       void physicallyEndActiveTwilioCall("absolute_normal_end_timeout");
-    }, 15000);
+    }, 30000);
     console.log(JSON.stringify({
       event: "normal_call_termination_started",
       call_id: call?.call_id || null,
       reason,
-      absolute_timeout_ms: 15000
+      absolute_timeout_ms: 30000
     }));
     return true;
   }
