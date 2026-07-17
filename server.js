@@ -5965,7 +5965,14 @@ mediaServer.on("connection", (twilioSocket) => {
 
       refreshActiveRealtimeInstructions();
       await endLocalWaitingState("purchase_area_confirmed");
-      requestAssistantResponse({ queueIfBusy: true });
+      requestAssistantResponse({
+  queueIfBusy: true,
+  response: {
+    output_modalities: ["audio"],
+    instructions:
+      `Say exactly: "Well, that's everything for this call, and now you're one step closer to becoming a homeowner in ${confirmedPurchaseArea}." Then say exactly: "Your next step is to start the application so I can follow up with you about its status, explore potential program options, and review your preliminary debt-to-income ratio. How does that sound?" Say nothing else.`
+  }
+});
       return;
     }
 
@@ -5986,7 +5993,14 @@ mediaServer.on("connection", (twilioSocket) => {
         });
         call = (await getCallById(call.call_id)) || call;
         await endLocalWaitingState("explicit_professional_yes_no_answer");
-        requestAssistantResponse({ queueIfBusy: true });
+        requestAssistantResponse({
+  queueIfBusy: true,
+  response: {
+    output_modalities: ["audio"],
+    instructions:
+      'Continue immediately with the next exact scripted question. Do not acknowledge, thank, summarize, comment on, or elaborate on the customer’s answer. Do not say "got it," "thanks," "thank you for that," "understood," "okay," "perfect," "excellent," "let me think," or any similar filler.'
+  }
+});
         return;
       }
     }
