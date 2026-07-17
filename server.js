@@ -6889,11 +6889,15 @@ mediaServer.on("connection", (twilioSocket) => {
           160
         ) || "the customer";
       const callbackType = call.result?.callback_type;
-      const finalClosing = callbackType === "call_one_rescheduled"
-        ? `Perfect. I have us scheduled to speak again. Thank you for your time, ${customerName}. I'll speak with you then. Have a great day.`
-        : callbackType === "call_two_application_follow_up"
-          ? `Excellent. Thank you for your time, ${customerName}. I look forward to speaking with you then. If there's nothing else, please feel free to disconnect the call. Have a great day.`
-          : `If there's nothing else, thank you for your time, ${customerName}. Have a great day.`;
+      const closingLead =
+  callbackType === "call_one_rescheduled"
+    ? `Perfect. I have us scheduled to speak again. Thank you for your time, ${customerName}. I'll speak with you then.`
+    : callbackType === "call_two_application_follow_up"
+      ? `Excellent. Thank you for your time, ${customerName}. I look forward to speaking with you then.`
+      : `Thank you for your time, ${customerName}.`;
+
+const finalClosing =
+  `${closingLead} If there's nothing else, please feel free to hang up and disconnect the call. Have a great day.`;
       requestAssistantResponse({
         queueIfBusy: true,
         allowTerminalClosing: true,
