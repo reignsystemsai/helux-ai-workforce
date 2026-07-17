@@ -5,21 +5,6 @@ const { Pool } = require("pg");
 const twilio = require("twilio");
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
-const {
-  REALTIME_TOOLS: BASE_REALTIME_TOOLS
-} = require("./src/intents/intent-types");
-const { routeIntent } = require("./src/intents/intent-router");
-const { guardAssistantOutput } = require("./src/compliance/compliance-guardrails");
-const { isInterestRateQuestion, interestRateResponse } = require("./src/compliance/interest-rate-policy");
-const { isListeningAcknowledgement } = require("./src/realtime/interruption-manager");
-const { semanticTurnDelay } = require("./src/realtime/turn-manager");
-const { DEFAULTS: REALTIME_DEFAULTS } = require("./src/realtime/latency-manager");
-const { buildRealtimeSession } = require("./src/realtime/openai-session");
-const {
-  SchedulingError,
-  createConfirmedAppointment,
-  localDateTimeToUtc
-} = require("./src/scheduling/confirmed-appointment");
 
 /*
  * HELUX AI WORKFORCE - DAISY 3.2.0
