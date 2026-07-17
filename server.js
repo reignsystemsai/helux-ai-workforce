@@ -5,21 +5,581 @@ const { Pool } = require("pg");
 const twilio = require("twilio");
 const WebSocket = require("ws");
 const { WebSocketServer } = WebSocket;
-const {
-  REALTIME_TOOLS: BASE_REALTIME_TOOLS
-} = require("./src/intents/intent-types");
-const { routeIntent } = require("./src/intents/intent-router");
-const { guardAssistantOutput } = require("./src/compliance/compliance-guardrails");
-const { isInterestRateQuestion, interestRateResponse } = require("./src/compliance/interest-rate-policy");
-const { isListeningAcknowledgement } = require("./src/realtime/interruption-manager");
-const { semanticTurnDelay } = require("./src/realtime/turn-manager");
-const { DEFAULTS: REALTIME_DEFAULTS } = require("./src/realtime/latency-manager");
-const { buildRealtimeSession } = require("./src/realtime/openai-session");
-const {
-  SchedulingError,
-  createConfirmedAppointment,
-  localDateTimeToUtc
-} = require("./src/scheduling/confirmed-appointment");
+
+/* Inlined production dependencies — formerly ./src modules */
+
+const INLINE_INTENTS = Object.freeze({
+  SAVE_CALL_PROGRESS: "save_call_progress",
+  CALCULATE_PRELIMINARY_DTI: "calculate_preliminary_dti",
+  SEND_RESOURCE_LINK: "send_resource_link",
+  CREATE_SPECIALIST_HANDOFF: "create_specialist_handoff",
+  TRANSFER_TO_SPECIALIST: "transfer_to_specialist",
+  MARK_CONTACT_RESTRICTION: "mark_contact_restriction",
+  CREATE_CONFIRMED_APPOINTMENT: "create_confirmed_appointment",
+  COMPLETE_CALL: "complete_call"
+});
+
+const INLINE_TOOL_TO_INTENT = Object.freeze(Object.fromEntries(
+  Object.entries(INLINE_INTENTS).map(([intent, toolName]) => [toolName, intent])
+));
+
+function inlineTool(name, description, properties, required) {
+  return { type: "function", name, description, parameters: { type: "object", properties, required, additionalProperties: false } };
+}
+
+const BASE_REALTIME_TOOLS = Object.freeze([
+  inlineTool("save_call_progress", "Save confirmed progress and an allowed conversation transition.", {
+    current_state: { type: "string" }, next_state: { type: "string" }, answers: { type: "object" },
+    sentiment: { type: "string", enum: ["positive", "neutral", "skeptical", "confused", "frustrated", "urgent", "excited", "hesitant", "fearful", "disappointed"] },
+    notes: { type: "string" }, current_objective: { type: "string" }, last_confirmed_fact: { type: "string" }, pending_question: { type: ["string", "null"] }, next_best_action: { type: "string" }
+  }, ["current_state", "next_state", "answers"]),
+  inlineTool("calculate_preliminary_dti", "Calculate a preliminary DTI planning estimate.", {
+    gross_monthly_household_income: { type: "number", minimum: 1 }, monthly_recurring_debt: { type: "number", minimum: 0 }
+  }, ["gross_monthly_household_income", "monthly_recurring_debt"]),
+  inlineTool("send_resource_link", "Send one approved resource after customer consent.", {
+    resource_type: { type: "string", enum: ["application", "dti_calculator", "prephub", "credit_readiness", "tax_readiness", "employment_readiness"] },
+    consent_confirmed: { type: "boolean" }
+  }, ["resource_type", "consent_confirmed"]),
+  inlineTool("create_specialist_handoff", "Create a structured specialist handoff.", {
+    reason: { type: "string" }, priority: { type: "string", enum: ["normal", "high", "urgent"] }, summary: { type: "string" }
+  }, ["reason", "priority", "summary"]),
+  inlineTool("transfer_to_specialist", "Attempt a live transfer only after explicit agreement.", {
+    reason: { type: "string" }, priority: { type: "string", enum: ["normal", "high", "urgent"] }, prospect_confirmed: { type: "boolean" }
+  }, ["reason", "priority", "prospect_confirmed"]),
+  inlineTool("mark_contact_restriction", "Apply a wrong-number, invalid-number, opt-out, or not-interested restriction.", {
+    restriction_type: { type: "string", enum: ["wrong_number", "invalid_number", "do_not_call", "not_interested"] }, reason: { type: "string" }, stop_voice: { type: "boolean" }, stop_sms: { type: "boolean" }, stop_email: { type: "boolean" }
+  }, ["restriction_type", "reason", "stop_voice", "stop_sms", "stop_email"]),
+  inlineTool("create_confirmed_appointment", "Create a future phone appointment only after the customer confirms the complete local date, time, and timezone.", {
+    customer_local_date: { type: "string", description: "Exact local date in YYYY-MM-DD format." },
+    customer_local_time: { type: "string", description: "Exact local time including hour and minute." },
+    callback_at: { type: "string", description: "Confirmed appointment as an ISO 8601 UTC timestamp." },
+    timezone: { type: "string", enum: ["America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles"] },
+    timezone_label: { type: "string", enum: ["Eastern", "Central", "Mountain", "Pacific"] },
+    callback_type: { type: "string", enum: ["call_one_rescheduled", "call_two_application_follow_up"] },
+    callback_reason: { type: "string" },
+    prospect_confirmed: { type: "boolean" },
+    source_call_id: { type: "string" },
+    discussion_summary: { type: "string" }
+  }, ["customer_local_date", "customer_local_time", "callback_at", "timezone", "timezone_label", "callback_type", "callback_reason", "prospect_confirmed", "source_call_id", "discussion_summary"]),
+  inlineTool("complete_call", "Record the connected-call result and sequence instruction.", {
+    outcome: { type: "string", enum: ["qualified", "hot_transfer", "specialist_handoff", "application_link_sent", "dti_calculator_sent", "needs_review", "nurture", "voicemail", "no_answer", "busy", "not_interested", "wrong_number", "opt_out", "disconnected", "technical_failure", "agent_notified"] },
+    next_action: { type: "string" }, summary: { type: "string" }, stop_sequence: { type: "boolean" }, pause_sequence: { type: "boolean" }
+  }, ["outcome", "next_action", "summary", "stop_sequence", "pause_sequence"])
+]);
+
+const INLINE_STATES = Object.freeze([
+  "identity_verification", "introduction", "trust_confirmation", "time_check",
+  "roadmap", "need", "dpa_education", "knowledge_discovery",
+  "timeline_discovery", "realtor_discovery", "lender_discovery", "urgency",
+  "dti_offer", "dti_in_progress", "application_next_step",
+  "nurture", "specialist_handoff", "closing", "completed"
+]);
+
+const INLINE_NEXT = Object.freeze({
+  identity_verification: ["introduction", "closing"],
+  introduction: ["trust_confirmation", "closing"],
+  trust_confirmation: ["time_check", "closing"],
+  time_check: ["roadmap", "closing"],
+  roadmap: ["need", "closing"],
+  need: ["dpa_education", "closing"],
+  dpa_education: ["knowledge_discovery", "timeline_discovery", "closing"],
+  knowledge_discovery: ["dpa_education", "timeline_discovery", "closing"],
+  timeline_discovery: ["realtor_discovery", "nurture", "closing"],
+  realtor_discovery: ["lender_discovery", "closing"],
+  lender_discovery: ["urgency", "closing"],
+  urgency: ["dti_offer", "application_next_step", "nurture", "closing"],
+  dti_offer: ["dti_in_progress", "application_next_step", "closing"],
+  dti_in_progress: ["application_next_step", "closing"],
+  application_next_step: ["specialist_handoff", "closing"],
+  nurture: ["closing", "completed"],
+  specialist_handoff: ["closing", "completed"],
+  closing: ["completed"]
+});
+
+const INLINE_LEGACY_ALIASES = Object.freeze({
+  greeting: "identity_verification",
+  readiness_confirmation: "trust_confirmation",
+  qualification: "timeline_discovery",
+  application_link_sent: "application_next_step",
+  reconnect_pending: "identity_verification",
+  reconnect_in_progress: "identity_verification"
+});
+
+function inlineNormalizeState(value) {
+  const state = String(value || "").trim().toLowerCase();
+  return INLINE_LEGACY_ALIASES[state] || (INLINE_STATES.includes(state) ? state : null);
+}
+
+function inlineCanTransition(from, to, options = {}) {
+  const current = inlineNormalizeState(from);
+  const next = inlineNormalizeState(to);
+  if (!current || !next) return options.allowLegacy !== false;
+  if (current === next || next === "closing") return true;
+  return (INLINE_NEXT[current] || []).includes(next);
+}
+
+function inlineIntentFailureValidation(code, retryable = false) {
+  return { valid: false, error: { code, retryable } };
+}
+
+function inlineValidateIntent(toolName, args = {}, context = {}) {
+  if (!INLINE_TOOL_TO_INTENT[toolName]) return inlineIntentFailureValidation("UNKNOWN_INTENT");
+  if (!args || typeof args !== "object" || Array.isArray(args)) return inlineIntentFailureValidation("INVALID_ARGUMENTS");
+  if (toolName === "send_resource_link" && args.consent_confirmed !== true) return inlineIntentFailureValidation("SMS_CONSENT_REQUIRED");
+  if (toolName === "transfer_to_specialist" && args.prospect_confirmed !== true) return inlineIntentFailureValidation("TRANSFER_CONFIRMATION_REQUIRED");
+  if (toolName === "create_confirmed_appointment" && args.prospect_confirmed !== true) return inlineIntentFailureValidation("APPOINTMENT_CONFIRMATION_REQUIRED");
+  if (toolName === "save_call_progress" && !inlineCanTransition(context.current_state || args.current_state, args.next_state, { allowLegacy: true })) return inlineIntentFailureValidation("INVALID_STATE_TRANSITION");
+  return { valid: true, intent: INLINE_TOOL_TO_INTENT[toolName], error: null };
+}
+
+function inlineIntentSuccess(intent, customerSafeMessage, data = {}) {
+  return { success: true, intent, customer_safe_message: customerSafeMessage, data, error: null };
+}
+
+function inlineIntentFailure(intent, code, retryable = false) {
+  return { success: false, intent, customer_safe_message: null, data: {}, error: { code, retryable } };
+}
+
+const INLINE_ACTION_MESSAGES = Object.freeze({
+  SAVE_CALL_PROGRESS: null,
+  CALCULATE_PRELIMINARY_DTI: "Your preliminary DTI estimate is ready.",
+  SEND_RESOURCE_LINK: "The requested resource was sent to your phone.",
+  CREATE_SPECIALIST_HANDOFF: "Your specialist follow-up has been created.",
+  TRANSFER_TO_SPECIALIST: "Your transfer is ready.",
+  MARK_CONTACT_RESTRICTION: "Your contact preference has been recorded.",
+  CREATE_CONFIRMED_APPOINTMENT: null,
+  COMPLETE_CALL: null
+});
+
+const INLINE_INTENT_HANDLERS = Object.freeze({
+  send_resource_link: (execute, call, args) => execute(call, "send_resource_link", args),
+  save_call_progress: (execute, call, args) => execute(call, "save_call_progress", args),
+  calculate_preliminary_dti: (execute, call, args) => execute(call, "calculate_preliminary_dti", args),
+  create_specialist_handoff: (execute, call, args) => execute(call, "create_specialist_handoff", args),
+  transfer_to_specialist: (execute, call, args) => execute(call, "transfer_to_specialist", args),
+  mark_contact_restriction: (execute, call, args) => execute(call, "mark_contact_restriction", args),
+  complete_call: (execute, call, args) => execute(call, "complete_call", args),
+  create_confirmed_appointment: (execute, call, args) => execute(call, "create_confirmed_appointment", args)
+});
+
+function inlineIntentPublicData(result = {}) {
+  const allowed = ["resource_type", "preliminary_dti_percent", "preliminary_dti_classification", "timezone", "timezone_label", "outcome", "sequence_status", "saved_fields", "current_state", "next_state", "confirmation_sms_sent", "callback_at", "customer_local_date", "customer_local_time", "callback_type", "callback_reason", "appointment_id", "next_action"];
+  return Object.fromEntries(allowed.filter((key) => result[key] !== undefined).map((key) => [key, result[key]]));
+}
+
+async function routeIntent({ toolName, args, call, execute }) {
+  const intent = INLINE_TOOL_TO_INTENT[toolName] || "UNKNOWN_INTENT";
+  const validation = inlineValidateIntent(toolName, args, call || {});
+  if (!validation.valid) return inlineIntentFailure(intent, validation.error.code, validation.error.retryable);
+  try {
+    const raw = await INLINE_INTENT_HANDLERS[toolName](execute, call, args);
+    if (!raw || raw.success !== true) return inlineIntentFailure(intent, `${intent}_FAILED`, raw?.retryable === true);
+    return inlineIntentSuccess(intent, INLINE_ACTION_MESSAGES[intent], inlineIntentPublicData(raw));
+  } catch {
+    return inlineIntentFailure(intent, `${intent}_FAILED`, true);
+  }
+}
+
+const INLINE_RATE_RESPONSE = "That's a great question. Mortgage interest rates can change and depend on factors specific to the borrower and loan. Your licensed lender will review the current available rates and financing options with you.";
+const INLINE_RATE_REDIRECT = "What I can help you with today is preparing your DPA application and estimating your homebuying power.";
+
+function isInterestRateQuestion(value) {
+  const text = String(value || "").toLowerCase();
+  return /\b(?:interest|mortgage)\s+rates?\b|\brate\s+(?:today|now|lock|quote)\b/.test(text);
+}
+
+function inlineAssistantRateViolation(value) {
+  const text = String(value || "").toLowerCase();
+  return /\b(?:interest\s+)?rates?\b.{0,35}\b\d+(?:\.\d+)?\s*%|\b\d+(?:\.\d+)?\s*%.{0,35}\b(?:interest\s+)?rates?\b/.test(text) ||
+    /\b(?:rates?|interest rates?)\s+(?:are|is|seem|look)\s+(?:high|low|good|bad)/.test(text) ||
+    /\b(?:lock|wait for|expect|predict)\b.{0,30}\brates?\b/.test(text) ||
+    /\brates?\b.{0,30}\b(?:rise|fall|drop|increase|decrease)\b/.test(text);
+}
+
+function interestRateResponse() {
+  return `${INLINE_RATE_RESPONSE} ${INLINE_RATE_REDIRECT}`;
+}
+
+const INLINE_PROHIBITED_REQUESTS = Object.freeze([
+  /social security|\bssn\b/i, /full date of birth|\bdob\b/i, /bank(?:ing)? (?:login|password)/i,
+  /card number/i, /password/i, /one[- ]time (?:passcode|code)|\botp\b/i
+]);
+
+function inlineRequestsProhibitedInformation(value) {
+  return INLINE_PROHIBITED_REQUESTS.some((pattern) => pattern.test(String(value || "")));
+}
+
+function guardAssistantOutput(value) {
+  if (inlineAssistantRateViolation(value)) return { allowed: false, code: "INTEREST_RATE_POLICY", replacement: interestRateResponse() };
+  if (inlineRequestsProhibitedInformation(value)) return { allowed: false, code: "SENSITIVE_INFORMATION_REQUEST", replacement: "I don't need that sensitive information. Let's continue with the non-sensitive information needed for your DPA next step." };
+  return { allowed: true, code: null, replacement: null };
+}
+
+const INLINE_LISTENING = new Set(["mm hmm", "mmm hmm", "mhm", "uh huh", "right", "okay", "ok", "yeah", "i see", "got it"]);
+
+function inlineNormalizeListening(value) {
+  return String(value || "").toLowerCase().replace(/-/g, " ").replace(/[^a-z\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function isListeningAcknowledgement(value) {
+  return INLINE_LISTENING.has(inlineNormalizeListening(value));
+}
+
+function semanticTurnDelay(value) {
+  const text = String(value || "").toLowerCase();
+  if (/\b(?:income|debt|payment|date|time|let me think|not sure|frustrat|confus|afraid)\b/.test(text)) return 750;
+  return 350;
+}
+
+const REALTIME_DEFAULTS = Object.freeze({ transcriptDebounceMs: 350, meaningfulInterruptionMs: 700, silenceReminderMs: 8000 });
+
+function buildRealtimeSession({ model, voice, transcriptionModel, instructions, tools }) {
+  const input = {
+    format: { type: "audio/pcmu" }, noise_reduction: { type: "near_field" },
+    turn_detection: { type: "server_vad", threshold: 0.62, prefix_padding_ms: 300, silence_duration_ms: 500, create_response: false, interrupt_response: false, idle_timeout_ms: 12000 }
+  };
+  if (transcriptionModel) input.transcription = { model: transcriptionModel, language: "en" };
+  return { type: "realtime", model, output_modalities: ["audio"], instructions, tools, tool_choice: "auto", audio: { input, output: { format: { type: "audio/pcmu" }, voice } } };
+}
+
+const INLINE_TIMEZONES = Object.freeze({
+  Eastern: "America/New_York",
+  Central: "America/Chicago",
+  Mountain: "America/Denver",
+  Pacific: "America/Los_Angeles"
+});
+
+const INLINE_CALLBACKS = Object.freeze({
+  call_one_rescheduled: {
+    reason: "Customer requested another time to complete Call One",
+    nextAction: "Resume Call One at the scheduled time"
+  },
+  call_two_application_follow_up: {
+    reason: "Application status, program options, and preliminary DTI follow-up",
+    nextAction: "Complete the application before Call Two"
+  }
+});
+
+class SchedulingError extends Error {
+  constructor(code, message, statusCode = 422) {
+    super(message);
+    this.name = "SchedulingError";
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
+function inlineSchedulingClean(value, maximum = 4000) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text ? text.slice(0, maximum) : null;
+}
+
+function inlineNormalizeAppointmentTimezone(timezone, timezoneLabel) {
+  const zone = inlineSchedulingClean(timezone, 100);
+  const label = inlineSchedulingClean(timezoneLabel, 30);
+  const zoneLabelMatch = Object.keys(INLINE_TIMEZONES).find(
+    (candidate) => candidate.toLowerCase() === String(zone || "").toLowerCase()
+  );
+  const labelMatch = Object.keys(INLINE_TIMEZONES).find(
+    (candidate) => candidate.toLowerCase() === String(label || "").toLowerCase()
+  );
+  const zoneMatch = Object.entries(INLINE_TIMEZONES).find(
+    ([, candidate]) => candidate === zone
+  );
+  const resolvedLabel = zoneLabelMatch || zoneMatch?.[0] || labelMatch || null;
+  const resolvedZone = zoneLabelMatch
+    ? INLINE_TIMEZONES[zoneLabelMatch]
+    : zoneMatch?.[1] || (labelMatch ? INLINE_TIMEZONES[labelMatch] : null);
+
+  if (!resolvedLabel || !resolvedZone) {
+    throw new SchedulingError(
+      "INVALID_TIMEZONE",
+      "Timezone must be Eastern, Central, Mountain, or Pacific."
+    );
+  }
+  if (zone && !zoneLabelMatch && !zoneMatch) {
+    throw new SchedulingError("INVALID_TIMEZONE", "Unsupported timezone.");
+  }
+  if (label && !labelMatch) {
+    throw new SchedulingError("INVALID_TIMEZONE_LABEL", "Unsupported timezone label.");
+  }
+  if (zone && label && INLINE_TIMEZONES[labelMatch] !== resolvedZone) {
+    throw new SchedulingError("TIMEZONE_MISMATCH", "Timezone and timezone label do not match.");
+  }
+  return { timezone: resolvedZone, timezoneLabel: resolvedLabel };
+}
+
+function inlineParseLocalDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(inlineSchedulingClean(value, 10) || "");
+  if (!match) throw new SchedulingError("INVALID_DATE", "Date must use YYYY-MM-DD.");
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) throw new SchedulingError("INVALID_DATE", "Date is not a valid calendar date.");
+  return { year, month, day, value: match[0] };
+}
+
+function inlineParseLocalTime(value) {
+  const text = inlineSchedulingClean(value, 20) || "";
+  let match = /^(\d{1,2}):(\d{2})\s*([AaPp][Mm])$/.exec(text);
+  let hour;
+  let minute;
+  if (match) {
+    hour = Number(match[1]);
+    minute = Number(match[2]);
+    if (hour < 1 || hour > 12 || minute > 59) {
+      throw new SchedulingError("INVALID_TIME", "Time is invalid.");
+    }
+    if (match[3].toLowerCase() === "pm" && hour !== 12) hour += 12;
+    if (match[3].toLowerCase() === "am" && hour === 12) hour = 0;
+  } else {
+    match = /^(\d{2}):(\d{2})$/.exec(text);
+    if (!match) {
+      throw new SchedulingError("INVALID_TIME", "Time must include an exact hour and minute.");
+    }
+    hour = Number(match[1]);
+    minute = Number(match[2]);
+    if (hour > 23 || minute > 59) throw new SchedulingError("INVALID_TIME", "Time is invalid.");
+  }
+  return { hour, minute, value: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}` };
+}
+
+function inlineLocalPartsAt(date, timezone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  return Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, Number(part.value)]));
+}
+
+function localDateTimeToUtc(localDate, localTime, timezone) {
+  const date = inlineParseLocalDate(localDate);
+  const time = inlineParseLocalTime(localTime);
+  const target = Date.UTC(date.year, date.month - 1, date.day, time.hour, time.minute);
+  const matches = [];
+  for (let deltaMinutes = -14 * 60; deltaMinutes <= 14 * 60; deltaMinutes += 1) {
+    const candidate = new Date(target + deltaMinutes * 60000);
+    const parts = inlineLocalPartsAt(candidate, timezone);
+    if (
+      parts.year === date.year && parts.month === date.month && parts.day === date.day &&
+      parts.hour === time.hour && parts.minute === time.minute
+    ) matches.push(candidate);
+  }
+  if (matches.length === 0) {
+    throw new SchedulingError("NONEXISTENT_LOCAL_TIME", "That local time does not exist because of a daylight-saving transition.");
+  }
+  if (matches.length > 1) {
+    throw new SchedulingError("AMBIGUOUS_LOCAL_TIME", "That local time occurs twice because of a daylight-saving transition; choose another exact time.");
+  }
+  return { callbackAt: matches[0], localDate: date.value, localTime: time.value };
+}
+
+function inlineConfirmedTimezoneFromCall(call) {
+  const result = call?.result || {};
+  const payload = call?.payload || {};
+  const candidates = [
+    result.customer_timezone_confirmed === true
+      ? [result.customer_timezone, result.customer_timezone_label, result.customer_timezone_confirmed_at]
+      : null,
+    payload.customer_timezone_confirmed === true
+      ? [payload.customer_timezone || payload.timezone, payload.customer_timezone_label || payload.timezone_label, payload.customer_timezone_confirmed_at]
+      : null
+  ].filter(Boolean);
+  for (const [timezone, label, confirmedAt] of candidates) {
+    try {
+      return {
+        ...inlineNormalizeAppointmentTimezone(timezone, label),
+        confirmedAt: inlineSchedulingClean(confirmedAt, 100)
+      };
+    } catch { /* Invalid saved values are ignored. */ }
+  }
+  return null;
+}
+
+function inlineCustomerKey(call) {
+  if (inlineSchedulingClean(call.lead_id, 150)) return `lead:${inlineSchedulingClean(call.lead_id, 150)}`;
+  if (inlineSchedulingClean(call.case_id, 150)) return `case:${inlineSchedulingClean(call.case_id, 150)}`;
+  return `request:${inlineSchedulingClean(call.request_key, 320) || call.call_id}`;
+}
+
+async function inlineFindSavedTimezone(client, call) {
+  const active = inlineConfirmedTimezoneFromCall(call);
+  if (active) return active;
+  const prior = await client.query(
+    `SELECT result, payload FROM ai_calls
+     WHERE call_id <> $1
+       AND (($2::text IS NOT NULL AND case_id = $2) OR ($3::text IS NOT NULL AND lead_id = $3))
+       AND (result->>'customer_timezone_confirmed' = 'true'
+         OR payload->>'customer_timezone_confirmed' = 'true')
+     ORDER BY updated_at DESC LIMIT 20`,
+    [call.call_id, call.case_id || null, call.lead_id || null]
+  );
+  for (const row of prior.rows) {
+    const saved = inlineConfirmedTimezoneFromCall(row);
+    if (saved) return saved;
+  }
+  return null;
+}
+
+function inlineValidateCallback(callbackType, callbackReason) {
+  const definition = INLINE_CALLBACKS[inlineSchedulingClean(callbackType, 80)];
+  if (!definition) throw new SchedulingError("UNSUPPORTED_CALLBACK_TYPE", "Unsupported callback type.");
+  if (inlineSchedulingClean(callbackReason, 500) !== definition.reason) {
+    throw new SchedulingError("UNSUPPORTED_CALLBACK_REASON", "Callback reason does not match the callback type.");
+  }
+  return definition;
+}
+
+function inlineSchedulingPublicId(prefix) {
+  return `${prefix}-${Date.now().toString(36).toUpperCase()}-${randomUUID().split("-")[0].toUpperCase()}`;
+}
+
+async function createConfirmedAppointment({ pool, input, now = new Date() }) {
+  if (input?.prospect_confirmed !== true) {
+    throw new SchedulingError("CONFIRMATION_REQUIRED", "Explicit customer confirmation is required.");
+  }
+  const localDate = inlineSchedulingClean(input.customer_local_date, 10);
+  const localTime = inlineSchedulingClean(input.customer_local_time, 20);
+  if (!localDate) throw new SchedulingError("DATE_REQUIRED", "Customer local date is required.");
+  if (!localTime) throw new SchedulingError("TIME_REQUIRED", "Customer local time is required.");
+  const callbackType = inlineSchedulingClean(input.callback_type, 80);
+  const callbackReason = inlineSchedulingClean(input.callback_reason, 500);
+  const callback = inlineValidateCallback(callbackType, callbackReason);
+  const sourceCallId = inlineSchedulingClean(input.source_call_id, 100);
+  if (!sourceCallId) throw new SchedulingError("SOURCE_CALL_REQUIRED", "Source call ID is required.");
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const callResult = await client.query("SELECT * FROM ai_calls WHERE call_id = $1 FOR UPDATE", [sourceCallId]);
+    const call = callResult.rows[0];
+    if (!call) throw new SchedulingError("CALL_NOT_FOUND", "Current call was not found.", 404);
+
+    const savedTimezone = await inlineFindSavedTimezone(client, call);
+    let timezoneSelection;
+    if (inlineSchedulingClean(input.timezone, 100) || inlineSchedulingClean(input.timezone_label, 30)) {
+      timezoneSelection = inlineNormalizeAppointmentTimezone(input.timezone, input.timezone_label);
+      if (
+        savedTimezone?.timezone === timezoneSelection.timezone &&
+        savedTimezone?.timezoneLabel === timezoneSelection.timezoneLabel
+      ) timezoneSelection.confirmedAt = savedTimezone.confirmedAt;
+    } else {
+      timezoneSelection = savedTimezone;
+      if (!timezoneSelection) {
+        throw new SchedulingError("TIMEZONE_REQUIRED", "A confirmed customer timezone is required.");
+      }
+    }
+
+    const converted = localDateTimeToUtc(localDate, localTime, timezoneSelection.timezone);
+    if (converted.callbackAt.getTime() <= now.getTime()) {
+      throw new SchedulingError("APPOINTMENT_NOT_FUTURE", "Appointment must be in the future.");
+    }
+
+    const appointmentId = inlineSchedulingPublicId("APPT");
+    const createdAt = now.toISOString();
+    const nextAction = callback.nextAction;
+    const key = inlineCustomerKey(call);
+    const appointmentInsert = await client.query(
+      `INSERT INTO scheduled_appointments (
+         appointment_id, customer_key, source_call_id, case_id, lead_id,
+         callback_at, customer_local_date, customer_local_time, timezone,
+         timezone_label, callback_type, callback_reason, discussion_summary,
+         prospect_confirmed, next_action, created_at, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE,$14,$15,$15)
+       ON CONFLICT (customer_key, callback_type, callback_at) DO NOTHING RETURNING *`,
+      [
+        appointmentId, key, call.call_id, call.case_id, call.lead_id,
+        converted.callbackAt, converted.localDate, converted.localTime,
+        timezoneSelection.timezone, timezoneSelection.timezoneLabel,
+        callbackType, callbackReason, inlineSchedulingClean(input.discussion_summary, 4000),
+        nextAction, now
+      ]
+    );
+    if (!appointmentInsert.rows[0]) {
+      throw new SchedulingError("DUPLICATE_APPOINTMENT", "This appointment already exists.", 409);
+    }
+
+    const attemptNumberResult = await client.query(
+      "SELECT COALESCE(MAX(attempt_number), 0) + 1 AS next_number FROM call_attempts WHERE call_id = $1",
+      [call.call_id]
+    );
+    const attemptId = inlineSchedulingPublicId("ATTEMPT");
+    await client.query(
+      `INSERT INTO call_attempts (
+         attempt_id, call_id, attempt_number, call_leg, technical_status,
+         attempt_type, idempotency_key, scheduled_for, appointment_id,
+         callback_type, callback_reason, callback_timezone,
+         callback_timezone_label, source_call_id
+       ) VALUES ($1,$2,$3,1,'pending',$4,$5,$6,$7,$4,$8,$9,$10,$2)`,
+      [
+        attemptId, call.call_id, Number(attemptNumberResult.rows[0].next_number),
+        callbackType, `appointment:${appointmentId}`, converted.callbackAt,
+        appointmentId, callbackReason, timezoneSelection.timezone,
+        timezoneSelection.timezoneLabel
+      ]
+    );
+
+    const crm = {
+      customer_timezone: timezoneSelection.timezone,
+      customer_timezone_label: timezoneSelection.timezoneLabel,
+      customer_timezone_confirmed: true,
+      customer_timezone_confirmed_at: timezoneSelection.confirmedAt || createdAt,
+      callback_at: converted.callbackAt.toISOString(),
+      callback_local_date: converted.localDate,
+      callback_local_time: converted.localTime,
+      callback_timezone: timezoneSelection.timezone,
+      callback_timezone_label: timezoneSelection.timezoneLabel,
+      callback_reason: callbackReason,
+      callback_type: callbackType,
+      callback_confirmed: true,
+      callback_created_at: createdAt,
+      callback_source_call_id: call.call_id,
+      appointment_id: appointmentId,
+      next_action: nextAction,
+      discussion_summary: inlineSchedulingClean(input.discussion_summary, 4000)
+    };
+    await client.query(
+      `UPDATE ai_calls SET timezone = $2, next_action = $3,
+         summary = COALESCE($4, summary), result = result || $5::jsonb,
+         actions = actions || $6::jsonb, updated_at = NOW()
+       WHERE call_id = $1`,
+      [
+        call.call_id, timezoneSelection.timezone, nextAction,
+        crm.discussion_summary, JSON.stringify(crm),
+        JSON.stringify([{ action: "create_confirmed_appointment", success: true, appointment_id: appointmentId, callback_at: crm.callback_at, callback_type: callbackType, created_at: createdAt }])
+      ]
+    );
+    await client.query("COMMIT");
+    return {
+      success: true,
+      callback_at: crm.callback_at,
+      customer_local_date: converted.localDate,
+      customer_local_time: converted.localTime,
+      timezone: timezoneSelection.timezone,
+      timezone_label: timezoneSelection.timezoneLabel,
+      callback_type: callbackType,
+      callback_reason: callbackReason,
+      appointment_id: appointmentId,
+      next_action: nextAction
+    };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 /*
  * HELUX AI WORKFORCE - DAISY 3.2.0
