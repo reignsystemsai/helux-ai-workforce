@@ -1,1 +1,0 @@
-module.exports = Object.freeze({ name: "first_call", entryState: "identity_verification", journey: ["identity_verification", "introduction", "trust_confirmation", "time_check", "roadmap", "need", "dpa_education", "knowledge_discovery", "timeline_discovery", "realtor_discovery", "lender_discovery", "urgency", "dti_offer", "application_next_step", "closing", "completed"] });
