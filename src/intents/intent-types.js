@@ -38,6 +38,7 @@ const REALTIME_TOOLS = Object.freeze([
   tool("create_confirmed_appointment", "Create a future phone appointment only after the customer confirms the complete local date, time, and timezone.", {
     customer_local_date: { type: "string", description: "Exact local date in YYYY-MM-DD format." },
     customer_local_time: { type: "string", description: "Exact local time including hour and minute." },
+    callback_at: { type: "string", description: "Confirmed appointment as an ISO 8601 UTC timestamp." },
     timezone: { type: "string", enum: ["America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles"] },
     timezone_label: { type: "string", enum: ["Eastern", "Central", "Mountain", "Pacific"] },
     callback_type: { type: "string", enum: ["call_one_rescheduled", "call_two_application_follow_up"] },
@@ -45,7 +46,7 @@ const REALTIME_TOOLS = Object.freeze([
     prospect_confirmed: { type: "boolean" },
     source_call_id: { type: "string" },
     discussion_summary: { type: "string" }
-  }, ["customer_local_date", "customer_local_time", "timezone", "timezone_label", "callback_type", "callback_reason", "prospect_confirmed", "source_call_id", "discussion_summary"]),
+  }, ["customer_local_date", "customer_local_time", "callback_at", "timezone", "timezone_label", "callback_type", "callback_reason", "prospect_confirmed", "source_call_id", "discussion_summary"]),
   tool("complete_call", "Record the connected-call result and sequence instruction.", {
     outcome: { type: "string", enum: ["qualified", "hot_transfer", "specialist_handoff", "application_link_sent", "dti_calculator_sent", "needs_review", "nurture", "voicemail", "no_answer", "busy", "not_interested", "wrong_number", "opt_out", "disconnected", "technical_failure", "agent_notified"] },
     next_action: { type: "string" }, summary: { type: "string" }, stop_sequence: { type: "boolean" }, pause_sequence: { type: "boolean" }

@@ -17,7 +17,8 @@ const { DEFAULTS: REALTIME_DEFAULTS } = require("./src/realtime/latency-manager"
 const { buildRealtimeSession } = require("./src/realtime/openai-session");
 const {
   SchedulingError,
-  createConfirmedAppointment
+  createConfirmedAppointment,
+  localDateTimeToUtc
 } = require("./src/scheduling/confirmed-appointment");
 
 /*
@@ -569,6 +570,7 @@ These are internal operating instructions. Never read headings, rules, braces, o
 - Use submitted information. Confirm it instead of repeating the intake form.
 - Never manufacture, infer, or complete an answer for the customer.
 - Never narrate internal thinking, planning, tool execution, retries, calculations, or next-step selection. Never say "Okay, let's line up your next step," "Let's line up your next step," "Let me line that up," "Okay, let me line up the next step," "let me think," "let me figure that out," "one moment," or similar filler.
+- Never describe saving information, checking information, scheduling preparation, CRM updates, or what question comes next. Never say "I'll keep things moving," "Let me make note of that," "Next, I'll ask about timing," "Let's pin down a time," "Let me check," or "Okay, moving forward."
 - After a customer answers, transition directly to the next scripted sentence.
 - Do not fill tool-execution time with narration.
 - If a tool fails, do not narrate a retry.
@@ -610,7 +612,7 @@ Saved lender status: {has_lender}
 Saved Realtor status: {has_realtor}
 Confirmed customer timezone: {customer_timezone_label}
 Current source call ID: {source_call_id}
-Current UTC datetime: {current_utc_datetime}
+Current call timestamp: {current_call_timestamp}
 Previous call summary: {previous_call_summary}
 
 Never speak "not provided" as though it were customer data. When a value is unavailable, use a natural generic version of the sentence.
@@ -683,7 +685,7 @@ After the customer confirms, Daisy says:
 
 WAIT.
 
-Respond naturally in one brief sentence based on the customer's mood and keep the call moving.
+Listen to the completed response, then reply with at most one very brief natural sentence appropriate to the customer's mood: positive, "I'm glad to hear that"; neutral, "Good to hear"; negative, "I'm sorry to hear that"; busy or distracted, "I understand." Do not ask how they feel, start a side conversation, overreact, or repeat their words. Immediately continue to the next scripted sentence.
 
 CONFIRM THE REQUEST
 
@@ -705,7 +707,7 @@ When the customer corrects the amount or first-time-homebuyer status:
 CONFIRM SUBMITTED INFORMATION
 
 When all submitted values are available, Daisy says:
-"Excellent. Based on your submitted credit score of (credit_score_submitted}, income of {income_submitted}, your work history of {work_history_submitted}, and your tax-return information of {tax_return_submitted}, reviewing down payment assistance options should be in your favor. Is all of that information correct?"
+"Excellent. Based on your submitted credit score of {credit_score_submitted}, your submitted income of {income_submitted}, your work history of {work_history_submitted}, and your tax return information of {tax_return_submitted}, reviewing down payment assistance options should be in your favor. Is all of that information still correct?"
 
 When one or more values are unavailable:
 - Confirm only the values that are available.
@@ -805,6 +807,8 @@ WAIT.
 
 Save the customer's exact meaningful answer as purchase_area without changing its spelling or location. Never infer it from lead city, ZIP code, intake data, Monday.com, another lead, or a nearby city. If the answer is unclear, ask exactly: "What city or area would you like to purchase in?" Do not guess.
 
+After saving purchase_area, use that exact saved answer in the personalized closing during this same call. When it is available, never replace it with "your area," "the area you mentioned," or "your desired location."
+
 SCHEDULE CALL TWO
 
 After saving the exact purchase area, Daisy says:
@@ -823,7 +827,7 @@ WAIT.
 If yes, ask:
 "Excellent. Would it be okay if I scheduled our second call for approximately 24 hours from now?"
 
-WAIT. Using Current UTC datetime and the confirmed customer timezone, propose the exact calendar date approximately 24 hours later. Ask for the exact callback time when it has not been provided. Approximately 24 hours is only a proposal and is never complete scheduling information. Ask only for missing details.
+WAIT. If the customer agrees, do not ask what time works, do not ask them to repeat the current time, and do not collect another callback time. Add exactly 24 hours to Current call timestamp. Convert that resulting UTC instant to the customer's confirmed saved timezone and use its exact local date and time. When a valid confirmed timezone is saved, proceed directly to the complete appointment confirmation without asking for the timezone again.
 
 If the customer cannot start today, ask:
 "That's understandable. When do you think you'll have time to get started?"
@@ -840,7 +844,7 @@ Repeat the exact complete appointment:
 
 WAIT. Only a clear yes confirms it. A timezone correction requires recalculation, a complete corrected repetition, and confirmation again.
 
-After clear confirmation call create_confirmed_appointment with callback_type "call_two_application_follow_up", callback_reason "Application status, program options, and preliminary DTI follow-up", prospect_confirmed true, and Current source call ID. Never call it from an assumed, vague, incomplete, or inferred answer. Do not claim scheduling succeeded unless the tool returns success true.
+After clear confirmation call create_confirmed_appointment with callback_type "call_two_application_follow_up", callback_reason "Application status, program options, and preliminary DTI follow-up", the calculated local date, calculated local time, remembered timezone, calculated UTC callback_at, prospect_confirmed true, and Current source call ID. Never call it from an assumed, vague, incomplete, or inferred answer. Do not claim scheduling succeeded unless the tool returns success true.
 
 After success, save all captured answers and the summary, then use complete_call. The server plays this final closing:
 "Excellent. Thank you for your time, {customer_name}. I look forward to speaking with you then. If there's nothing else, please feel free to disconnect the call. Have a great day."
@@ -965,7 +969,7 @@ income_submitted:
         ? result.customer_timezone_label
         : "not confirmed",
     source_call_id: call.call_id,
-    current_utc_datetime: new Date().toISOString(),
+    current_call_timestamp: new Date().toISOString(),
     previous_call_summary:
       cleanText(
         call.summary ??
@@ -4385,6 +4389,25 @@ async function executeDougTool(call, name, args, sessionCallPhase) {
     if (cleanText(safeArgs.source_call_id, 100) !== call.call_id) {
       return { success: false, error: "The appointment must use the current source call." };
     }
+    const suppliedCallbackAt = new Date(safeArgs.callback_at);
+    if (Number.isNaN(suppliedCallbackAt.getTime())) {
+      return { success: false, error: "A valid UTC callback timestamp is required." };
+    }
+    try {
+      const calculatedCallback = localDateTimeToUtc(
+        safeArgs.customer_local_date,
+        safeArgs.customer_local_time,
+        safeArgs.timezone
+      );
+      if (calculatedCallback.callbackAt.getTime() !== suppliedCallbackAt.getTime()) {
+        return { success: false, error: "The UTC callback timestamp does not match the confirmed local appointment." };
+      }
+    } catch (error) {
+      if (error instanceof SchedulingError) {
+        return { success: false, error: error.message, error_code: error.code };
+      }
+      throw error;
+    }
     try {
       const appointment = await createConfirmedAppointment({
         pool,
@@ -5060,6 +5083,10 @@ app.post(
         "name",
         "customer_name",
         "estimated_dpa",
+        "credit_score",
+        "mid_fico",
+        "fico_score",
+        "fico",
         "household_income",
         "income",
         "employment_history",
