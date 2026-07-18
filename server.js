@@ -6827,7 +6827,7 @@ return true;
     const completeCallSucceeded =
       name === "complete_call" &&
       output?.success === true &&
-      output?.intent === "complete_call" &&
+      output?.intent === "COMPLETE_CALL" &&
       output?.error === null;
     const terminalActionSucceeded = completeCallSucceeded;
 
