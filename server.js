@@ -6338,21 +6338,6 @@ mediaServer.on("connection", (twilioSocket) => {
     assistantResponseFinished = false;
     pendingResponsePreservesQuestion = options.preservePendingQuestion === true;
     pendingResponseWaitingPromptKind = options.waitingPromptKind || null;
-  const event = {
-  type: "response.create",
-  response: options.response || {
-    output_modalities: ["audio"],
-    instructions:
-      'Continue immediately with only the next exact quoted scripted line required by the current call phase. Do not acknowledge, transition, narrate, explain, summarize, plan aloud, or add filler. Never say "one moment," "understood," "got it," "I will make a note of that," "let me line up the next step," "I will pin down that exact time," "let me lock that in," or anything similar.'
-  }
-};
-
-if (!sendToOpenAI(event)) {
-  responseCreatePending = false;
-  assistantResponseFinished = true;
-  pendingResponsePreservesQuestion = false;
-  pendingResponseWaitingPromptKind = null;
-  return false;
 }
 return true;}
   function currentQuestionState() {
