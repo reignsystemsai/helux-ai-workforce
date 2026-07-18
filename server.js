@@ -6338,8 +6338,19 @@ mediaServer.on("connection", (twilioSocket) => {
     assistantResponseFinished = false;
     pendingResponsePreservesQuestion = options.preservePendingQuestion === true;
     pendingResponseWaitingPromptKind = options.waitingPromptKind || null;
+const event = { type: "response.create" };
+if (options.response) event.response = options.response;
+
+if (!sendToOpenAI(event)) {
+  responseCreatePending = false;
+  assistantResponseFinished = true;
+  pendingResponsePreservesQuestion = false;
+  pendingResponseWaitingPromptKind = null;
+  return false;
 }
-return true;}
+
+return true;
+}
   function currentQuestionState() {
     return {
       pending_question_type: pendingQuestionType,
