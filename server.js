@@ -6338,7 +6338,6 @@ mediaServer.on("connection", (twilioSocket) => {
     assistantResponseFinished = false;
     pendingResponsePreservesQuestion = options.preservePendingQuestion === true;
     pendingResponseWaitingPromptKind = options.waitingPromptKind || null;
-    const event = { type: "response.create" };
   const event = {
   type: "response.create",
   response: options.response || {
