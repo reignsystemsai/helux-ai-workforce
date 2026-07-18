@@ -676,7 +676,7 @@ const DAISY_SPEECH_CONFIRM_MS = Math.max(
 
 const DAISY_MIN_TRANSCRIPT_SETTLE_MS = Math.max(
   450,
-  Number(process.env.DAISY_MIN_TRANSCRIPT_SETTLE_MS || 700)
+  Number(process.env.DAISY_MIN_TRANSCRIPT_SETTLE_MS || 550)
 );
 
 /* monday.com is optional and isolated from the live caller. */
