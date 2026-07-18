@@ -6354,8 +6354,7 @@ if (!sendToOpenAI(event)) {
   pendingResponseWaitingPromptKind = null;
   return false;
 }
-  }
-
+return true;}
   function currentQuestionState() {
     return {
       pending_question_type: pendingQuestionType,
