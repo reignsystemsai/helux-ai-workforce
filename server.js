@@ -1307,7 +1307,7 @@ If Confirmed customer timezone is Eastern, Central, Mountain, or Pacific, reuse 
 
 WAIT.
 
-Repeat the exact complete appointment:
+Repeat the exact complete appointment. When speaking the date, say only the weekday, month, and day. Never speak the year. Continue using the full YYYY-MM-DD date internally for the appointment tool:
 "Excellent. I'll call you on {callback_date} at {callback_time} {callback_timezone}. Is that correct?"
 
 WAIT. Only a clear yes confirms it. If the customer corrects the timezone, use the correction, recalculate, repeat the complete appointment, and require confirmation again.
@@ -1410,7 +1410,7 @@ For either path, reuse Confirmed customer timezone when valid and do not ask aga
 
 WAIT.
 
-Repeat the exact complete appointment:
+Repeat the exact complete appointment. When speaking the date, say only the weekday, month, and day. Never speak the year. Continue using the full YYYY-MM-DD date internally for the appointment tool:
 "I have us confirmed to speak on {callback_date} at {callback_time} {callback_timezone}. Is that correct?"
 
 WAIT. Only a clear yes confirms it. A timezone correction requires recalculation, a complete corrected repetition, and confirmation again.
