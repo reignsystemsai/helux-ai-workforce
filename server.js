@@ -2346,6 +2346,11 @@ function extractPrimaryQuestion(value) {
 function pendingQuestionType(value) {
   const text = normalizeMondayKey(value);
   if (/speakwith|isthis/.test(text)) return "identity_confirmation";
+  if (
+    /howsoon.*homeowner|twomonths.*fourmonths|fourmonths.*sixmonths|purchase.*timeline|buy.*timeline/.test(
+      text
+    )
+  ) return "purchase_timeline";
   if (/realtor|realestateagent/.test(text)) return "has_realtor";
   if (/lender|preapproved|preapproval/.test(text)) return "applied_with_lender";
   if (/what.*(?:city|area).*purchase|area.*purchase.*home/.test(text)) {
@@ -6524,6 +6529,47 @@ return true;
       assistantResponseActive ||
       responseCreatePending;
 
+    // Preserve structured answers even when the customer answers quickly over
+    // the final fraction of Daisy's question. The conversation model may keep
+    // moving, but these facts must still reach the CRM.
+    if (awaitingCustomerResponse && pendingQuestionType === "purchase_timeline") {
+      const timeline = timeFrameMeaning(transcript);
+      if (timeline?.category === "timeframe") {
+        const timelineLabel = ({
+          2: "Two months",
+          4: "Four months",
+          6: "Six months",
+          12: "One year"
+        })[timeline.months];
+        if (timelineLabel) {
+          await mergeCallResult(call.call_id, {
+            purchase_timeline_detail: timelineLabel,
+            time_frame: normalizeTimeFrame(timelineLabel)
+          });
+          call = (await getCallById(call.call_id)) || call;
+        }
+      }
+    }
+
+    if (
+      awaitingCustomerResponse &&
+      ["has_realtor", "applied_with_lender"].includes(
+        String(pendingQuestionType || "")
+      )
+    ) {
+      const explicitAnswer = normalizeExplicitYesNo(transcript);
+      if (explicitAnswer !== null) {
+        const storedAnswer = explicitAnswer ? "Yes" : "No";
+        await mergeCallResult(call.call_id, {
+          [pendingQuestionType]: storedAnswer,
+          ...(pendingQuestionType === "applied_with_lender"
+            ? { has_lender: storedAnswer }
+            : {})
+        });
+        call = (await getCallById(call.call_id)) || call;
+      }
+    }
+
     if (
       overlappedAssistant &&
       !customerExplicitlyInterrupted(transcript)
@@ -6572,6 +6618,33 @@ return true;
 
     if (!awaitingCustomerResponse) {
       requestAssistantResponse({ queueIfBusy: true });
+      return;
+    }
+
+    if (pendingQuestionType === "purchase_timeline") {
+      const timeline = timeFrameMeaning(transcript);
+      if (timeline?.category !== "timeframe") {
+        requestAssistantResponse({
+          queueIfBusy: true,
+          allowWhileAwaiting: true,
+          preservePendingQuestion: true,
+          response: {
+            output_modalities: ["audio"],
+            instructions:
+              'Ask exactly: "Would that be within two months, four months, six months, or one year?" Say nothing else.'
+          }
+        });
+        return;
+      }
+      await endLocalWaitingState("purchase_timeline_confirmed");
+      requestAssistantResponse({
+        queueIfBusy: true,
+        response: {
+          output_modalities: ["audio"],
+          instructions:
+            'Continue immediately with the lender question from the approved script. Do not add filler or repeat the timeline answer.'
+        }
+      });
       return;
     }
 
