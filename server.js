@@ -1,6 +1,6 @@
 const express = require("express");
 const http = require("http");
-const { randomUUID, createHash } = require("crypto");
+const { randomUUID, createHash, createHmac } = require("crypto");
 const { Pool } = require("pg");
 const twilio = require("twilio");
 const WebSocket = require("ws");
@@ -596,6 +596,10 @@ const HELUX_BASE_URL = String(
 ).replace(/\/+$/, "");
 const HELUX_RESULTS_PATH =
   process.env.HELUX_RESULTS_PATH || "/api/v1/calls/results";
+const CRM_RESULTS_URL = String(
+  process.env.CRM_RESULTS_URL ||
+    "https://fklchtsxahepzfzgcqdp.supabase.co/functions/v1/helux-call-result"
+).trim();
 
 const PUBLIC_BASE_URL = String(
   process.env.PUBLIC_BASE_URL || "https://helux-ai-workforce.onrender.com"
@@ -4390,6 +4394,57 @@ async function notifyHelux(call) {
 
   try {
     const attempts = await getAttemptsForCall(call.call_id);
+    const resultPayload = {
+        direction: "outbound",
+        qualification:
+          Number(call.payload?.readiness_score) === 100 ? "qualified" : "unqualified",
+        phone: call.phone || call.payload?.phone,
+        email: call.payload?.email,
+        time_zone: call.timezone,
+        case_id: call.case_id,
+        lead_id: call.lead_id,
+        call_id: call.call_id,
+        twilio_call_sid: call.twilio_call_sid,
+        status: call.status,
+        sequence_status: call.sequence_status,
+        attempts_used: call.attempts,
+        outcome: call.outcome,
+        sentiment: call.sentiment,
+        awaiting_customer_response: call.awaiting_customer_response,
+        pending_question_type: call.pending_question_type,
+        pending_question_text: call.pending_question_text,
+        question_asked_at: call.question_asked_at,
+        response_reminder_count: call.response_reminder_count,
+        next_action: call.next_action,
+        summary: call.summary,
+        transcript: call.transcript || [],
+        actions: publicCallActions(call.actions),
+        result: publicCallResult(call.result),
+        monday: {
+          enabled: MONDAY_SYNC_ENABLED,
+          board_id: MONDAY_BOARD_ID,
+          item_id: call.monday_item_id,
+          group_id: call.monday_group_id,
+          last_sync_at: call.monday_last_sync_at,
+          last_error: call.monday_last_error,
+          attempt_subitems: attempts.map((attempt) => ({
+            attempt_id: attempt.attempt_id,
+            monday_subitem_id: attempt.monday_subitem_id,
+            last_sync_at: attempt.monday_last_sync_at,
+            last_error: attempt.monday_last_error
+          }))
+        },
+        versions: {
+          agent: call.agent_version,
+          prompt: call.prompt_version,
+          tools: call.tool_version,
+          knowledge: call.knowledge_version,
+          routing: call.routing_version,
+          monday_adapter: DOUG_CONFIG.mondayAdapterVersion,
+          realtime_model: OPENAI_REALTIME_MODEL,
+          voice: OPENAI_VOICE
+        }
+      };
     const response = await fetch(`${HELUX_BASE_URL}${HELUX_RESULTS_PATH}`, {
       method: "POST",
       headers: {
@@ -4451,6 +4506,17 @@ async function notifyHelux(call) {
           500
         )}`
       );
+    }
+    if (CRM_RESULTS_URL) {
+      const crmBody = JSON.stringify({ ...resultPayload, transcript: undefined, transcript_count: Array.isArray(resultPayload.transcript) ? resultPayload.transcript.length : 0 });
+      const crmTimestamp = Date.now().toString();
+      const crmSignature = createHmac("sha256", HELUX_API_KEY).update(`${crmTimestamp}.${crmBody}`).digest("hex");
+      const crmResponse = await fetch(CRM_RESULTS_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-helux-timestamp": crmTimestamp, "x-helux-signature": `sha256=${crmSignature}` },
+        body: crmBody
+      });
+      if (!crmResponse.ok) console.error(`CRM result callback failed with ${crmResponse.status}: ${(await crmResponse.text()).slice(0, 500)}`);
     }
   } catch (error) {
     console.error("HELUX result callback failed:", error.message);
