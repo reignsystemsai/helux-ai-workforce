@@ -7592,8 +7592,11 @@ const finalClosing =
   });
 });
 
+const managerCalls = require('./manager-calls').registerManagerCalls({app,pool,authenticateHelux,twilioClient,publicBaseUrl:PUBLIC_BASE_URL,authToken:TWILIO_AUTH_TOKEN,accountSid:TWILIO_ACCOUNT_SID,fromNumber:TWILIO_FROM_NUMBER,heluxKey:HELUX_API_KEY,openaiKey:OPENAI_API_KEY,voice:OPENAI_VOICE,model:OPENAI_REALTIME_MODEL,outboundEnabled:OUTBOUND_CALLS_ENABLED});
+
 server.on("upgrade", (request, socket, head) => {
   try {
+    if (managerCalls.handleUpgrade(request, socket, head)) return;
     const requestUrl = new URL(
       request.url,
       `http://${request.headers.host || "localhost"}`
