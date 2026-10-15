@@ -5699,6 +5699,8 @@ app.post(
   }
 );
 
+require('./prephub-outreach').registerPrepHubOutreach({app,pool,authenticateHelux,twilioClient,publicBaseUrl:PUBLIC_BASE_URL,authToken:TWILIO_AUTH_TOKEN,fromNumber:TWILIO_FROM_NUMBER,heluxKey:HELUX_API_KEY});
+
 app.post(
   "/api/v1/calls",
   authenticateHelux,
