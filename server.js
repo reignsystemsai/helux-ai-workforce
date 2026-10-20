@@ -5559,7 +5559,7 @@ app.get("/health", async (req, res) => {
     res.json({
       status: "healthy",
       service: "helux-ai-workforce",
-      manager_call_revision: 9,
+      manager_call_revision: 10,
       version: DOUG_CONFIG.agentVersion,
       database: "connected",
       database_time: database.rows[0].database_time,

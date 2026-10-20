@@ -5,3 +5,6 @@ Guided calls use server-directed opening turns: identity -> availability/recordi
 The site walkthrough uses the existing tab/field/save labels from DPAHelpCenter/prephub/index.html. It is reference knowledge, not a live screen-sharing or live workbook-reading tool. The assistant asks what the client sees and whether they saved; it cannot certify unsaved progress. General assistance information must remain qualified; no invented program amounts or eligibility decisions. A sent email is mentioned only if the client briefing contains supporting communication evidence.
 
 Voice settings remain a per-call snapshot from the CRM. The owner requested restoring Marin. No real calls are placed by tests.
+
+
+The next opening revision adds a rapport turn after identity: one cordial how-are-you question, then one brief acknowledgment and availability confirmation. It avoids counseling or probing personal problems. The saved caller setting enables a digital-assistant disclosure after availability/inquiry confirmation, followed by an accurate explanation of preparation guidance and agent follow-up requests. It never claims to handle everything or to have completed an unsupported action.
