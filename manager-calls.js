@@ -47,12 +47,24 @@ function preparationNeeds(payload){
  return [...areas].filter(a=>!keys[a]||!(progress.assessed?.[keys[a]]===true&&progress.sections?.[keys[a]]===25)).sort((a,b)=>a==='Credit'?-1:b==='Credit'?1:0);
 }
 function preparationSummary(payload){
- const i=payload.preparation_context?.intake||{},facts=preparationNeeds(payload).map(a=>{
- if(a==='Credit')return Number(i.credit_score)>0&&Number(i.credit_score)<=850?'a credit score of '+Number(i.credit_score):'that credit preparation needs attention';
- if(a==='Taxes')return ({filed_1_year:'one year of filed tax returns',not_filed_recently:'that you haven’t filed taxes recently',not_sure:'that you’re unsure about your tax-filing history'})[i.tax_return_history]||'that your tax-filing history needs review';
- if(a==='Work History')return 'that your work history needs review';
- if(a==='Income'||a==='DTI')return Number(i.household_income)>0?'household income of $'+Number(i.household_income).toLocaleString('en-US')+' and a need to review '+(a==='DTI'?'your income and monthly debts':'income preparation'):'that your '+(a==='DTI'?'income and monthly debts':'income preparation')+' need review';
- });return facts.length?facts.length===1?facts[0]:facts.slice(0,-1).join(', ')+' and '+facts.at(-1):'preparation information that we can review together';
+ const i=payload.preparation_context?.intake||{},areas=preparationNeeds(payload),seen=new Set(),facts=[];
+ for(const area of areas){
+ const key=area==='Income'||area==='DTI'?'income_dti':area;if(seen.has(key))continue;seen.add(key);
+ if(area==='Credit'){
+ const score=Number(i.credit_score),reported=Number.isFinite(score)&&score>=300&&score<=850?'You reported a credit score of '+score+'. ':'Your credit preparation needs review. ';
+ facts.push(reported+'PrepHub’s credit preparation target is a middle FICO of 640; some lenders may consider lower scores');
+ }else if(area==='Taxes'){
+ const reported=({filed_1_year:'You reported one year of filed tax returns. ',not_filed_recently:'You reported that you haven’t filed taxes recently. ',not_sure:'You were unsure about your tax-filing history. '})[i.tax_return_history]||'Your tax-filing history needs review. ';
+ facts.push(reported+'Some loans require two years of tax returns to document income, so we’ll clarify what you have and what your lender may need');
+ }else if(area==='Work History'){
+ const reported=({in_and_out_of_work:'You reported time in and out of work. ',switched_jobs_continuous_2_years:'You reported job changes with two years of continuous employment. ',switched_jobs_2_years:'You reported job changes over the last two years. ',employed_2_years:'You reported two years of employment. '})[i.employment_history]||'Your work history needs review. ';
+ facts.push(reported+'We’ll map your last two years so a lender can review income stability; it doesn’t have to be with the same employer');
+ }else if(key==='income_dti'){
+ const income=Number(i.household_income),reported=Number.isFinite(income)&&income>0?'You reported household income of $'+income.toLocaleString('en-US',{maximumFractionDigits:0})+'. ':'';
+ facts.push(reported+'We’ll compare your income with monthly debts and an estimated housing payment to understand your homebuying budget');
+ }
+ }
+ return facts.length?facts.join('. '):'We can review your preparation information together to clarify your next step';
 }
 function requestedAssistance(payload){const raw=payload.preparation_context?.intake?.estimated_dpa;if(raw===null||raw===undefined||raw==='')return null;const amount=Number(String(raw).replace(/[$, ]/g,''));return Number.isFinite(amount)&&amount>0?'$'+amount.toLocaleString('en-US',{maximumFractionDigits:0}):null;}
 function simpleLine(stage,payload){
