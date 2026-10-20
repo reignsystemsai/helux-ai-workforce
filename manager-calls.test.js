@@ -58,5 +58,8 @@ test('live page tool is scoped to immutable approved recipient and rejects trans
  }
  assert.equal((await tool('read-page',{})).ok,true);assert.equal(f.counts.lastFetch.body.lead_id,'DPA-test-authorized');
  assert.equal((await tool('injected-recipient',{lead_id:'DPA-other-person'})).ok,false);
+ session.c.payload.preparation_sections=[{area:'Income',text:'Do you work?'},{area:'Credit',text:'Review your credit report?'}];
+ await event(session.ai,{type:'response.function_call_arguments.done',name:'finish_call',call_id:'nav-finish',arguments:JSON.stringify({outcome:'completed',summary:'Credit next step discussed',next_action:'Review saved report',preparation_area_outcomes:[{area:'Credit',disposition:'discussed',client_quote:'No questions.',next_step:'Review report'}]})});
+ assert.equal(session.c.result.outcome,'completed');assert.equal(session.c.result.preparation_coverage.length,1);assert.equal(session.c.result.preparation_coverage[0].area,'Credit');
  session.socket.close();
 });
