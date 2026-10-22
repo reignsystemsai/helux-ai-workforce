@@ -1,0 +1,17 @@
+'use strict';
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const {readFileSync}=require('node:fs');
+const vm=require('node:vm');
+const source=readFileSync(require.resolve('./manager-calls.js'),'utf8');
+const context={module:{exports:{}},require:(id)=>id.startsWith('node:')?require(id):{},process,console,URL,Buffer,setTimeout,clearTimeout};
+vm.runInNewContext(source,context);
+const {validRequest}=context.module.exports;
+const dpa='https://fklchtsxahepzfzgcqdp.supabase.co/functions/v1/manager-daisy-call-result';
+const builder='https://fklchtsxahepzfzgcqdp.supabase.co/functions/v1/ai-builder-call-result';
+const payload=()=>({action_id:'11111111-1111-4111-8111-111111111111',owner_authorized:true,direct_number:true,call_mode:'direct_number',phone:'+12025550123',callback_url:builder,caller_settings:{version:1,settings:{company_name:'AI Builder Class',script_delivery:'verbatim'}},script:{objective:'Webinar follow-up',opening:'Hi, is Doug available?',key_points:['Webinar date will be announced.']}});
+test('AI Builder callback accepts the class direct-call profile',()=>assert.equal(validRequest(payload()),true));
+test('Existing DPA callback remains valid',()=>assert.equal(validRequest({...payload(),callback_url:dpa,caller_settings:undefined}),true));
+test('AI Builder callback rejects the wrong company or flow',()=>{const p=payload();assert.equal(validRequest({...p,caller_settings:{version:1,settings:{company_name:'DPA Help Center'}}}),false);assert.equal(validRequest({...p,direct_number:false}),false);assert.equal(validRequest({...p,owner_authorized:false,permission_verified:true}),false);});
+test('Caller rejects arbitrary callback destinations',()=>{for(const callback_url of ['https://example.com/collect',builder+'?redirect=1',builder+'.evil.com',dpa+'/../other'])assert.equal(validRequest({...payload(),callback_url}),false);});
+test('International E.164 numbers are supported for class calls',()=>assert.equal(validRequest({...payload(),phone:'+573001234567'}),true));
