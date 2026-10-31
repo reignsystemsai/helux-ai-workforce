@@ -259,3 +259,16 @@ test('a recovery call confirms identity then resumes its saved checkbox question
   assert.equal(session.c.result.recovery_checkpoint.stage,'tax_save');assert.equal(session.c.result.recovery_checkpoint.prephub_login_confirmed,true);
  }finally{session.socket.close();}
 });
+
+test('reconnected callback confirmation carries the actual prior request into scheduling evidence',async()=>{
+ const f=fixture(),request='Call me tomorrow at eleven Eastern.',readback='I can call you tomorrow at 11:00 AM Eastern. Is that correct?';
+ f.payload.caller_settings={version:1,settings:{script_delivery:'guided',recording_mode:'off'}};f.payload.conversation_mode='follow_up';f.payload.preparation_context={prior_conversations:[{action_id:'old-source',transcript:[{role:'client',text:request}]}]};
+ f.payload.disconnect_recovery={root_action_id:'old-source',source_action_id:'old-source',attempt:1,checkpoint:{stage:'callback_time',script_line:readback,instructions:'Confirm the pending callback once',pending_callback:{callback_at:new Date(Date.now()+86400000).toISOString(),timezone:'America/New_York',request_quote:request,label:'tomorrow at eleven Eastern',confirmation_line:readback}}};
+ const session=await liveSession(f);try{
+  await event(session.ai,{type:'session.updated'});await event(session.ai,{type:'response.done',response:{status:'completed'}});
+  await event(session.ai,{type:'conversation.item.input_audio_transcription.completed',item_id:'recovery-name',transcript:'This is Test speaking.'});
+  await event(session.ai,{type:'response.output_audio_transcript.done',item_id:'callback-readback',transcript:readback});await event(session.ai,{type:'response.done',response:{status:'completed'}});
+  await event(session.ai,{type:'conversation.item.input_audio_transcription.completed',item_id:'recovery-slot-yes',transcript:'Yes, that works.'});
+  assert.equal(f.counts.schedules,1);assert.equal(f.counts.lastFetch.body.request_quote,request);assert.ok(f.counts.lastFetch.body.transcript.some(t=>t.role==='client'&&t.text===request));assert.equal(f.counts.lastFetch.body.transcript.at(-1).text,'Yes, that works.');
+ }finally{session.socket.close();}
+});
