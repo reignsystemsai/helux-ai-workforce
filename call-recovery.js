@@ -1,3 +1,4 @@
+const {cleanCallerText,sectionPrompt,LOGIN_LINE}=require('./guided-access');
 'use strict';
 const terminal=s=>['completed','failed','no-answer','busy','canceled'].includes(s);
 function recoveryDecision(call){
@@ -11,5 +12,5 @@ function recoveryDecision(call){
  return {policy:1,operation:'call',root_action_id:call.action_id};
 }
 function recoveryOpening(p){const name=String(p.first_name||'').trim();return 'Hi'+(name?', '+name:'')+'. This is Daisy with the DPA Help Center. It looks like we got disconnected. '+(name?'Is this '+name+' speaking?':'Am I speaking with the person I was just talking with?');}
-function resumeCheckpoint(p){const cp=p.disconnect_recovery?.checkpoint;if(!cp||typeof cp.stage!=='string'||cp.stage==='wrapup')return null;return {stage:cp.stage,scriptLine:cp.script_line||null,instructions:cp.instructions||'Continue from the last unanswered question in the approved script. Do not repeat the introduction.',pendingCallback:cp.pending_callback||null,relativeCallback:cp.relative_callback||null};}
+function resumeCheckpoint(p){const cp=p.disconnect_recovery?.checkpoint;if(!cp||typeof cp.stage!=='string'||cp.stage==='wrapup')return null;if(cp.stage==='tax_login')return {stage:'tax_section_navigation',scriptLine:sectionPrompt('taxes')};if(cp.stage==='login_confirm')return {stage:'section_status',instructions:'Call get_prephub_status and guide the relevant section by its actual heading.'};if(cp.stage==='login')return {stage:'email_login',scriptLine:LOGIN_LINE};return {stage:cp.stage,scriptLine:cleanCallerText(cp.script_line)||null,instructions:cp.instructions||'Continue from the last unanswered question in the approved script. Do not repeat the introduction.',pendingCallback:cp.pending_callback||null,relativeCallback:cp.relative_callback||null};}
 module.exports={recoveryDecision,recoveryOpening,resumeCheckpoint};

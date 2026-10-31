@@ -1,9 +1,10 @@
+const {sectionPrompt}=require('./guided-access');
 'use strict';
 const {fillerReply}=require('./turn-taking');
 const {recentTaxYears}=require('./tax-years');
 const INVITE='When would you like me to call you back—maybe in a few days, a few weeks, or a month?';
 function taxSelections(p){const values=p.client_reported_tax_years?.years||{},years=recentTaxYears(p).slice().sort((a,b)=>Number(values[b]===true)-Number(values[a]===true));const choices=years.map(y=>'“I have '+(values[y]===true?'filed ':'not filed ')+y+'”');return {stage:'tax_select_both',scriptLine:'In the Taxes tab, select '+choices.join(', then select ')+'. Let me know when you’ve selected both.',instructions:'Read these two approved tax selections, then stop and listen. Do not ask another tax-year confirmation.'};}
-function taxActionStart(p){return p.prephub_login_confirmed===true?taxSelections(p):{stage:'tax_login',scriptLine:'Are you inside PrepHub now?',instructions:'Confirm sign-in briefly before directing selections. Email receipt does not establish login. Do not repeat the tax-year questions.'};}
+function taxActionStart(p){return p.prephub_section_confirmed==='taxes'?taxSelections(p):{stage:'tax_section_navigation',scriptLine:sectionPrompt('taxes',p.prephub_live_status),instructions:'Guide the Taxes section by its actual heading. Do not repeat tax-year questions.'};}
 function completedTaxAction(words,stage){
  const s=String(words||'').toLowerCase().replace(/[’]/g,"'").replace(/\b(?:not a problem|no problem|no worries)\b/g,'');
  if(/\b(?:not|neither|none|not yet|haven't|have not|didn't|did not|can't|cannot|couldn't|only one|just one|first one|one of|trying to|going to|about to|need to|will)\b/.test(s))return false;
@@ -19,8 +20,9 @@ function taxFlowTurn(stage,words,p,line){
  const text=String(words||''),yes=/^(?:yes|yeah|yep|sure|okay|ok|done|saved|ready|i did|i have|i.m in|i am in|i.ve|that.s done|it.s done|sounds good|absolutely)\b/i.test(text),no=/^(?:no|not yet|nope|i can.t|i cannot)\b/i.test(text);
  const years=recentTaxYears(p),values=p.client_reported_tax_years?.years||{},missing=years.filter(y=>values[y]===false),say=(next,scriptLine)=>({stage:next,scriptLine,instructions:'Read only this approved tax-guidance step, then wait. Do not restart the introduction or reassurance. Never claim to see an unsaved click.'});
  const select=i=>say('tax_select_'+i,'For '+years[i]+', select “I have '+(values[years[i]]===true?'filed ':'not filed ')+years[i]+'.” Let me know when you’ve selected that.');
- if(stage==='tax_walkthrough_offer')return yes?say('tax_login','Excellent. Open the PrepHub link in that email and sign in. Are you inside PrepHub now?'):no?{stage:'callback_time',scriptLine:INVITE}:{stage,instructions:'Briefly address their actual question, then clarify whether they have two to three minutes for the preparation checklist now or want a callback. Do not restart the introduction.'};
- if(stage==='tax_login'){if(yes){p.prephub_login_confirmed=true;return taxSelections(p);}return say(stage,'Open the PrepHub link in your email and sign in. Let me know when you’re inside.');}
+ if(stage==='tax_walkthrough_offer')return yes?taxActionStart(p):no?{stage:'callback_time',scriptLine:INVITE}:{stage,instructions:'Briefly address their actual question, then clarify whether they have two to three minutes for the preparation checklist now or want a callback. Do not restart the introduction.'};
+ if(stage==='tax_login')return taxActionStart(p);
+ if(stage==='tax_section_navigation'){if(yes){p.prephub_section_confirmed='taxes';return taxSelections(p);}return say(stage,sectionPrompt('taxes',p.prephub_live_status));}
  if(stage==='tax_tab')return yes?taxSelections(p):{stage,instructions:'Ask what page heading they see, then give one navigation instruction to the existing Taxes tab. Never invent a control. Offer a callback if they cannot continue.'};
  if(stage==='tax_select_both')return completedTaxAction(text,stage)?say('tax_save','Excellent. Scroll down to Your filing plan. Your selections and any remaining filing steps appear there. Click Save Progress, and let me know when it’s saved.'):say(stage,'Have you selected both filing-status boxes?');
  if(stage==='tax_select_0')return yes?select(1):select(0);
