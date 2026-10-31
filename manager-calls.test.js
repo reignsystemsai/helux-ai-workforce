@@ -200,3 +200,9 @@ test('approximate callback from the walkthrough immediately receives computed ch
 });
 
 test('presence after the approved interest statement resumes the saved email step with no improvised questions',()=>{const f=fixture();f.payload.preparation_context={intake:{}};f.payload.script.script_text='[PrepHub:amount_interest]\nApproved interest statement.\n[PrepHub:email]\nApproved fresh email announcement.\n[PrepHub:email_sent]\nSent.';const turn=f.api.presenceResume('amount','Approved interest statement.',f.payload);assert.equal(turn.stage,'email');assert.equal(turn.scriptLine,'Approved fresh email announcement.');assert.equal(turn.autoWelcome,true);const pending=f.api.presenceResume('identity','Hi, is Test available?',f.payload);assert.equal(pending.stage,'identity');assert.equal(pending.scriptLine,'Hi, is Test available?');assert.doesNotMatch(turn.instructions,/buy within|home in mind|optional areas/);});
+
+test('scheduled follow-up answers natural yes plus why and does not repeat the introduction',()=>{
+ const f=fixture();f.payload.conversation_mode='follow_up';f.payload.preparation_context={scheduled_callback:{request_quote:'Call me back in 15 minutes.'},prior_conversations:[{summary:'Discussed 2024 filed and 2025 pending.'}]};f.payload.caller_settings={version:1,settings:{script_delivery:'guided',recording_mode:'off'}};
+ for(const words of ['Yeah, why are you calling me right now?','Yes, and why are you calling me?']){const turn=f.api.nextGuidedTurn('identity',words,f.payload);assert.equal(turn.stage,'follow_up');assert.match(turn.scriptLine,/calling back as we arranged/);assert.doesNotMatch(turn.scriptLine,/Congratulations|looking for around/);}
+ assert.match(f.api.callInstructions(f.payload),/few days, a few weeks, or a month/);
+});
