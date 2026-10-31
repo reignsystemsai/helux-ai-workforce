@@ -1,4 +1,5 @@
 'use strict';
+const {fillerReply}=require('./turn-taking');
 const {recentTaxYears}=require('./tax-years');
 const INVITE='When would you like me to call you back—maybe in a few days, a few weeks, or a month?';
 function taxSelections(p){const values=p.client_reported_tax_years?.years||{},years=recentTaxYears(p).slice().sort((a,b)=>Number(values[b]===true)-Number(values[a]===true));const choices=years.map(y=>'“I have '+(values[y]===true?'filed ':'not filed ')+y+'”');return {stage:'tax_select_both',scriptLine:'In the Taxes tab, select '+choices.join(', then select ')+'. Let me know when you’ve selected both.',instructions:'Read these two approved tax selections, then stop and listen. Do not ask another tax-year confirmation.'};}
@@ -14,6 +15,7 @@ function completedTaxAction(words,stage){
 }
 function taxFlowTurn(stage,words,p,line){
  if(!stage.startsWith('tax_')||['tax_years','tax_year_missing','tax_years_confirm'].includes(stage))return null;
+ if(fillerReply(words))return {stage,hold:true};
  const text=String(words||''),yes=/^(?:yes|yeah|yep|sure|okay|ok|done|saved|ready|i did|i have|i.m in|i am in|i.ve|that.s done|it.s done|sounds good|absolutely)\b/i.test(text),no=/^(?:no|not yet|nope|i can.t|i cannot)\b/i.test(text);
  const years=recentTaxYears(p),values=p.client_reported_tax_years?.years||{},missing=years.filter(y=>values[y]===false),say=(next,scriptLine)=>({stage:next,scriptLine,instructions:'Read only this approved tax-guidance step, then wait. Do not restart the introduction or reassurance. Never claim to see an unsaved click.'});
  const select=i=>say('tax_select_'+i,'For '+years[i]+', select “I have '+(values[years[i]]===true?'filed ':'not filed ')+years[i]+'.” Let me know when you’ve selected that.');
