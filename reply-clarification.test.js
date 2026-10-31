@@ -4,3 +4,5 @@ test('login clarification is specific and does not guess that man or amen means 
 test('tax-year clarification asks for the missing year without demanding a yes/no answer',()=>{const t=clarifyReply('tax_years','Ja.',{stage:'tax_years'},{});a.equal(t.stage,'tax_years');a.equal(t.scriptLine,'I’m sorry, which tax year did you say?');});
 
 test('correctly transcribed signed-in replies advance immediately instead of clarifying again',()=>{const {accessComplete}=require('./guided-access');for(const s of ["I'm in.",'I’m in.','I am in.',"I'm inside.",'I am inside.'])a.equal(accessComplete(s),true,s);});
+
+test('unclear tie-down and referral replies cannot silently advance to the next section',()=>{for(const stage of ['needs','orientation','tax_assistant','tax_resources','tax_referral_offer']){const p={},t=clarifyReply(stage,'Ja.',{stage:'next-step',scriptLine:'Next question'},p);a.equal(t.stage,stage);a.equal(t.scriptLine,BOOLEAN_CLARIFICATION);}});
