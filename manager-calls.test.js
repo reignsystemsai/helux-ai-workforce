@@ -248,3 +248,14 @@ test('stop requests get a brief farewell without promising future work',async()=
   assert.match(spoken,/Thank you for your time. Goodbye/);assert.doesNotMatch(spoken,/look forward/);
  }finally{session.socket.close();}
 });
+test('a recovery call confirms identity then resumes its saved checkbox question without restarting script 40',async()=>{
+ const f=fixture();f.payload.caller_settings={version:1,settings:{script_delivery:'guided',recording_mode:'off'}};f.payload.conversation_mode='follow_up';f.payload.disconnect_recovery={root_action_id:'22222222-2222-4222-8222-222222222222',attempt:1,checkpoint:{stage:'tax_save',script_line:'Have you saved your progress?',instructions:'Call get_prephub_status after save',prephub_login_confirmed:true,client_reported_tax_years:{years:{2024:true,2025:false}}}};
+ const session=await liveSession(f);try{
+  await event(session.ai,{type:'session.updated'});assert.match(session.ai.sent.at(-1).response.instructions,/got disconnected/);assert.doesNotMatch(session.ai.sent.at(-1).response.instructions,/Congratulations/);
+  await event(session.ai,{type:'response.done',response:{status:'completed'}});
+  await event(session.ai,{type:'conversation.item.input_audio_transcription.completed',item_id:'resume-identity',transcript:'This is Test speaking.'});
+  assert.match(session.ai.sent.filter(e=>e.type==='response.create').at(-1).response.instructions,/Have you saved your progress/);
+  await event(session.ai,{type:'response.done',response:{status:'completed'}});await new Promise(r=>setImmediate(r));
+  assert.equal(session.c.result.recovery_checkpoint.stage,'tax_save');assert.equal(session.c.result.recovery_checkpoint.prephub_login_confirmed,true);
+ }finally{session.socket.close();}
+});
