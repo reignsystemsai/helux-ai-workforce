@@ -1,0 +1,6 @@
+const {test}=require('node:test'),a=require('node:assert/strict'),{clarifyReply,BOOLEAN_CLARIFICATION,LOGIN_CLARIFICATION}=require('./reply-clarification');
+test('unrecognized replies clarify the existing yes/no step without replaying it',()=>{const p={},t=clarifyReply('section_navigation','Não.',{stage:'section_navigation',scriptLine:'Please select Taxes. Do you see that heading?'},p);a.equal(t.stage,'section_navigation');a.equal(t.scriptLine,BOOLEAN_CLARIFICATION);a.equal(p.reply_clarification.stage,'section_navigation');});
+test('login clarification is specific and does not guess that man or amen means signed in',()=>{for(const s of ['Man.','Amen.'])a.equal(clarifyReply('email_login',s,{stage:'email_login'},{}).scriptLine,LOGIN_CLARIFICATION);});
+test('tax-year clarification asks for the missing year without demanding a yes/no answer',()=>{const t=clarifyReply('tax_years','Ja.',{stage:'tax_years'},{});a.equal(t.stage,'tax_years');a.equal(t.scriptLine,'I’m sorry, which tax year did you say?');});
+
+test('correctly transcribed signed-in replies advance immediately instead of clarifying again',()=>{const {accessComplete}=require('./guided-access');for(const s of ["I'm in.",'I’m in.','I am in.',"I'm inside.",'I am inside.'])a.equal(accessComplete(s),true,s);});

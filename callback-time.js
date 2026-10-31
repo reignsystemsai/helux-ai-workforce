@@ -10,7 +10,8 @@ function callbackProposal(args,transcript,now=Date.now()){
  return {callback_at:new Date(at).toISOString(),timezone:zone,request_quote:quote,label,confirmation_line:'I can call you on '+label+'. Is that correct?'};
 }
 function confirmedCallback(args,transcript){
- const turns=(transcript||[]).filter(t=>['client','daisy'].includes(t.role)&&String(t.text||'').trim()),last=turns.at(-1),readback=turns.at(-2);
+ const turns=(transcript||[]).filter(t=>['client','daisy'].includes(t.role)&&String(t.text||'').trim()),last=turns.at(-1);let readback=turns.at(-2);
+ if(/^Just to make sure I understand you correctly, was that a yes or a no[?!. ]*$/i.test(String(readback?.text||''))&&turns.at(-3)?.role==='client'&&!/[0-9]|\b(?:instead|actually|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(String(turns.at(-3)?.text||'')))readback=turns.at(-4);
  if(last?.role!=='client'||!callbackAffirmative(last.text)||readback?.role!=='daisy'||/\bor\b/i.test(readback.text))return null;
  const at=Date.parse(args.callback_at);if(!Number.isFinite(at)||callbackZone(readback.text)!==args.timezone)return null;
  const parts=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:args.timezone,month:'long',day:'numeric',hour:'numeric',minute:'2-digit',hour12:true}).formatToParts(at).map(p=>[p.type,p.value]));

@@ -15,3 +15,5 @@ test('one complete conversational confirmation is reused; partial or alternative
 test('explicit callback proposals may include client-selected evening times before confirmation',()=>{
  const args={callback_at:'2026-11-30T18:00:00-05:00',timezone:'America/New_York',client_quote:quote};assert.ok(callbackProposal(args,[{role:'client',text:quote}],now));assert.ok(callbackProposal({...args,callback_at:'2026-11-30T23:30:00-05:00'},[{role:'client',text:quote}],now));
 });
+
+test('one short confirmation clarification retains the existing full callback readback',()=>{const {confirmedCallback}=require('./callback-time');const args={callback_at:'2026-11-30T21:00:00-05:00',timezone:'America/New_York'};const ts=[{role:'daisy',text:'I can call you on Monday, November 30, 2026 at 9:00 PM EST. Is that correct?'},{role:'client',text:'Ja.'},{role:'daisy',text:'Just to make sure I understand you correctly, was that a yes or a no?'},{role:'client',text:'Yes.'}];assert.equal(confirmedCallback(args,ts),'Yes.');ts[1].text='Actually 4 PM.';assert.equal(confirmedCallback(args,ts),null);});
