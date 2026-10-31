@@ -1,6 +1,17 @@
 const {test}=require('node:test'),assert=require('node:assert/strict'),{callbackProposal,callbackAffirmative}=require('./callback-time');
 const now=Date.parse('2026-10-20T15:00:00Z'),quote='Call me tomorrow at noon Eastern.';
 test('Requested callback is converted to explicit timezone readback',()=>{const p=callbackProposal({callback_at:'2026-10-21T12:00:00-04:00',timezone:'America/New_York',client_quote:quote},[{role:'client',text:quote}],now);assert.equal(p.callback_at,'2026-10-21T16:00:00.000Z');assert.match(p.confirmation_line,/October 21, 2026/);assert.match(p.confirmation_line,/12:00 PM EDT/);});
-test('Missing timezone, unsupported quote, past dates and closed hours require clarification',()=>{const valid={callback_at:'2026-10-21T12:00:00-04:00',timezone:'America/New_York',client_quote:quote},transcript=[{role:'client',text:quote}];for(const args of [{...valid,timezone:''},{...valid,client_quote:'invented quote'},{...valid,callback_at:'2026-10-19T12:00:00Z'},{...valid,callback_at:'2026-10-21T23:00:00Z'}])assert.throws(()=>callbackProposal(args,transcript,now));for(const answer of ['Yes.','That works for me.','Sounds good.'])assert.equal(callbackAffirmative(answer),true);for(const answer of ['Maybe.','Yes but later.','No.'])assert.equal(callbackAffirmative(answer),false);});
+test('Missing timezone, unsupported quote and past dates require clarification',()=>{const valid={callback_at:'2026-10-21T12:00:00-04:00',timezone:'America/New_York',client_quote:quote},transcript=[{role:'client',text:quote}];for(const args of [{...valid,timezone:''},{...valid,client_quote:'invented quote'},{...valid,callback_at:'2026-10-19T12:00:00Z'}])assert.throws(()=>callbackProposal(args,transcript,now));for(const answer of ['Yes.','That works for me.','Sounds good.'])assert.equal(callbackAffirmative(answer),true);for(const answer of ['Maybe.','Yes but later.','No.'])assert.equal(callbackAffirmative(answer),false);});
 
 test('uh-huh confirms a callback while uh-uh and corrections do not',()=>{for(const a of ['Uh-huh.','Uh huh.','Mm-hmm.'])assert.equal(callbackAffirmative(a),true);for(const a of ['Uh-uh.','Uh-huh, but later.'])assert.equal(callbackAffirmative(a),false);});
+
+test('one complete conversational confirmation is reused; partial or alternative readbacks are not',()=>{
+ const {confirmedCallback}=require('./callback-time');const args={callback_at:'2026-11-30T18:00:00-05:00',timezone:'America/New_York'};
+ const readback='Is the callback for November 30 at 6 PM Eastern Standard Time?';
+ assert.equal(confirmedCallback(args,[{role:'daisy',text:readback},{role:'client',text:'Yes.'}]),'Yes.');
+ for(const text of ['November 30 or December 1 at 6 PM Eastern?','November 30 at 5 PM Eastern?','November 30 at 6 PM Pacific?','Does that sound good?'])assert.equal(confirmedCallback(args,[{role:'daisy',text},{role:'client',text:'Yes.'}]),null);
+ assert.equal(confirmedCallback(args,[{role:'daisy',text:readback},{role:'client',text:'Yes, but later.'}]),null);
+});
+test('explicit callback proposals may include client-selected evening times before confirmation',()=>{
+ const args={callback_at:'2026-11-30T18:00:00-05:00',timezone:'America/New_York',client_quote:quote};assert.ok(callbackProposal(args,[{role:'client',text:quote}],now));assert.ok(callbackProposal({...args,callback_at:'2026-11-30T23:30:00-05:00'},[{role:'client',text:quote}],now));
+});

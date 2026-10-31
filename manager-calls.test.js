@@ -192,3 +192,9 @@ test('follow-up mode confirms identity then resumes recorded work without replay
  const instructions=f.api.callInstructions(p);assert.match(instructions,/FOLLOW-UP MODE/);assert.match(instructions,/Client filed 2024/);assert.doesNotMatch(instructions,/Follow this required order without skipping/);
  p.conversation_mode='new_client';assert.notEqual(f.api.simpleLine('identity',p),'Hi, is this Douglas speaking?');assert.equal(f.api.nextGuidedTurn('identity','This is Doug speaking.',p).stage,'amount');
 });
+
+test('approximate callback from the walkthrough immediately receives computed choices instead of an exact-date demand',()=>{
+ const f=fixture();for(const stage of ['orientation_checklist','preparation','callback_time']){
+ const turn=f.api.nextGuidedTurn(stage,'Call me back in about a month, Eastern time after 5 PM.',f.payload);assert.equal(turn.stage,'callback_time');assert.match(turn.instructions,/calendar-calculated options/);assert.match(turn.instructions,/Preserve any time or timezone/);assert.match(turn.instructions,/server supplies the ONE confirmation/);assert.equal(turn.scriptLine,undefined);
+ }
+});
