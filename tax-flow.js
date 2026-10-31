@@ -4,8 +4,8 @@ const INVITE='When would you like me to call you back—maybe in a few days, a f
 function taxSelections(p){const values=p.client_reported_tax_years?.years||{},years=recentTaxYears(p).slice().sort((a,b)=>Number(values[b]===true)-Number(values[a]===true));const choices=years.map(y=>'“I have '+(values[y]===true?'filed ':'not filed ')+y+'”');return {stage:'tax_select_both',scriptLine:'In the Taxes tab, select '+choices.join(', then select ')+'. Let me know when you’ve selected both.',instructions:'Read these two approved tax selections, then stop and listen. Do not ask another tax-year confirmation.'};}
 function taxActionStart(p){return p.prephub_login_confirmed===true?taxSelections(p):{stage:'tax_login',scriptLine:'Are you inside PrepHub now?',instructions:'Confirm sign-in briefly before directing selections. Email receipt does not establish login. Do not repeat the tax-year questions.'};}
 function completedTaxAction(words,stage){
- const s=String(words||'').toLowerCase().replace(/[’]/g,"'");
- if(/\b(?:not yet|haven't|have not|didn't|did not|can't|cannot|couldn't|only one|just one|first one|one of|trying to|going to|about to|need to|will)\b/.test(s))return false;
+ const s=String(words||'').toLowerCase().replace(/[’]/g,"'").replace(/\b(?:not a problem|no problem|no worries)\b/g,'');
+ if(/\b(?:not|neither|none|not yet|haven't|have not|didn't|did not|can't|cannot|couldn't|only one|just one|first one|one of|trying to|going to|about to|need to|will)\b/.test(s))return false;
  if(/^(?:yes|yeah|yep|sure|okay|ok|done|saved|ready|all set|absolutely)\b/.test(s))return true;
  if(stage==='tax_save')return /\b(?:saved|clicked(?: on)? (?:save|the save)|pressed(?: the)? save|hit save)\b/.test(s);
  return /\b(?:selected|checked|marked|chosen|clicked|completed|finished|done)\b/.test(s)&&(/\b(?:both|boxes|selections|years|them|everything|all|it|that|done)\b/.test(s)||/\b(?:i am|i'm|i have|i've|that's|that is|it is|it's) (?:done|finished|completed)\b/.test(s));
