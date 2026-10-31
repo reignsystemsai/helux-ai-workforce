@@ -1,4 +1,4 @@
-const {sectionPrompt}=require('./guided-access');
+const {sectionVisible,sectionPrompt}=require('./guided-access');
 'use strict';
 const {fillerReply}=require('./turn-taking');
 const {recentTaxYears}=require('./tax-years');
@@ -22,7 +22,7 @@ function taxFlowTurn(stage,words,p,line){
  const select=i=>say('tax_select_'+i,'For '+years[i]+', select “I have '+(values[years[i]]===true?'filed ':'not filed ')+years[i]+'.” Let me know when you’ve selected that.');
  if(stage==='tax_walkthrough_offer')return yes?taxActionStart(p):no?{stage:'callback_time',scriptLine:INVITE}:{stage,instructions:'Briefly address their actual question, then clarify whether they have two to three minutes for the preparation checklist now or want a callback. Do not restart the introduction.'};
  if(stage==='tax_login')return taxActionStart(p);
- if(stage==='tax_section_navigation'){if(yes){p.prephub_section_confirmed='taxes';return taxSelections(p);}return say(stage,sectionPrompt('taxes',p.prephub_live_status));}
+ if(stage==='tax_section_navigation'){if(sectionVisible(text,'taxes')){p.prephub_section_confirmed='taxes';return taxSelections(p);}return say(stage,sectionPrompt('taxes',p.prephub_live_status));}
  if(stage==='tax_tab')return yes?taxSelections(p):{stage,instructions:'Ask what page heading they see, then give one navigation instruction to the existing Taxes tab. Never invent a control. Offer a callback if they cannot continue.'};
  if(stage==='tax_select_both')return completedTaxAction(text,stage)?say('tax_save','Excellent. Scroll down to Your filing plan. Your selections and any remaining filing steps appear there. Click Save Progress, and let me know when it’s saved.'):say(stage,'Have you selected both filing-status boxes?');
  if(stage==='tax_select_0')return yes?select(1):select(0);
