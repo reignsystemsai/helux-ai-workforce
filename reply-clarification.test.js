@@ -5,4 +5,4 @@ test('tax-year clarification asks for the missing year without demanding a yes/n
 
 test('correctly transcribed signed-in replies advance immediately instead of clarifying again',()=>{const {accessComplete}=require('./guided-access');for(const s of ["I'm in.",'I’m in.','I am in.',"I'm inside.",'I am inside.'])a.equal(accessComplete(s),true,s);});
 
-test('unclear tie-down and referral replies cannot silently advance to the next section',()=>{for(const stage of ['needs','orientation','tax_assistant','tax_resources','tax_referral_offer']){const p={},t=clarifyReply(stage,'Ja.',{stage:'next-step',scriptLine:'Next question'},p);a.equal(t.stage,stage);a.equal(t.scriptLine,BOOLEAN_CLARIFICATION);}});
+test('unclear tie-down and referral replies cannot silently advance to the next section',()=>{for(const stage of ['needs','orientation','tax_assistant','tax_resources','tax_referral_offer']){const p={},t=clarifyReply(stage,'Ja.',{stage:'next-step',scriptLine:'Next question'},p);a.equal(t.stage,stage);a.equal(t.scriptLine,['tax_assistant','tax_resources'].includes(stage)?'What do you think of that?':BOOLEAN_CLARIFICATION);}});

@@ -1,6 +1,6 @@
 const {callbackZone}=require('./callback-relative');
 'use strict';
-function normalizeAffirmation(value){return String(value||'').trim().replace(/^(?:(?:oh|um|well)[,!. ]+)+/i,'').replace(/^(?:uh[ -]*huh|mhm|mm[ -]*hmm)\b/i,'Yes');}
+function normalizeAffirmation(value){return String(value||'').trim().replace(/^(?:(?:oh|um|uh(?![ -]*(?:huh|uh)\b)|ah|well)[,!. ]+)+/i,'').replace(/^(?:uh[ -]*huh|mhm|mm[ -]*hmm)\b/i,'Yes');}
 function callbackAffirmative(value){const s=normalizeAffirmation(value).replace(/^(?:oh|um|uh)[, ]+/i,'');return /^(?:yes|yeah|yep|yup|sure|okay|ok|correct|absolutely|that (?:works|is fine|sounds good)|sounds good|perfect|please do|go ahead)\b/i.test(s)&&!/\b(?:not|don.t|do not|no|wait|but|instead|actually)\b/i.test(s);}
 function callbackProposal(args,transcript,now=Date.now()){
  const at=Date.parse(args.callback_at),zone=String(args.timezone||''),quote=String(args.client_quote||'').trim();

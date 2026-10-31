@@ -1,9 +1,11 @@
+const {taxObservation,selectionSummary,observedTaxTurn}=require('./tax-observation');
 const {sectionVisible,sectionPrompt}=require('./guided-access');
 'use strict';
 const {fillerReply}=require('./turn-taking');
 const {recentTaxYears}=require('./tax-years');
+function followupPurpose(p){const missing=recentTaxYears(p).filter(y=>p.client_reported_tax_years?.years?.[y]===false);return 'I’d follow up to check on '+(missing.length?'your '+missing.join(' and ')+' tax filing':'your next preparation milestone')+' and help you keep moving forward. ';}
 const INVITE='When would you like me to call you back—maybe in a few days, a few weeks, or a month?';
-function taxSelections(p){const values=p.client_reported_tax_years?.years||{},years=recentTaxYears(p).slice().sort((a,b)=>Number(values[b]===true)-Number(values[a]===true));const choices=years.map(y=>'“I have '+(values[y]===true?'filed ':'not filed ')+y+'”');return {stage:'tax_select_both',scriptLine:'In the Taxes tab, select '+choices.join(', then select ')+'. Let me know when you’ve selected both.',instructions:'Read these two approved tax selections, then stop and listen. Do not ask another tax-year confirmation.'};}
+function taxSelections(p){const observed=observedTaxTurn(p.prephub_live_status,p);if(observed)return observed;const values=p.client_reported_tax_years?.years||{},years=recentTaxYears(p).slice().sort((a,b)=>Number(values[b]===true)-Number(values[a]===true));const choices=years.map(y=>'“I have '+(values[y]===true?'filed ':'not filed ')+y+'”');return {stage:'tax_select_both',scriptLine:'In the Taxes tab, select '+choices.join(', then select ')+'. Let me know when you’ve selected both.',instructions:'Read these two approved tax selections, then stop and listen. Do not ask another tax-year confirmation.'};}
 function taxActionStart(p){return p.prephub_section_confirmed==='taxes'?taxSelections(p):{stage:'tax_section_navigation',scriptLine:sectionPrompt('taxes',p.prephub_live_status),instructions:'Guide the Taxes section by its actual heading. Do not repeat tax-year questions.'};}
 function completedTaxAction(words,stage){
  const s=String(words||'').toLowerCase().replace(/[’]/g,"'").replace(/\b(?:not a problem|no problem|no worries)\b/g,'');
@@ -32,13 +34,13 @@ function taxFlowTurn(stage,words,p,line){
  if(stage==='tax_assistant')return {stage:'tax_resources',instructions:'Briefly address the client reaction, then read the saved tax_resources block. Use only the fresh saved percentage if supplied; otherwise omit any numeric progress claim. Do not claim 100% is loan approval.' ,scriptLine:line('tax_resources',p)};
  if(stage==='tax_resources')return missing.length?say('tax_obstacle','Based on what we covered, you still need to file your '+missing.join(' and ')+' '+(missing.length===1?'return.':'returns.')+' If you don’t mind me asking, what’s been holding you back?'):say('callback_time','When you have time, you can upload your filed returns here so everything stays in one place. '+INVITE);
  if(stage==='tax_obstacle')return {stage:'tax_referral_offer',instructions:'Acknowledge their actual obstacle in one short sentence without tax advice, then ask the saved tax_referral_offer question. Do not add a new intake interview.',scriptLine:line('tax_referral_offer',p)};
- if(stage==='tax_referral_offer')return {...say('callback_time',(yes?'I’ll note your request for a tax-professional referral. ':'')+INVITE),...(yes?{referralRequest:true}:{})};
+ if(stage==='tax_referral_offer')return {...say('callback_time',(yes?'I’ll note your request for a tax-professional referral. ':'')+followupPurpose(p)+INVITE),...(yes?{referralRequest:true}:{})};
  return null;
 }
 function taxSavedTurn(output,p,line){
- const people=output.tax_progress?.people||[],expected=p.client_reported_tax_years?.years||{},match=Object.keys(expected).length===2&&people.length===1&&Object.entries(expected).every(([y,filed])=>people[0].years?.[y]===filed);
+ const observation=taxObservation(output,p),expected=p.client_reported_tax_years?.years||{},match=observation?.source==='saved'&&Object.keys(expected).length===2&&Object.entries(expected).every(([y,filed])=>observation.years[y]===filed);
  p.prephub_live_status=output;
- const acknowledgment=match?'Excellent. I can see those filing-status selections are saved. ':'';
+ const acknowledgment=match?'Excellent. I can see your filing-status selections are saved: '+selectionSummary(observation)+'. ':'';
  return {stage:'tax_assistant',scriptLine:acknowledgment+line('tax_assistant',p),instructions:'Render the saved assistant introduction and tie-down. Saved selections are client-reported, not IRS verification. No claim about unsaved clicks.'};
 }
 module.exports={completedTaxAction,taxActionStart,taxSelections,taxFlowTurn,taxSavedTurn,INVITE};

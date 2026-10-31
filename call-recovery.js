@@ -4,7 +4,7 @@ const terminal=s=>['completed','failed','no-answer','busy','canceled'].includes(
 function recoveryDecision(call){
  const p=call.payload||{},r=call.result||{},turns=call.transcript||[];
  if(p.disconnect_recovery_policy!==1||!terminal(call.status)||r.owner_ended_call||r.normal_end_requested||r.duration_wrapup||r.stop_calls||r.callback_schedule?.scheduled||r.outcome)return null;
- if(turns.some(t=>t.role==='client'&&/\b(?:stop calling|do not call|don't call|remove me|wrong number|goodbye|bye|have to go|got to go|need to go|can't talk|cannot talk|not interested)\b/i.test(t.text||'')))return null;
+ if(turns.some(t=>t.role==='client'&&/\b(?:stop calling|do not call|don't call|remove me|wrong number|goodbye|bye|hang up|getting off|come back when|come back whenever|return when|have to go|got to go|need to go|can't talk|cannot talk|not interested)\b/i.test(t.text||'')))return null;
  const recovery=p.disconnect_recovery;
  if(recovery?.attempt===1)return {policy:1,operation:'email',root_action_id:recovery.root_action_id};
  if(call.status!=='completed'&&call.status!=='failed')return null;
