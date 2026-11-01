@@ -1,10 +1,25 @@
-# PrepHub conversation pacing
+# PrepHub guided conversation handling
 
-Guided calls use server-directed opening turns: identity -> availability/recording -> inquiry confirmation -> email or PrepHub -> client questions -> preparation. Each request instructs one question and at most two short sentences, then waits for a client reply. Who-is-calling and busy/unclear answers do not automatically advance the opening. Guided mode disables VAD automatic response generation; an actual transcribed client turn requests the next response. Duplicate transcript events cannot advance the stages twice. Recording tool continuations do not request a new spoken response if the assistant already asked a question and is awaiting a reply. Existing recording, contact and stop controls remain.
+The saved script remains the authority for the opening, resource explanations, milestones and closing sequence. Runtime revision v27 adds a shared secondary interpreter for Credit and Taxes; it does not create a new script or rewrite the saved tax blocks.
 
-The site walkthrough uses the existing tab/field/save labels from DPAHelpCenter/prephub/index.html. It is reference knowledge, not a live screen-sharing or live workbook-reading tool. The assistant asks what the client sees and whether they saved; it cannot certify unsaved progress. General assistance information must remain qualified; no invented program amounts or eligibility decisions. A sent email is mentioned only if the client briefing contains supporting communication evidence.
+## Turn handling
 
-Voice settings remain a per-call snapshot from the CRM. The owner requested restoring Marin. No real calls are placed by tests.
+1. Respect explicit stop/end requests immediately. Keep identity, recording controls and recipient scope outside the secondary interpreter.
+2. Preview the existing script transition using a copy of runtime state. Straightforward accepted replies, valid tax-year evidence, required page reads and ordinary callback details keep the native path.
+3. Interpret mixed, negative, unclear or unexpected preparation replies through a bounded Responses request with strict structured output. Consider the current question, recent turns, the saved checkpoint, approved script/catalog and this recipient's reported/saved page facts. Interpret meaning and negation before keyword matches. Record offer decisions and follow-up ownership separately from the primary response action.
+4. The server applies an allowed conversational move: preserve the native turn, normalize an unambiguous answer, answer and return to the unfinished question, clarify, decline an optional offer, defer a task, hand off to the callback scheduler, read actual page status, or close. The interpreter has no database, enrollment, payment or outreach tools.
+5. Preserve the original checkpoint across clarification and interruptions. An explicit answer plus a question can advance once after answering; acknowledgment of an explanation alone must not complete an unrelated task. Declining a paid plan leaves the free preparation tools available. Existing tax help declines only the professional referral.
+6. Distinguish the client offering to call from requesting a Daisy callback. Respect the recorded preference unless the client changes it. Dates, time zones, booking confirmation and save results stay with the existing scheduler and authenticated tools. Questions during confirmation do not silently book an appointment.
+7. If interpretation fails, keep the checkpoint and ask a relevant clarification. Do not replay the price list or assume yes. After another failure offer to pause instead of repeating indefinitely. Discard late results after a newer client turn, stage change, disconnect or goodbye.
 
+## Script and evidence boundaries
 
-The next opening revision adds a rapport turn after identity: one cordial how-are-you question, then one brief acknowledgment and availability confirmation. It avoids counseling or probing personal problems. The saved caller setting enables a digital-assistant disclosure after availability/inquiry confirmation, followed by an accurate explanation of preparation guidance and agent follow-up requests. It never claims to handle everything or to have completed an unsupported action.
+- Credit sweep and tradeline assessment are separate topics. Use only the approved catalog and website guide; do not invent services or guaranteed outcomes.
+- Tax filing selections are client-reported, not IRS verification. Preserve the existing recent-two-year logic, selection/save walkthrough, resource block and follow-up.
+- A page read is read-only and scoped to the call recipient. Fresh status is required before claiming to see current saved work. Conversation output cannot claim to have sent, saved, booked, enrolled, charged or referred anything.
+- The unfinished conversational checkpoint, declined plan and follow-up ownership survive reconnect. Existing one-reconnect policy and polite provider hang-up remain in effect.
+- `result.conversation_handling` records the last interpretation action, original client quotation, script stage, resulting stage and latency or fallback status for review. Connection diagnostics remain separate from conversational evidence.
+
+## Verification
+
+Node tests exercise the real guided-call event path with mocked model/provider transports, including the last-call refusal, natural tax explanations, mixed answers, interruptions, callback ownership, failed interpretation, stale results and reconnect. They do not place customer calls or prove speech/model quality under real telephone conditions. A fresh owner test call validates the deployed behavior.
