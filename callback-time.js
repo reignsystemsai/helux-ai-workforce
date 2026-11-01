@@ -6,7 +6,8 @@ function callbackProposal(args,transcript,now=Date.now()){
  const at=Date.parse(args.callback_at),zone=String(args.timezone||''),quote=String(args.client_quote||'').trim();
  if(!/(Z|[+-]\d\d:\d\d)$/.test(String(args.callback_at))||!Number.isFinite(at)||at<now+60000||at>now+366*86400000)throw Error('Choose an exact future callback date and time, at least one minute from now');
  if(!quote||!(transcript||[]).some(t=>t.role==='client'&&String(t.text||'').includes(quote)))throw Error('Use the client’s actual requested time quotation');
- const label=new Intl.DateTimeFormat('en-US',{timeZone:zone,weekday:'long',month:'long',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}).format(at);
+ const spokenZone={'America/New_York':'Eastern time','America/Chicago':'Central time','America/Denver':'Mountain time','America/Los_Angeles':'Pacific time'}[zone];
+ const label=new Intl.DateTimeFormat('en-US',{timeZone:zone,weekday:'long',month:'long',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}).format(at).replace(/\b(?:EST|EDT|CST|CDT|MST|MDT|PST|PDT)$/,z=>spokenZone||z);
  return {callback_at:new Date(at).toISOString(),timezone:zone,request_quote:quote,label,confirmation_line:'I can call you on '+label+'. Is that correct?'};
 }
 function confirmedCallback(args,transcript){
