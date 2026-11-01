@@ -1,3 +1,4 @@
+// Tradeline facts: https://www.consumerfinance.gov/ask-cfpb/what-is-a-credit-report-en-309/ and https://www.myfico.com/credit-education/faq/scores/authorized-user
 'use strict';
 const {booleanReply,positiveReaction}=require('./reply-clarification');
 const {callbackZone}=require('./callback-relative');
@@ -25,21 +26,24 @@ function planQuestion(words){return /\b(?:plans?|pricing|prices?|cost|included|i
 function waitingForTeam(words){return /\b(?:wait|waiting|expect|expected|request(?:ed)?|somebody|someone|team|response|recorded|requested)\b/i.test(words)&&/\b(?:call|contact|follow.?up|recorded|requested|response)\b/i.test(words);}
 function noMoreQuestions(words){if(/^(?:no[,!. ]+)?(?:i (?:don't|do not) have (?:any|more) questions|that's (?:all|it)|everything's clear|i'm (?:good|all set))[.! ]*$/i.test(words))return true;return /^(?:(?:well|okay|ok|uh|um)[,!. ]+)*(?:no(?:pe)?(?:[,. ]+(?:thanks|thank you|that's all|that's it|i'm good|i'm all set))?|no (?:more )?questions|that.s (?:all|it)|all (?:set|clear)|nothing else|i (?:don't|do not) have (?:any|more) questions|everything.s clear|i.m good)[.! ]*$/i.test(words);}
 function supportPrompt(p,line){return {stage:'credit_support_offer',scriptLine:line('credit_support_offer',p)};}
+function milestoneFollowup(p){p.credit_milestone_offered=true;p.credit_next_step='gathering and uploading your credit reports';return {stage:'callback_time',scriptLine:'Before we wrap up, when would you like me to follow up on gathering and uploading your credit reports—maybe in a few days, a few weeks, or a month?'};}
 function creditFlowTurn(stage,words,p,line){
  const inCredit=stage.startsWith('credit_'),resume=stage==='callback_time'&&p.credit_active;
  if(!inCredit&&!resume)return null;if(stage==='credit_plans_questions')stage='credit_plan_questions';
  p.credit_active=true;
  const previousPlan=p.credit_selected_plan;
  const text=String(words||'').replace(/[’]/g,"'"),value=booleanReply(text),selected=planChoice(text),say=(next,scriptLine)=>({stage:next,scriptLine:scriptLine||line(next,p)});
- if(selected)p.credit_selected_plan=selected;
+ if(selected){p.credit_selected_plan=selected;p.credit_next_step='reviewing '+PLANS[selected].name+' with our team';}
  const overview=()=>say('credit_plan_questions',line('credit_plan_overview',p));
  const questions=()=>say('credit_plan_questions',line('credit_plans',p));
- const close=()=>({stage:'wrapup',finishOutcome:'completed',finishReason:p.credit_support_recorded?'Credit-plan team follow-up requested; client questions addressed':'Credit preparation options reviewed; no team follow-up requested',finishNextAction:p.credit_support_recorded?'Team: review '+(PLANS[p.credit_selected_plan]?.name||'credit preparation plans')+(p.credit_preferred_window?'; preferred contact: '+p.credit_preferred_window:''):'Client may return to self-guided credit preparation; no callback arranged',finishLine:'Thank you for your time. '+(p.credit_support_recorded?'Your credit-plan follow-up request is recorded. Our team will review the details with you. ':'You can return to PrepHub anytime to use the tools and review your preparation options. ')+'I look forward to helping you with your homebuyer preparation. Have a great day. Goodbye.'});
+ const close=()=>p.credit_milestone_pending&&!p.credit_milestone_offered?milestoneFollowup(p):({stage:'wrapup',finishOutcome:'completed',finishReason:p.credit_support_recorded?'Credit-plan team follow-up requested; client questions addressed':'Credit preparation options reviewed; no team follow-up requested',finishNextAction:p.credit_support_recorded?'Team: review '+(PLANS[p.credit_selected_plan]?.name||'credit preparation plans')+(p.credit_preferred_window?'; preferred contact: '+p.credit_preferred_window:''):'Client may return to self-guided credit preparation; no callback arranged',finishLine:'Thank you for your time. '+(p.credit_support_recorded?'Your credit-plan follow-up request is recorded. Our team will review the details with you. ':'You can return to PrepHub anytime to use the tools and review your preparation options. ')+'I look forward to helping you with your homebuyer preparation. Have a great day. Goodbye.'});
  const checkRequest=()=>{p.credit_request_quote=text;return {stage:'credit_request_check',requiredTool:'get_prephub_status'};};
  // A genuine request to end this conversation or arrange a Daisy callback still uses the shared handlers.
  if(!['credit_team_timing','credit_team_zone','credit_team_date_choice','credit_team_clock'].includes(stage)&&/\b(?:call me back|give me a call back|call back later|another time|can.t talk|cannot talk|have to go|need to go)\b/i.test(text)&&!waitingForTeam(text)&&!planQuestion(text)&&!lowEffort(text))return null;
  if(waitingForTeam(text)&&!['credit_team_timing','credit_team_zone','credit_team_date_choice','credit_team_clock'].includes(stage))return p.credit_support_recorded&&stage==='credit_handoff_questions'?say('credit_team_timing'):checkRequest();
  if(resume){if(!planQuestion(text)&&!lowEffort(text)&&! /\b(?:right now|keep going|talk about it now)\b/i.test(text))return null;stage='credit_plan_questions';}
+ if(/trade[ -]?line/i.test(text)&&/\?|what|why|how|benefit|do for|adding/i.test(text)){return say('credit_tradeline_answer','A tradeline is a credit account on your report, such as a card or loan. Its payment history, balance, credit limit and age can affect your credit profile. A well-managed authorized-user account can help build history, while negative account information can hurt. Adding one does not guarantee a higher score or mortgage approval. The plan assesses your profile; it does not include buying a tradeline. Does that answer your question?');}
+ if(stage==='credit_tradeline_answer'){if(value===true||positiveReaction(text))return say(p.credit_support_recorded?'credit_handoff_questions':'credit_plan_questions','What else would you like to know about the plan?');stage='credit_plan_questions';}
  if(stage==='credit_intro'){
   if(value===true||positiveReaction(text)||/sounds helpful|go ahead|tell me more/i.test(text))return say('credit_overview');
   if(value===false)return questions();
@@ -62,8 +66,8 @@ function creditFlowTurn(stage,words,p,line){
   if(/\b(?:not interested|do it myself|work through it myself)\b/i.test(text))return say('credit_close_offer','No problem. You can use the preparation tools yourself. Would you like Daisy to follow up on your next preparation step?');
   if(/\b(?:right now|keep going|talk about it now|more information|more info|tell me more)\b/i.test(text)&&!selected&&!lowEffort(text))return overview();
   if(lowEffort(text))return say('credit_plan_questions','For more personal support, Agent Review + Plan includes a personal report and profile review, while the First-Time Homebuyer Credit Pathway includes guided preparation and progress checkpoints. Credit Sweep + Tradeline Assessment includes specialist dispute assistance for specific inaccuracies. You’ll still need to provide information and review decisions. Our team can confirm the service scope before you start. Which of those plans would you like to discuss?');
-  if(selected&&p.credit_support_recorded&&selected===previousPlan)return say('credit_handoff_questions',planFacts(selected)+' What other questions can I answer before we arrange the team follow-up?');
-  if(selected){p.credit_next_step='reviewing '+PLANS[selected].name+' with our team';return say('credit_request_button',planFacts(selected)+' If you’d like the team to discuss it with you, click “I Want to Start This Plan.” That records a follow-up request, not enrollment or payment. Let me know when it says “Requested.”');}
+  if(selected&&p.credit_support_recorded&&selected===(p.credit_saved_plan_key||previousPlan))return say('credit_handoff_questions',planFacts(selected)+' What other questions can I answer before we arrange the team follow-up?');
+  if(selected){if(p.credit_support_recorded&&selected!==(p.credit_saved_plan_key||previousPlan)){p.credit_plan_change_pending=true;p.credit_support_recorded=false;}p.credit_next_step='reviewing '+PLANS[selected].name+' with our team';return say('credit_request_button',planFacts(selected)+' If you’d like the team to discuss it with you, click “I Want to Start This Plan.” Let me know when it says “Requested.”');}
   if(/\b(?:guarantee|how (?:fast|long)|months?|score|rapid|repair|delete|coaching|top tier)\b/i.test(text))return say('credit_plan_questions','The plans list specific preparation and review services. There is no guaranteed score increase, deletion or completion timeline. Our goal is to help you address the next homebuying milestone. Which named plan would you like me to explain?');
   if(planQuestion(text))return overview();
   if(stage==='credit_support_offer'&&(value===true||/\b(?:please do|have.{0,20}team|contact me|reach out|interested)\b/i.test(text)&&! /\b(?:not|don't|do not|maybe|not sure)\b/i.test(text))){p.credit_support_recorded=true;return {...say('credit_handoff_questions','I’ll record your interest and request a team follow-up. What other questions can I answer about the plans before we wrap up?'),creditInterest:{requested:true,fulfilled:false,plan_key:p.credit_selected_plan||null,client_quote:text,request_prompt:line('credit_support_offer',p),source:'client_confirmation'}};}
@@ -73,7 +77,7 @@ function creditFlowTurn(stage,words,p,line){
  }
  if(stage==='credit_handoff_questions'){
   if(noMoreQuestions(text)||value===false)return say('credit_team_timing');
-  if(planQuestion(text)||lowEffort(text)){stage='credit_plan_questions';return creditFlowTurn(stage,text,p,line);}
+  if(planQuestion(text)||lowEffort(text)){p.credit_selected_plan=previousPlan;stage='credit_plan_questions';return creditFlowTurn(stage,text,p,line);}
   return say(stage,'What other question can I answer about the plan before we arrange the team follow-up?');
  }
  if(stage==='credit_team_timing'){
@@ -101,12 +105,12 @@ function creditFlowTurn(stage,words,p,line){
   return say('credit_team_zone','What time zone are you in, so I can include it with your preferred contact time?');
  }
  if(stage==='credit_team_zone'){const zone=callbackZone(text);if(!zone)return say(stage,'What city and state are you in? I can use that to identify the time zone.');return {...close(),creditTiming:{preferred_window:p.credit_preferred_window||'Not specified',window_quote:p.credit_preferred_window||'',timezone:zone,timezone_quote:text,date_quote:p.credit_date_quote||null,preferred_date:p.credit_selected_date?.date||null,time_quote:p.credit_clock_quote||null,appointment_confirmed:false}};}
- if(stage==='credit_close_offer'){if(value===false||noMoreQuestions(text))return close();if(value===true)return say('callback_time',line('credit_followup',p));if(planQuestion(text)||lowEffort(text))return creditFlowTurn('credit_plan_questions',text,p,line);return say(stage,'Would you like a follow-up call, or would you prefer to return to PrepHub on your own?');}
+ if(stage==='credit_close_offer'){if(value===false||noMoreQuestions(text)){p.credit_milestone_offered=true;return close();}if(value===true){p.credit_milestone_offered=true;return say('callback_time',line('credit_followup',p));}if(planQuestion(text)||lowEffort(text))return creditFlowTurn('credit_plan_questions',text,p,line);return say(stage,'Would you like a follow-up call, or would you prefer to return to PrepHub on your own?');}
  return questions();
 }
 function creditRequestTurn(output,p,line){
  const request=output?.credit_plan_request,key=request?.plan_key;
- if(request?.status==='follow_up_needed'&&PLANS[key]&&(!p.credit_selected_plan||p.credit_selected_plan===key)){p.credit_selected_plan=key;p.credit_support_recorded=true;p.credit_next_step='reviewing '+PLANS[key].name+' with our team';return {stage:'credit_handoff_questions',scriptLine:'I can see your request for '+PLANS[key].name+' is saved. That is a request for a team follow-up, not enrollment or payment. The team can go over the details with you. What questions can I answer before we wrap up?',creditInterest:{requested:true,fulfilled:false,plan_key:key,client_quote:p.credit_request_quote||'',source:'saved_plan_request',requested_at:request.requested_at}};}
+ if(request?.status==='follow_up_needed'&&PLANS[key]&&(!p.credit_selected_plan||p.credit_selected_plan===key)){p.credit_selected_plan=key;p.credit_saved_plan_key=key;p.credit_support_recorded=true;p.credit_plan_change_pending=false;p.credit_milestone_pending=(output.steps||[]).some(s=>s.id==='reports'&&!['recorded','saved_complete'].includes(s.status));p.credit_next_step='reviewing '+PLANS[key].name+' with our team';return {stage:'credit_handoff_questions',scriptLine:'I can see your request for '+PLANS[key].name+' is saved. The team can go over the details with you. What questions can I answer before we wrap up?',creditInterest:{requested:true,fulfilled:false,plan_key:key,client_quote:p.credit_request_quote||'',source:'saved_plan_request',requested_at:request.requested_at}};}
  return {stage:'credit_support_offer',scriptLine:'I couldn’t verify a saved plan request yet. '+line('credit_support_offer',p)};
 }
-module.exports={PLANS,BLOCKS,creditFlowTurn,creditRequestTurn,planChoice,lowEffort,waitingForTeam};
+module.exports={milestoneFollowup,PLANS,BLOCKS,creditFlowTurn,creditRequestTurn,planChoice,lowEffort,waitingForTeam};
