@@ -1,6 +1,7 @@
 'use strict';
 const {booleanReply,positiveReaction}=require('./reply-clarification');
 const {callbackZone}=require('./callback-relative');
+const {callbackSuggestions}=require('./callback-suggestions');
 const PLANS={self:{name:'Instant Prep Plan',price:'$49.97',includes:['Credit preparation priorities','DTI and student loan questions','Home affordability snapshot','Next-step checklist']},review:{name:'Agent Review + Plan',price:'$97',includes:['Everything in the preparation plan','Report and profile review','Priorities explained in plain language','Questions for your lender']},full:{name:'First-Time Homebuyer Credit Pathway',price:'$249',includes:['Personalized homebuyer roadmap','Credit, DTI and student loan priorities','Credit and affordability preparation','Follow-up and progress checkpoints']},sweep:{name:'Credit Sweep + Tradeline Assessment',price:'$599',includes:['Review of inaccurate or unverifiable items','Specialist dispute assistance','Tradeline profile assessment','Homebuying impact and next steps']}};
 const BLOCKS={
  credit_intro:'{first_name}, credit can be a major hurdle when you’re preparing to buy your first home. PrepHub connects your credit preparation to that homebuying goal. I’ll be working alongside you as your personal PrepHub first-time homebuyer preparation assistant. Our focus is helping you understand the next step and keep moving toward a home. Does that sound helpful?',
@@ -36,8 +37,8 @@ function creditFlowTurn(stage,words,p,line){
  const close=()=>({stage:'wrapup',finishOutcome:'completed',finishReason:p.credit_support_recorded?'Credit-plan team follow-up requested; client questions addressed':'Credit preparation options reviewed; no team follow-up requested',finishNextAction:p.credit_support_recorded?'Team: review '+(PLANS[p.credit_selected_plan]?.name||'credit preparation plans')+(p.credit_preferred_window?'; preferred contact: '+p.credit_preferred_window:''):'Client may return to self-guided credit preparation; no callback arranged',finishLine:'Thank you for your time. '+(p.credit_support_recorded?'Your credit-plan follow-up request is recorded. Our team will review the details with you. ':'You can return to PrepHub anytime to use the tools and review your preparation options. ')+'I look forward to helping you with your homebuyer preparation. Have a great day. Goodbye.'});
  const checkRequest=()=>{p.credit_request_quote=text;return {stage:'credit_request_check',requiredTool:'get_prephub_status'};};
  // A genuine request to end this conversation or arrange a Daisy callback still uses the shared handlers.
- if(!['credit_team_timing','credit_team_zone'].includes(stage)&&/\b(?:call me back|give me a call back|call back later|another time|can.t talk|cannot talk|have to go|need to go)\b/i.test(text)&&!waitingForTeam(text)&&!planQuestion(text)&&!lowEffort(text))return null;
- if(waitingForTeam(text)&&!['credit_team_timing','credit_team_zone'].includes(stage))return p.credit_support_recorded&&stage==='credit_handoff_questions'?say('credit_team_timing'):checkRequest();
+ if(!['credit_team_timing','credit_team_zone','credit_team_date_choice','credit_team_clock'].includes(stage)&&/\b(?:call me back|give me a call back|call back later|another time|can.t talk|cannot talk|have to go|need to go)\b/i.test(text)&&!waitingForTeam(text)&&!planQuestion(text)&&!lowEffort(text))return null;
+ if(waitingForTeam(text)&&!['credit_team_timing','credit_team_zone','credit_team_date_choice','credit_team_clock'].includes(stage))return p.credit_support_recorded&&stage==='credit_handoff_questions'?say('credit_team_timing'):checkRequest();
  if(resume){if(!planQuestion(text)&&!lowEffort(text)&&! /\b(?:right now|keep going|talk about it now)\b/i.test(text))return null;stage='credit_plan_questions';}
  if(stage==='credit_intro'){
   if(value===true||positiveReaction(text)||/sounds helpful|go ahead|tell me more/i.test(text))return say('credit_overview');
@@ -76,13 +77,30 @@ function creditFlowTurn(stage,words,p,line){
   return say(stage,'What other question can I answer about the plan before we arrange the team follow-up?');
  }
  if(stage==='credit_team_timing'){
+  if(/^(?:maybe(?: i(?:'ll| will)?)?|i(?:'ll| will)|let me think)[.! ]*$/i.test(text))return {stage,hold:true};
+  const options=callbackSuggestions('Call me back '+text.replace(/\b(few|couple)[, ]+\1\b/gi,'$1'),Date.now(),callbackZone(text)||p.credit_team_timezone||'America/New_York');if(options?.kind==='dates'){p.credit_contact_options=options.options;p.credit_original_window=text;p.credit_preferred_window=text;return say('credit_team_date_choice','Would '+options.options.map(o=>o.label).join(' or ')+' work better for the team follow-up?');}
   if(planQuestion(text)||lowEffort(text))return creditFlowTurn('credit_plan_questions',text,p,line);
   if(/\b(?:not sure|don.t know|do not know|anytime|any time|whenever)\b/i.test(text)){p.credit_preferred_window=text;return {...close(),creditTiming:{preferred_window:text,window_quote:text,timezone:null,appointment_confirmed:false}};}
-  if(!/\b(?:today|tomorrow|next|week|month|day|morning|afternoon|evening|tonight|after|before|around|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\d/i.test(text))return say(stage,line('credit_team_timing',p));
+  if(!/\b(?:today|tomorrow|next|weeks?|months?|days?|hours?|minutes?|morning|afternoon|evening|tonight|after|before|around|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\d/i.test(text))return say(stage,line('credit_team_timing',p));
   p.credit_preferred_window=text;const zone=callbackZone(text);if(zone)return {...close(),creditTiming:{preferred_window:text,window_quote:text,timezone:zone,appointment_confirmed:false}};
   return say('credit_team_zone','What time zone are you in, so I can include that with your preferred contact time?');
  }
- if(stage==='credit_team_zone'){const zone=callbackZone(text);if(!zone)return say(stage,'What city and state are you in? I can use that to identify the time zone.');return {...close(),creditTiming:{preferred_window:p.credit_preferred_window||'Not specified',window_quote:p.credit_preferred_window||'',timezone:zone,timezone_quote:text,appointment_confirmed:false}};}
+ if(stage==='credit_team_date_choice'){
+  const revised=callbackSuggestions('Call me back '+text.replace(/\b(few|couple)[, ]+\1\b/gi,'$1'),Date.now(),callbackZone(text)||'America/New_York');if(revised?.kind==='dates'){p.credit_contact_options=revised.options;p.credit_original_window=text;p.credit_preferred_window=text;return say(stage,'Would '+revised.options.map(o=>o.label).join(' or ')+' work better?');}
+  if(/^(?:maybe(?: i(?:'ll| will)?)?|i(?:'ll| will)|let me think)[.! ]*$/i.test(text))return {stage,hold:true};
+  const choices=p.credit_contact_options||[],matches=choices.filter((o,i)=>{const date=new Date(o.date+'T12:00:00Z'),long=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',day:'numeric'}).format(date).toLowerCase(),short=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'short',day:'numeric'}).format(date).toLowerCase();return text.toLowerCase().includes(o.date)||text.toLowerCase().includes(long)||text.toLowerCase().includes(short)||text.toLowerCase().includes(o.label.split(',')[0].toLowerCase())||new RegExp('\\b'+(i===0?'first':'second')+'\\b','i').test(text);}),selected=matches.length===1?matches[0]:null;
+  if(selected){p.credit_selected_date=selected;p.credit_date_quote=text;return say('credit_team_clock','What time would you prefer on '+selected.label+'?');}
+  const prefix=/just told|already (?:said|told)|few weeks|couple (?:of )?weeks/i.test(text)?'You said '+(p.credit_original_window||'a few weeks')+'. ':'';
+  return say(stage,prefix+'Would '+choices.map(o=>o.label).join(' or ')+' work better?');
+ }
+ if(stage==='credit_team_clock'){
+  if(/^(?:maybe(?: i(?:'ll| will)?)?|let me think)[.! ]*$/i.test(text))return {stage,hold:true};
+  if(planQuestion(text))return creditFlowTurn('credit_plan_questions',text,p,line);
+  if(!/\d|\b(?:morning|afternoon|evening|noon|anytime|any time|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/i.test(text))return say(stage,'What time of day would you prefer?');
+  p.credit_clock_quote=text;p.credit_preferred_window=(p.credit_selected_date?.label||'Preferred date')+'; '+text;const zone=callbackZone(text);if(zone)return {...close(),creditTiming:{preferred_window:p.credit_preferred_window,window_quote:p.credit_original_window,date_quote:p.credit_date_quote,preferred_date:p.credit_selected_date?.date,time_quote:text,timezone:zone,appointment_confirmed:false}};
+  return say('credit_team_zone','What time zone are you in, so I can include it with your preferred contact time?');
+ }
+ if(stage==='credit_team_zone'){const zone=callbackZone(text);if(!zone)return say(stage,'What city and state are you in? I can use that to identify the time zone.');return {...close(),creditTiming:{preferred_window:p.credit_preferred_window||'Not specified',window_quote:p.credit_preferred_window||'',timezone:zone,timezone_quote:text,date_quote:p.credit_date_quote||null,preferred_date:p.credit_selected_date?.date||null,time_quote:p.credit_clock_quote||null,appointment_confirmed:false}};}
  if(stage==='credit_close_offer'){if(value===false||noMoreQuestions(text))return close();if(value===true)return say('callback_time',line('credit_followup',p));if(planQuestion(text)||lowEffort(text))return creditFlowTurn('credit_plan_questions',text,p,line);return say(stage,'Would you like a follow-up call, or would you prefer to return to PrepHub on your own?');}
  return questions();
 }
