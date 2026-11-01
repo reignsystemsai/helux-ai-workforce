@@ -1,12 +1,13 @@
 const {callbackZone}=require('./callback-relative');
 'use strict';
-function normalizeAffirmation(value){return String(value||'').trim().replace(/^(?:(?:oh|um|uh(?![ -]*(?:huh|uh)\b)|ah|well)[,!. ]+)+/i,'').replace(/^(?:uh[ -]*huh|mhm|mm[ -]*hmm)\b/i,'Yes');}
+function normalizeAffirmation(value){return String(value||'').trim().replace(/^(?:(?:oh|um|uh(?![ -]*(?:huh|uh)\b)|ah|well)[,!. ]+)+/i,'').replace(/^(?:that (?:was|is)|it (?:was|is)) (?:a )?(yes|no)\b/i,'$1').replace(/^(?:uh[ -]*huh|mhm|mm[ -]*hmm)\b/i,'Yes');}
 function callbackAffirmative(value){const s=normalizeAffirmation(value).replace(/^(?:oh|um|uh)[, ]+/i,'');return /^(?:yes|yeah|yep|yup|sure|okay|ok|correct|absolutely|that (?:works|is fine|sounds good)|sounds good|perfect|please do|go ahead)\b/i.test(s)&&!/\b(?:not|don.t|do not|no|wait|but|instead|actually)\b/i.test(s);}
 function callbackProposal(args,transcript,now=Date.now()){
  const at=Date.parse(args.callback_at),zone=String(args.timezone||''),quote=String(args.client_quote||'').trim();
  if(!/(Z|[+-]\d\d:\d\d)$/.test(String(args.callback_at))||!Number.isFinite(at)||at<now+60000||at>now+366*86400000)throw Error('Choose an exact future callback date and time, at least one minute from now');
  if(!quote||!(transcript||[]).some(t=>t.role==='client'&&String(t.text||'').includes(quote)))throw Error('Use the client’s actual requested time quotation');
  const spokenZone={'America/New_York':'Eastern time','America/Chicago':'Central time','America/Denver':'Mountain time','America/Los_Angeles':'Pacific time'}[zone];
+ const zoneConfirmed=(transcript||[]).some((t,i,all)=>t.role==='client'&&(callbackZone(t.text)===zone||callbackAffirmative(t.text)&&all[i-1]?.role==='daisy'&&callbackZone(all[i-1].text)===zone));if(!zoneConfirmed)throw Error('Ask the client what time zone they are in before preparing a callback confirmation');
  const label=new Intl.DateTimeFormat('en-US',{timeZone:zone,weekday:'long',month:'long',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}).format(at).replace(/\b(?:EST|EDT|CST|CDT|MST|MDT|PST|PDT)$/,z=>spokenZone||z);
  return {callback_at:new Date(at).toISOString(),timezone:zone,request_quote:quote,label,confirmation_line:'I can call you on '+label+'. Is that correct?'};
 }
