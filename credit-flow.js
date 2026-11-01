@@ -27,12 +27,36 @@ function waitingForTeam(words){return /\b(?:wait|waiting|expect|expected|request
 function noMoreQuestions(words){if(/^(?:no[,!. ]+)?(?:i (?:don't|do not) have (?:any|more) questions|that's (?:all|it)|everything's clear|i'm (?:good|all set))[.! ]*$/i.test(words))return true;return /^(?:(?:well|okay|ok|uh|um)[,!. ]+)*(?:no(?:pe)?(?:[,. ]+(?:thanks|thank you|that's all|that's it|i'm good|i'm all set))?|no (?:more )?questions|that.s (?:all|it)|all (?:set|clear)|nothing else|i (?:don't|do not) have (?:any|more) questions|everything.s clear|i.m good)[.! ]*$/i.test(words);}
 function supportPrompt(p,line){return {stage:'credit_support_offer',scriptLine:line('credit_support_offer',p)};}
 function milestoneFollowup(p){p.credit_milestone_offered=true;p.credit_next_step='gathering and uploading your credit reports';return {stage:'callback_time',scriptLine:'Before we wrap up, when would you like me to follow up on gathering and uploading your credit reports—maybe in a few days, a few weeks, or a month?'};}
+// Sweep scope follows the saved plan catalog; accurate-current information is not promised removable.
+// https://www.consumerfinance.gov/ask-cfpb/how-long-does-information-stay-on-my-credit-report-en-323/
+const SWEEP_GUIDANCE='The sweep reviews reporting errors and helps dispute specific inaccuracies. For bankruptcies, student loans, derogatory accounts and late payments, the review checks whether the reporting is inaccurate or unverifiable. It does not erase accurate records or cancel student loan debt. Our team needs to review your reports to confirm which items it can address.';
+function creditQuestionTurn(stage,text,p){
+ const correcting=/didn.t (?:really )?answer|did not answer|not (?:what|the question)|why are you talking|stop talking|i (?:was )?(?:asked|asking)|i meant/i.test(text);
+ const fullPlan=/credit (?:sweep(?:ing)?|suite).{0,25}trade[ -]?line.{0,20}(?:assessment|system|plan)/i.test(text);
+ const explicitTradeline=/what.{0,25}trade[ -]?line.{0,25}(?:do|help|benefit)|how.{0,30}trade[ -]?line|(?:explain|tell me about) (?:a |the )?trade[ -]?line|adding.{0,15}trade[ -]?line/i.test(text)||!fullPlan&&/trade[ -]?line/i.test(text)&&/details|information|about|explain|tell|what|why|how|benefit|help|\?/i.test(text);
+ if(fullPlan&&/\b(?:switch|choose|select|want to start|go with|sign me up)\b/i.test(text))return null;
+ const shortFeature=['credit_plan_detail','credit_sweep_answer','credit_tradeline_answer'].includes(stage);
+ const sweepQuestion=shortFeature&&/^(?:the )?(?:credit )?sweeps?[.! ]*$/i.test(text)||(!fullPlan&&/\bsweeps?\b/i.test(text)&&/what|how|does|do|help|explain|tell|\?/i.test(text))||/bankrupt|student loans?|derogator|late payments?|negative items?/i.test(text);
+ const correctedSweep=correcting&&(p.credit_question_topic==='sweep'||/sweep/i.test(text)||/why are you talking.{0,20}trade[ -]?line/i.test(text));
+ const both=/\bsweeps?\b/i.test(text)&&/trade[ -]?line/i.test(text)&&(/both|difference|versus|\bvs\b|compare/i.test(text)||!fullPlan&&/sweeps? and trade/i.test(text));
+ let topic=both?'both':correctedSweep||sweepQuestion?'sweep':explicitTradeline||shortFeature&&/^(?:the )?trade[ -]?lines?(?: assessment)?[.! ]*$/i.test(text)?'tradeline':fullPlan?'plan':null;
+ if(!topic&&correcting&&p.credit_question_topic)topic=p.credit_question_topic;
+ if(!topic)return null;
+ if(!['credit_tradeline_answer','credit_sweep_answer','credit_plan_detail'].includes(stage))p.credit_question_return_stage=stage;
+ p.credit_question_topic=topic;p.credit_question_text=text;
+ if(topic==='both')return {stage:'credit_sweep_answer',scriptLine:'They are separate. The credit sweep reviews report inaccuracies and provides assistance disputing specific errors. The tradeline assessment reviews how credit accounts and their history affect your profile; it does not include purchasing an account. Neither guarantees removal or a score increase. Which would you like more detail on?'};
+ if(topic==='sweep')return {stage:'credit_sweep_answer',scriptLine:(correcting?'You’re asking about the sweep itself. ':'')+SWEEP_GUIDANCE+' Does that clarify what the sweep does?'};
+ if(topic==='tradeline')return {stage:'credit_tradeline_answer',scriptLine:'A tradeline is a credit account on your report, such as a card or loan. Its payment history, balance, credit limit and age can affect your credit profile. An authorized-user account can help or hurt, depending on its history; improvement is not guaranteed. The plan assesses your profile and does not include buying a tradeline. Does that answer your question?'};
+ p.credit_selected_plan='sweep';p.credit_next_step='reviewing '+PLANS.sweep.name+' with our team';
+ return {stage:'credit_plan_detail',scriptLine:planFacts('sweep')+' Which part would you like to explore—the credit sweep or the tradeline assessment?'};
+}
 function creditFlowTurn(stage,words,p,line){
  const inCredit=stage.startsWith('credit_'),resume=stage==='callback_time'&&p.credit_active;
  if(!inCredit&&!resume)return null;if(stage==='credit_plans_questions')stage='credit_plan_questions';
  p.credit_active=true;
  const previousPlan=p.credit_selected_plan;
  const text=String(words||'').replace(/[’]/g,"'"),value=booleanReply(text),selected=planChoice(text),say=(next,scriptLine)=>({stage:next,scriptLine:scriptLine||line(next,p)});
+ const questionTurn=creditQuestionTurn(stage,text,p);if(questionTurn)return questionTurn;
  if(selected){p.credit_selected_plan=selected;p.credit_next_step='reviewing '+PLANS[selected].name+' with our team';}
  const overview=()=>say('credit_plan_questions',line('credit_plan_overview',p));
  const questions=()=>say('credit_plan_questions',line('credit_plans',p));
@@ -42,8 +66,13 @@ function creditFlowTurn(stage,words,p,line){
  if(!['credit_team_timing','credit_team_zone','credit_team_date_choice','credit_team_clock'].includes(stage)&&/\b(?:call me back|give me a call back|call back later|another time|can.t talk|cannot talk|have to go|need to go)\b/i.test(text)&&!waitingForTeam(text)&&!planQuestion(text)&&!lowEffort(text))return null;
  if(waitingForTeam(text)&&!['credit_team_timing','credit_team_zone','credit_team_date_choice','credit_team_clock'].includes(stage))return p.credit_support_recorded&&stage==='credit_handoff_questions'?say('credit_team_timing'):checkRequest();
  if(resume){if(!planQuestion(text)&&!lowEffort(text)&&! /\b(?:right now|keep going|talk about it now)\b/i.test(text))return null;stage='credit_plan_questions';}
- if(/trade[ -]?line/i.test(text)&&/\?|what|why|how|benefit|do for|adding|explain|tell me|about/i.test(text)){return say('credit_tradeline_answer','A tradeline is a credit account on your report, such as a card or loan. Its payment history, balance, credit limit and age can affect your credit profile. A well-managed authorized-user account can help build history, while negative account information can hurt. Adding one does not guarantee a higher score or mortgage approval. The plan assesses your profile; it does not include buying a tradeline. Does that answer your question?');}
- if(stage==='credit_tradeline_answer'){if(value===true||positiveReaction(text))return say(p.credit_support_recorded?'credit_handoff_questions':'credit_plan_questions','What else would you like to know about the plan?');stage='credit_plan_questions';}
+ if(['credit_tradeline_answer','credit_sweep_answer','credit_plan_detail'].includes(stage)){
+  if(stage==='credit_plan_detail'&&/^(?:the )?(?:credit )?sweep[.! ]*$/i.test(text))return creditQuestionTurn(stage,'What does the sweep do?',p);
+  if(stage==='credit_plan_detail'&&/^(?:the )?trade[ -]?line(?: assessment)?[.! ]*$/i.test(text))return creditQuestionTurn(stage,'What does a tradeline do?',p);
+  if(value===true||positiveReaction(text)||noMoreQuestions(text))return say(p.credit_support_recorded?'credit_handoff_questions':'credit_plan_questions','What other questions can I answer about the plan?');
+  if(/what|how|why|\?/i.test(text))return say(stage,'Which part would you like me to clarify?');
+  stage='credit_plan_questions';
+ }
  if(stage==='credit_intro'){
   if(value===true||positiveReaction(text)||/sounds helpful|go ahead|tell me more/i.test(text))return say('credit_overview');
   if(value===false)return questions();
@@ -113,4 +142,4 @@ function creditRequestTurn(output,p,line){
  if(request?.status==='follow_up_needed'&&PLANS[key]&&(!p.credit_selected_plan||p.credit_selected_plan===key)){p.credit_selected_plan=key;p.credit_saved_plan_key=key;p.credit_support_recorded=true;p.credit_plan_change_pending=false;p.credit_milestone_pending=(output.steps||[]).some(s=>s.id==='reports'&&!['recorded','saved_complete'].includes(s.status));p.credit_next_step='reviewing '+PLANS[key].name+' with our team';return {stage:'credit_handoff_questions',scriptLine:'I can see your request for '+PLANS[key].name+' is saved. The team can go over the details with you. What questions can I answer before we wrap up?',creditInterest:{requested:true,fulfilled:false,plan_key:key,client_quote:p.credit_request_quote||'',source:'saved_plan_request',requested_at:request.requested_at}};}
  return {stage:'credit_support_offer',scriptLine:'I couldn’t verify a saved plan request yet. '+line('credit_support_offer',p)};
 }
-module.exports={milestoneFollowup,PLANS,BLOCKS,creditFlowTurn,creditRequestTurn,planChoice,lowEffort,waitingForTeam};
+module.exports={SWEEP_GUIDANCE,creditQuestionTurn,milestoneFollowup,PLANS,BLOCKS,creditFlowTurn,creditRequestTurn,planChoice,lowEffort,waitingForTeam};
