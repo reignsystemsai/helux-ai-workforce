@@ -8,7 +8,7 @@ const twilio=require('twilio');
 const tick=async()=>{for(let n=0;n<8;n++)await new Promise(resolve=>setImmediate(resolve));};
 
 test('real media handler enforces priority-first saves and automatically dials after announcement playback',async()=>{
- const routes=new Map(),updates=[],aiSessions=[],events=[],phoneMessages=[];let holdIntake=true,releaseWrite;
+ const routes=new Map(),updates=[],aiSessions=[],events=[],phoneMessages=[],recordingRequests=[];let holdIntake=true,releaseWrite;
  const phone=new EventEmitter();phone.readyState=1;phone.send=raw=>phoneMessages.push(JSON.parse(raw));phone.close=()=>{};
  class FakeAI extends EventEmitter{constructor(){super();this.readyState=1;this.sent=[];aiSessions.push(this);}send(raw){this.sent.push(JSON.parse(raw));}close(){this.readyState=3;}}
  FakeAI.OPEN=1;
@@ -16,12 +16,12 @@ test('real media handler enforces priority-first saves and automatically dials a
  const moduleObject={exports:{}};
  const sandbox={module:moduleObject,exports:moduleObject.exports,require:name=>name==='ws'?FakeAI:require(name),Buffer,URL,AbortSignal,console,setTimeout,clearTimeout,fetch:async(url,options)=>{
   const event=JSON.parse(options.body);events.push(event);if(event.kind==='intake'&&holdIntake)return await new Promise(resolve=>{releaseWrite=()=>resolve({ok:true,json:async()=>({ok:true})});});
-  return {ok:true,json:async()=>event.kind==='probe'?{ok:true,transfer_phone:'+12025550199'}:event.kind==='context'?{ok:true,context:{direction:'inbound',script_id:'intake',phone:'+12025550123',custom_script:'Collect name then ZIP. Offer an optional specialist transfer.'}}:{ok:true}};
+  return {ok:true,json:async()=>event.kind==='probe'?{ok:true,transfer_phone:'+12025550199',test_recording_phone:'+12025550123'}:event.kind==='context'?{ok:true,context:{direction:'inbound',script_id:'intake',phone:'+12025550123',custom_script:'Collect name then ZIP. Offer an optional specialist transfer.'}}:{ok:true}};
  }};
  vm.runInNewContext(fs.readFileSync(require.resolve('./index'),'utf8'),sandbox);
  let keyRow;
  const numbers=()=>({update:async()=>{}});numbers.list=async()=>[{sid:'PNded2efa63292b8210420f5711248e0bb'}];
- const bridge=moduleObject.exports.registerMedicareVoice({app:{get:(p,...h)=>routes.set('GET '+p,h.at(-1)),post:(p,...h)=>routes.set('POST '+p,h.at(-1))},pool:{query:async(sql,args)=>{if(sql.startsWith('INSERT INTO medicare_bridge_signing_keys'))keyRow={private_jwk:args[1],public_jwk:args[2]};return {rows:sql.startsWith('SELECT private_jwk')?[keyRow]:[]};}},twilioClient:{incomingPhoneNumbers:numbers,calls:()=>({update:async value=>updates.push(value)})},authToken:'test-token',accountSid:'ACtest',publicBaseUrl:'https://voice.example',openaiKey:'test',voice:'marin',model:'test'});
+ const bridge=moduleObject.exports.registerMedicareVoice({app:{get:(p,...h)=>routes.set('GET '+p,h.at(-1)),post:(p,...h)=>routes.set('POST '+p,h.at(-1))},pool:{query:async(sql,args)=>{if(sql.startsWith('INSERT INTO medicare_bridge_signing_keys'))keyRow={private_jwk:args[1],public_jwk:args[2]};return {rows:sql.startsWith('SELECT private_jwk')?[keyRow]:[]};}},twilioClient:{incomingPhoneNumbers:numbers,calls:()=>({update:async value=>updates.push(value),recordings:{create:async options=>{recordingRequests.push(options);return {sid:'RE'+'1'.repeat(32)};}}})},authToken:'test-token',accountSid:'ACtest',publicBaseUrl:'https://voice.example',openaiKey:'test',voice:'marin',model:'test'});
  await bridge.activate();
  const body={AccountSid:'ACtest',To:'+18773179445',From:'+12025550123',CallSid:'CA'+'2'.repeat(32)};
  const req={body,query:{},originalUrl:'/api/v1/medicare/voice',headers:{'x-twilio-signature':twilio.getExpectedTwilioSignature('test-token','https://voice.example/api/v1/medicare/voice',body)}};
@@ -32,7 +32,10 @@ test('real media handler enforces priority-first saves and automatically dials a
  phone.emit('message',JSON.stringify({event:'start',start:{callSid:body.CallSid,streamSid:'MZtest',customParameters:{ctx:token}}}));await tick();
  const ai=aiSessions[0];ai.emit('open');assert.ok(ai.sent[0].session.instructions.length<3000,'keep the per-turn prompt compact');assert.equal(ai.sent[0].session.audio.input.turn_detection.silence_duration_ms,450);ai.emit('message',JSON.stringify({type:'session.updated'}));await tick();
  const lastResponse=()=>ai.sent.filter(e=>e.type==='response.create').at(-1).response.instructions;
- assert.match(lastResponse(),/STEP: name/);
+ assert.match(lastResponse(),/STEP: name/);assert.doesNotMatch(lastResponse(),/transcribed|recorded|recording notice/);assert.equal(recordingRequests.length,1);assert.equal(recordingRequests[0].recordingChannels,'dual');assert.ok(events.some(e=>e.kind==='recording_consent'&&e.data.consent===true));
+ ai.emit('message',JSON.stringify({type:'response.created',response:{id:'opening'}}));ai.emit('message',JSON.stringify({type:'response.output_audio_transcript.done',response_id:'opening',item_id:'opening-item',transcript:'Thank you for calling Estimate Medicare. I’m Daisy. And whom do I have the pleasure of speaking to?'}));ai.emit('message',JSON.stringify({type:'input_audio_buffer.speech_started',item_id:'caller-name'}));ai.emit('message',JSON.stringify({type:'conversation.item.input_audio_transcription.completed',item_id:'caller-name',transcript:'Test Caller.'}));await tick();
+ assert.ok(events.some(e=>e.kind==='summary'&&e.data.transcript?.some(t=>t.role==='daisy')));assert.ok(events.some(e=>e.kind==='summary'&&e.data.transcript?.some(t=>t.role==='caller'&&t.text==='Test Caller.')));
+
  const answers=[[{full_name:'Test Caller'},'priority'],[{review_priority:'doctors'},'zip'],[{zip_code:'32819'},'parts_a_b'],[{has_parts_a_b:true},'coverage'],[{current_coverage:'original_medicare'},'phone']];
  for(const [answer,next] of answers){ai.emit('message',JSON.stringify({type:'response.function_call_arguments.done',name:'save_intake',call_id:next,arguments:JSON.stringify(answer)}));await tick();assert.match(lastResponse(),new RegExp('STEP: '+next));if(next==='phone')assert.match(lastResponse(),/plus one, two zero two, five five five, zero one two three/);assert.equal(updates.length,0);if(next==='priority'){assert.equal(typeof releaseWrite,'function','CRM write is still waiting while the next question is already queued');holdIntake=false;releaseWrite();await tick();}}
  ai.emit('message',JSON.stringify({type:'response.function_call_arguments.done',name:'save_intake',call_id:'confirm',arguments:JSON.stringify({phone:'+12025550123',phone_confirmed:true})}));await tick();
@@ -48,3 +51,4 @@ test('real media handler enforces priority-first saves and automatically dials a
  assert.ok(events.some(e=>e.data.intake?.handoff_status==='dialing'));
  assert.ok(!ai.sent.some(e=>e.type==='response.create'&&/Would you like/.test(e.response?.instructions||'')));
 });
+
