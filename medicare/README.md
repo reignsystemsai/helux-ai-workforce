@@ -13,7 +13,7 @@ modified by this module.
   uses the server pool; client records are sent to the dedicated Medicare CRM.
 - Transfer: destination is stored privately in the Medicare database settings, loaded through the signed bridge, and never accepted from caller/model input.
 - Opening: Daisy speaks directly; no preliminary synthetic voice or recording prompt.
-- Prepared transcript upgrade: audio recording stays off; a separate transcript flag saves timestamped speaker turns after Daisy’s opening notice. Apply transcript.sql before deploying this upgrade. Caller opt-out stops future transcript capture.
+- Prepared transcript upgrade: audio recording stays off; a separate transcript flag saves timestamped speaker turns without changing Daisy’s approved opening. Apply transcript.sql before deploying this upgrade. Caller opt-out stops future transcript capture.
 
 Set `MEDICARE_VOICE_ENABLED=false` and deploy to disable the module without
 changing DPA behavior. Before disabling or removing it, repoint this Medicare
