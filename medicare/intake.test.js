@@ -51,7 +51,7 @@ test('Medicare inbound activation and signed intake routes',async()=>{
 
 test('intake asks for facts without promising an unconfigured transfer',()=>{
  const prompt=instructions({direction:'inbound',script_id:'intake',recording:false});
- for(const expected of ['name','ZIP','Parts A and B','save_intake','callback number','do not promise an immediate transfer'])assert.ok(prompt.includes(expected),expected);
+ for(const expected of ['name','ZIP','Medicare Part A and Part B','save_intake','phone number','do not promise an immediate transfer'])assert.ok(prompt.includes(expected),expected);
  assert.match(prompt,/never decide eligibility or reject them/);
 });
 
@@ -69,7 +69,7 @@ test('greeting and intake instructions address observed call problems',()=>{
 
 test('specialist handoff uses a controlled Dial after the intake announcement',()=>{
  const prompt=instructions({direction:'inbound',script_id:'intake',recording:false,phone:'+12025550123',transfer_available:true});
- assert.match(prompt,/Please hold one minute/);
+ assert.match(prompt,/Please hold\./);
  assert.match(prompt,/call transfer_call/);
  assert.doesNotMatch(prompt,/closer destination is not configured/);
  const xml=transferXml('+12025550199','https://voice.example');
@@ -78,4 +78,15 @@ test('specialist handoff uses a controlled Dial after the intake announcement',(
  assert.match(xml,/callerId="\+18773179445"/);
  assert.match(xml,/>\+12025550199<\/Dial>/);
  assert.doesNotMatch(xml,/<Say/);
+});
+
+test('approved script captures CRM fields in the requested order before transfer',()=>{
+ const prompt=instructions({direction:'inbound',script_id:'intake',recording:false,phone:'+12025550123',transfer_available:true});
+ const steps=['1. After the opening','2. Say: Hi, [customer name]','3. Say: Excellent. Medicare costs','4. Say: Do you currently have both','5. Say: What coverage','6. Only after those questions'];
+ let previous=-1;
+ for(const step of steps){const index=prompt.indexOf(step);assert.ok(index>previous,step);previous=index;}
+ for(const field of ['full_name','review_priority','zip_code','has_parts_a_b','current_coverage','phone_confirmed=true'])assert.ok(prompt.includes(field),field);
+ assert.match(prompt,/digital Estimate Medicare cost specialist/);
+ assert.match(prompt,/Now that I have some basic information about you/);
+ assert.doesNotMatch(prompt,/Ask for ZIP first after the name/);
 });
