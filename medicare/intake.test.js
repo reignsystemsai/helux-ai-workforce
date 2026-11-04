@@ -52,7 +52,7 @@ test('Medicare inbound activation and signed intake routes',async()=>{
 test('intake asks for facts without promising an unconfigured transfer',()=>{
  const prompt=instructions({direction:'inbound',script_id:'intake',recording:false});
  for(const expected of ['name','ZIP','Medicare Part A and Part B','save_intake','phone number','do not promise an immediate transfer'])assert.ok(prompt.includes(expected),expected);
- assert.match(prompt,/never decide eligibility or reject them/);
+ assert.match(prompt,/Do not make a legal eligibility determination/);
 });
 
 test('greeting and intake instructions address observed call problems',()=>{
@@ -101,4 +101,10 @@ test('phone readback spells every digit with US grouping',()=>{
 test('handoff thanks the captured customer by name using the exact approved wording',()=>{
  const {transferLine}=require('./index');
  assert.equal(transferLine({full_name:'Doug'}),'Thank you for your time, Doug. Please hold while I connect you to a live representative who can further assist you with your Medicare plans.');
+});
+
+test('only a confirmed no takes the A/B closing branch',()=>{
+ const {nextIntakeTurn,MISSING_PARTS_LINE}=require('./index');
+ assert.equal(nextIntakeTurn({has_parts_a_b:false}).say,MISSING_PARTS_LINE);
+ assert.notEqual(nextIntakeTurn({has_parts_a_b:null}).stage,'missing_parts');
 });

@@ -7,7 +7,7 @@ const fs=require('node:fs');
 const twilio=require('twilio');
 const tick=async()=>{for(let n=0;n<8;n++)await new Promise(resolve=>setImmediate(resolve));};
 
-test('real media handler enforces priority-first saves and automatically dials after announcement playback',async()=>{
+for(const missingParts of [false,true])test(missingParts?'confirmed missing A/B plays the required closing and hangs up without dialing':'real media handler enforces priority-first saves and automatically dials after announcement playback',async()=>{
  const routes=new Map(),updates=[],aiSessions=[],events=[],phoneMessages=[],recordingRequests=[];let holdIntake=true,releaseWrite;
  const phone=new EventEmitter();phone.readyState=1;phone.send=raw=>phoneMessages.push(JSON.parse(raw));phone.close=()=>{};
  class FakeAI extends EventEmitter{constructor(){super();this.readyState=1;this.sent=[];aiSessions.push(this);}send(raw){this.sent.push(JSON.parse(raw));}close(){this.readyState=3;}}
@@ -36,8 +36,16 @@ test('real media handler enforces priority-first saves and automatically dials a
  ai.emit('message',JSON.stringify({type:'response.created',response:{id:'opening'}}));ai.emit('message',JSON.stringify({type:'response.output_audio_transcript.done',response_id:'opening',item_id:'opening-item',transcript:'Thank you for calling Estimate Medicare. I’m Daisy. And whom do I have the pleasure of speaking to?'}));ai.emit('message',JSON.stringify({type:'input_audio_buffer.speech_started',item_id:'caller-name'}));ai.emit('message',JSON.stringify({type:'conversation.item.input_audio_transcription.completed',item_id:'caller-name',transcript:'Test Caller.'}));await tick();
  assert.ok(events.some(e=>e.kind==='summary'&&e.data.transcript?.some(t=>t.role==='daisy')));assert.ok(events.some(e=>e.kind==='summary'&&e.data.transcript?.some(t=>t.role==='caller'&&t.text==='Test Caller.')));
 
- const answers=[[{full_name:'Test Caller'},'priority'],[{review_priority:'doctors'},'zip'],[{zip_code:'32819'},'parts_a_b'],[{has_parts_a_b:true},'coverage'],[{current_coverage:'original_medicare'},'phone']];
- for(const [answer,next] of answers){ai.emit('message',JSON.stringify({type:'response.function_call_arguments.done',name:'save_intake',call_id:next,arguments:JSON.stringify(answer)}));await tick();assert.match(lastResponse(),new RegExp('STEP: '+next));if(next==='phone')assert.match(lastResponse(),/plus one, two zero two, five five five, zero one two three/);assert.equal(updates.length,0);if(next==='priority'){assert.equal(typeof releaseWrite,'function','CRM write is still waiting while the next question is already queued');holdIntake=false;releaseWrite();await tick();}}
+ const answers=[[{full_name:'Test Caller'},'priority'],[{review_priority:'doctors'},'zip'],[{zip_code:'32819'},'parts_a_b'],[{has_parts_a_b:!missingParts},missingParts?'missing_parts':'coverage'],...(missingParts?[]:[[{current_coverage:'original_medicare'},'phone']])];
+ for(const [answer,next] of answers){ai.emit('message',JSON.stringify({type:'response.function_call_arguments.done',name:'save_intake',call_id:next,arguments:JSON.stringify(answer)}));await tick();if(missingParts&&next==='missing_parts')assert.match(lastResponse(),/Having A and B is necessary/);else assert.match(lastResponse(),new RegExp('STEP: '+next));if(next==='phone')assert.match(lastResponse(),/plus one, two zero two, five five five, zero one two three/);assert.equal(updates.length,0);if(next==='priority'){assert.equal(typeof releaseWrite,'function','CRM write is still waiting while the next question is already queued');holdIntake=false;releaseWrite();await tick();}}
+ if(missingParts){
+  assert.match(lastResponse(),/visit Medicare.gov/);assert.match(lastResponse(),/Have a wonderful day. Goodbye/);
+  ai.emit('message',JSON.stringify({type:'response.created',response:{id:'missing-parts-closing'}}));
+  ai.emit('message',JSON.stringify({type:'response.done',response:{id:'missing-parts-closing'}}));await tick();
+  phone.emit('message',JSON.stringify({event:'mark',mark:{name:'medicare-finish'}}));await tick();
+  assert.equal(updates.length,1);assert.equal(updates[0].status,'completed');assert.equal(updates[0].twiml,undefined);
+  assert.ok(events.some(e=>e.kind==='summary'&&e.data.intake?.service_outcome==='missing_parts_a_b'));return;
+ }
  ai.emit('message',JSON.stringify({type:'response.function_call_arguments.done',name:'save_intake',call_id:'confirm',arguments:JSON.stringify({phone:'+12025550123',phone_confirmed:true})}));await tick();
  assert.match(lastResponse(),/Thank you for your time, Test Caller\. Please hold while I connect you to a live representative who can further assist you with your Medicare plans\./);
  assert.match(lastResponse(),/Do not ask whether the caller wants a transfer/);
