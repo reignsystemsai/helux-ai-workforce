@@ -7595,8 +7595,15 @@ const finalClosing =
 
 const managerCalls = require('./manager-calls').registerManagerCalls({app,pool,authenticateHelux,twilioClient,publicBaseUrl:PUBLIC_BASE_URL,authToken:TWILIO_AUTH_TOKEN,accountSid:TWILIO_ACCOUNT_SID,fromNumber:TWILIO_FROM_NUMBER,heluxKey:HELUX_API_KEY,openaiKey:OPENAI_API_KEY,voice:OPENAI_VOICE,model:OPENAI_REALTIME_MODEL,outboundEnabled:OUTBOUND_CALLS_ENABLED});
 
+// Estimate Medicare is isolated in its own module, routes, number and CRM.
+// Disable independently with MEDICARE_VOICE_ENABLED=false.
+const medicareVoice = process.env.MEDICARE_VOICE_ENABLED === 'false'
+  ? { activate: async () => {}, handleUpgrade: () => false }
+  : require('./medicare').registerMedicareVoice({app,pool,twilioClient,authToken:TWILIO_AUTH_TOKEN,accountSid:TWILIO_ACCOUNT_SID,publicBaseUrl:PUBLIC_BASE_URL,openaiKey:OPENAI_API_KEY,voice:process.env.MEDICARE_OPENAI_VOICE || OPENAI_VOICE,model:process.env.MEDICARE_OPENAI_MODEL || OPENAI_REALTIME_MODEL});
+
 server.on("upgrade", (request, socket, head) => {
   try {
+    if (medicareVoice.handleUpgrade(request, socket, head)) return;
     if (managerCalls.handleUpgrade(request, socket, head)) return;
     const requestUrl = new URL(
       request.url,
@@ -7642,6 +7649,7 @@ async function start() {
     await initializeDatabase();
 
     server.listen(PORT, "0.0.0.0", () => {
+      void medicareVoice.activate();
       console.log(`HELUX AI Workforce running on port ${PORT}`);
       console.log(`Agent version: ${DOUG_CONFIG.agentVersion}`);
       console.log(`Realtime model: ${OPENAI_REALTIME_MODEL}`);
