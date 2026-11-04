@@ -48,7 +48,7 @@ test('real media handler enforces priority-first saves and automatically dials a
  phone.emit('message',JSON.stringify({event:'mark',mark:{name:'medicare-finish'}}));await tick();
  assert.equal(updates.length,1);
  assert.match(updates[0].twiml,/>\+12025550199<\/Dial>/);
- assert.ok(events.some(e=>e.data.intake?.handoff_status==='dialing'));
+ assert.ok(events.some(e=>e.data.intake?.handoff_status==='dialing'));phone.emit('message',JSON.stringify({event:'stop'}));ai.emit('message',JSON.stringify({type:'conversation.item.input_audio_transcription.completed',item_id:'final-confirmation',transcript:'Yes, that is correct.'}));ai.emit('message',JSON.stringify({type:'response.output_audio_transcript.done',response_id:'handoff',item_id:'handoff-item',transcript:'Thank you for your time, Test Caller. Please hold while I connect you to a live representative who can further assist you with your Medicare plans.'}));await tick();assert.ok(events.some(e=>e.kind==='summary'&&e.data.transcript?.some(t=>t.text==='Yes, that is correct.')));assert.ok(events.some(e=>e.kind==='summary'&&e.data.transcript?.some(t=>t.text.includes('Thank you for your time, Test Caller'))));
  assert.ok(!ai.sent.some(e=>e.type==='response.create'&&/Would you like/.test(e.response?.instructions||'')));
 });
 
