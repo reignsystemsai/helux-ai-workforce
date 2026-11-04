@@ -69,7 +69,7 @@ test('greeting and intake instructions address observed call problems',()=>{
 
 test('specialist handoff uses a controlled Dial after the intake announcement',()=>{
  const prompt=instructions({direction:'inbound',script_id:'intake',recording:false,phone:'+12025550123',transfer_available:true});
- assert.match(prompt,/Please hold\./);
+ assert.match(prompt,/Please hold while I connect you/);
  assert.match(prompt,/call transfer_call/);
  assert.doesNotMatch(prompt,/closer destination is not configured/);
  const xml=transferXml('+12025550199','https://voice.example');
@@ -87,7 +87,7 @@ test('approved script captures CRM fields in the requested order before transfer
  for(const step of steps){const index=prompt.indexOf(step);assert.ok(index>previous,step);previous=index;}
  for(const field of ['full_name','review_priority','zip_code','has_parts_a_b','current_coverage','phone_confirmed=true'])assert.ok(prompt.includes(field),field);
  assert.match(prompt,/digital Estimate Medicare cost specialist/);
- assert.match(prompt,/Now that I have some basic information about you/);
+ assert.match(prompt,/Thank you for your time/);
  assert.doesNotMatch(prompt,/Ask for ZIP first after the name/);
 });
 
@@ -95,4 +95,10 @@ test('phone readback spells every digit with US grouping',()=>{
  assert.equal(spokenPhone('+16892828783'),'plus one, six eight nine, two eight two, eight seven eight three');
  assert.equal(spokenPhone('202-555-0123'),'plus one, two zero two, five five five, zero one two three');
  assert.equal(spokenPhone('anonymous'),'');
+});
+
+
+test('handoff thanks the captured customer by name using the exact approved wording',()=>{
+ const {transferLine}=require('./index');
+ assert.equal(transferLine({full_name:'Doug'}),'Thank you for your time, Doug. Please hold while I connect you to a live representative who can further assist you with your Medicare plans.');
 });

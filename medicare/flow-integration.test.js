@@ -39,7 +39,7 @@ test('real media handler enforces priority-first saves and automatically dials a
  const answers=[[{full_name:'Test Caller'},'priority'],[{review_priority:'doctors'},'zip'],[{zip_code:'32819'},'parts_a_b'],[{has_parts_a_b:true},'coverage'],[{current_coverage:'original_medicare'},'phone']];
  for(const [answer,next] of answers){ai.emit('message',JSON.stringify({type:'response.function_call_arguments.done',name:'save_intake',call_id:next,arguments:JSON.stringify(answer)}));await tick();assert.match(lastResponse(),new RegExp('STEP: '+next));if(next==='phone')assert.match(lastResponse(),/plus one, two zero two, five five five, zero one two three/);assert.equal(updates.length,0);if(next==='priority'){assert.equal(typeof releaseWrite,'function','CRM write is still waiting while the next question is already queued');holdIntake=false;releaseWrite();await tick();}}
  ai.emit('message',JSON.stringify({type:'response.function_call_arguments.done',name:'save_intake',call_id:'confirm',arguments:JSON.stringify({phone:'+12025550123',phone_confirmed:true})}));await tick();
- assert.match(lastResponse(),/Now that I have some basic information/);
+ assert.match(lastResponse(),/Thank you for your time, Test Caller\. Please hold while I connect you to a live representative who can further assist you with your Medicare plans\./);
  assert.match(lastResponse(),/Do not ask whether the caller wants a transfer/);
  assert.equal(updates.length,0,'wait until the announcement is heard');
  ai.emit('message',JSON.stringify({type:'response.created',response:{id:'handoff'}}));
@@ -51,4 +51,5 @@ test('real media handler enforces priority-first saves and automatically dials a
  assert.ok(events.some(e=>e.data.intake?.handoff_status==='dialing'));
  assert.ok(!ai.sent.some(e=>e.type==='response.create'&&/Would you like/.test(e.response?.instructions||'')));
 });
+
 
