@@ -3,7 +3,7 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const crypto=require('node:crypto');
 const twilio=require('twilio');
-const {registerMedicareVoice,instructions}=require('./index');
+const {registerMedicareVoice,instructions,transferXml}=require('./index');
 
 test('Medicare inbound activation and signed intake routes',async()=>{
  const routes=new Map(),events=[],updates=[];
@@ -39,17 +39,10 @@ test('Medicare inbound activation and signed intake routes',async()=>{
   const body={AccountSid:'ACtest',To:'+18773179445',From:'+12025550123',CallSid:'CA'+'1'.repeat(32)};
   function req(path,body){return {body,query:{},originalUrl:path,headers:{'x-twilio-signature':twilio.getExpectedTwilioSignature('test-token','https://voice.example'+path,body)}};}
   await routes.get('POST /api/v1/medicare/voice')(req('/api/v1/medicare/voice',body),res);
-  assert.match(res.value,/May I record/);
-  assert.match(res.value,/<Gather/);
-  assert.doesNotMatch(res.value,/visit Estimate/);
-  assert.equal(events.at(-1).kind,'started');
-  const action=res.value.match(/action="([^"]+)"/)[1].replace(/&amp;/g,'&');
-  const url=new URL(action),consentBody={...body,Digits:'2'};
-  const request=req(url.pathname+url.search,consentBody);request.query={ctx:url.searchParams.get('ctx')};
-  await routes.get('POST /api/v1/medicare/consent')(request,res);
   assert.match(res.value,/<Connect><Stream/);
   assert.match(res.value,/wss:\/\/voice.example\/api\/v1\/medicare\/media/);
-  assert.equal(events.at(-1).data.consent,false);
+  assert.doesNotMatch(res.value,/<Say|<Gather|May I record|virtual assistant/);
+  assert.equal(events.at(-1).kind,'started');
   const invalid=req('/api/v1/medicare/voice',body);invalid.headers={};
   await routes.get('POST /api/v1/medicare/voice')(invalid,res);
   assert.equal(res.statusCode,403);
@@ -60,4 +53,29 @@ test('intake asks for facts without promising an unconfigured transfer',()=>{
  const prompt=instructions({direction:'inbound',script_id:'intake',recording:false});
  for(const expected of ['name','ZIP','Parts A and B','save_intake','callback number','do not promise an immediate transfer'])assert.ok(prompt.includes(expected),expected);
  assert.match(prompt,/never decide eligibility or reject them/);
+});
+
+test('greeting and intake instructions address observed call problems',()=>{
+ const prompt=instructions({direction:'inbound',script_id:'intake',recording:false,phone:'+12025550123'});
+ assert.match(prompt,/Thank you for calling Estimate Medicare. I’m Daisy. And whom do I have the pleasure of speaking to\?/);
+ assert.match(prompt,/Incoming phone number supplied by the telephone system: \+12025550123/);
+ assert.match(prompt,/Accept same number/);
+ assert.match(prompt,/Save confirmed answers silently/);
+ assert.match(prompt,/Do not ask to record/);
+ assert.match(prompt,/If asked whether you are AI, answer honestly/);
+ const blocked=instructions({direction:'inbound',script_id:'intake',recording:false,phone:'anonymous'});
+ assert.match(blocked,/telephone system: unavailable/);
+});
+
+test('specialist handoff uses a controlled Dial after the intake announcement',()=>{
+ const prompt=instructions({direction:'inbound',script_id:'intake',recording:false,phone:'+12025550123',transfer_available:true});
+ assert.match(prompt,/Please hold one minute/);
+ assert.match(prompt,/call transfer_call/);
+ assert.doesNotMatch(prompt,/closer destination is not configured/);
+ const xml=transferXml('+12025550199','https://voice.example');
+ assert.match(xml,/<Dial/);
+ assert.match(xml,/answerOnBridge="true"/);
+ assert.match(xml,/callerId="\+18773179445"/);
+ assert.match(xml,/>\+12025550199<\/Dial>/);
+ assert.doesNotMatch(xml,/<Say/);
 });
