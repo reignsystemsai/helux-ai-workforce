@@ -3,7 +3,7 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const crypto=require('node:crypto');
 const twilio=require('twilio');
-const {registerMedicareVoice,instructions,transferXml}=require('./index');
+const {registerMedicareVoice,instructions,transferXml,spokenPhone}=require('./index');
 
 test('Medicare inbound activation and signed intake routes',async()=>{
  const routes=new Map(),events=[],updates=[];
@@ -89,4 +89,10 @@ test('approved script captures CRM fields in the requested order before transfer
  assert.match(prompt,/digital Estimate Medicare cost specialist/);
  assert.match(prompt,/Now that I have some basic information about you/);
  assert.doesNotMatch(prompt,/Ask for ZIP first after the name/);
+});
+
+test('phone readback spells every digit with US grouping',()=>{
+ assert.equal(spokenPhone('+16892828783'),'plus one, six eight nine, two eight two, eight seven eight three');
+ assert.equal(spokenPhone('202-555-0123'),'plus one, two zero two, five five five, zero one two three');
+ assert.equal(spokenPhone('anonymous'),'');
 });

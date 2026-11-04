@@ -27,4 +27,6 @@ infrastructure change, not claimed by this implementation.
 
 Validation: `node --test medicare/intake.test.js` plus `npm test`.
 
-The server controls the next intake step after each successful CRM save and automatically queues the specialist transfer after phone confirmation. Saved library scripts cannot change the order or turn the handoff into an optional offer. Per-call `flow_revision`, `next_step`, and `handoff_status` provide diagnostics without enabling recording.
+The server controls the next intake step after each captured answer and automatically queues the specialist transfer after phone confirmation. CRM writes run in a serial background queue; transfer and hangup flush pending writes. Saved library scripts cannot change the order or turn the handoff into an optional offer. Per-call `flow_revision`, `next_step`, and `handoff_status` provide diagnostics without enabling recording.
+
+US phone readback spells digits as plus one, area-code digits, exchange digits, and the final four digits. Speech endpointing waits 450 ms of silence. Inbound live instructions contain only safety rules and the current server-controlled question.
