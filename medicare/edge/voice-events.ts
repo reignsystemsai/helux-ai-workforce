@@ -14,6 +14,12 @@ Deno.serve(async req=>{
   const body=JSON.parse(raw);if(body.kind==='probe'){const configDb=createClient(Deno.env.get('SUPABASE_URL')!,Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,{auth:{persistSession:false,autoRefreshToken:false}});const {data,error}=await configDb.from('medicare_voice_settings').select('transfer_phone').eq('id','primary').maybeSingle();if(error)return reply({error:'Voice configuration unavailable'},503);return reply({ok:true,transfer_phone:data?.transfer_phone||null});}
   if(!/^[0-9a-f-]{36}$/i.test(body.event_id||'')||!/^CA[0-9a-f]{32}$/i.test(body.call_sid||'')||!['started','context','intake','summary','status','recording','recording_consent','recording_failed'].includes(body.kind))return reply({error:'Invalid event'},400);
   const db=createClient(Deno.env.get('SUPABASE_URL')!,Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,{auth:{persistSession:false,autoRefreshToken:false}});
+  if(body.kind==='started'&&body.data?.direction==='inbound'){
+   const {data:settings,error}=await db.from('medicare_voice_settings').select('script_library,script_assignments').eq('id','primary').single();
+   if(error)return reply({error:'Intake script unavailable'},503);
+   const number=settings.script_assignments?.intake||1,script=settings.script_library?.find((s:any)=>s.number===number);
+   if(script?.content)body.data.voice_context={...(body.data.voice_context||{}),custom_script:script.content,script_number:number};
+  }
   const result=await db.rpc('ingest_medicare_voice',{p_event_id:body.event_id,p_kind:body.kind,p_call_sid:body.call_sid,p_data:body.data||{}});return result.error?reply({error:'Unable to save call'},503):reply(result.data);
  }catch{return reply({error:'Unable to process voice event'},503);}
 });

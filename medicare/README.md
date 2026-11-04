@@ -26,3 +26,5 @@ independent. Hosting is shared; independent service deployment is a separate
 infrastructure change, not claimed by this implementation.
 
 Validation: `node --test medicare/intake.test.js` plus `npm test`.
+
+The server controls the next intake step after each successful CRM save and automatically queues the specialist transfer after phone confirmation. Saved library scripts cannot change the order or turn the handoff into an optional offer. Per-call `flow_revision`, `next_step`, and `handoff_status` provide diagnostics without enabling recording.
