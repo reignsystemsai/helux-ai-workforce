@@ -63,7 +63,7 @@ grant execute on function public.ingest_medicare_voice(uuid,text,text,jsonb) to 
 
 -- Routing is private configuration. Set the destination through the database;
 -- do not commit personal telephone numbers into source code.
-create table public.medicare_voice_settings (id text primary key, transfer_phone text not null check(transfer_phone ~ '^\\+[1-9][0-9]{9,14}$'));
+create table public.medicare_voice_settings (id text primary key, transfer_phone text not null check(transfer_phone ~ '^[+][1-9][0-9]{9,14}$'));
 alter table public.medicare_voice_settings enable row level security;
 revoke all on public.medicare_voice_settings from public,anon,authenticated;
 grant select on public.medicare_voice_settings to service_role;
