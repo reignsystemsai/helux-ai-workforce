@@ -16,13 +16,19 @@ test('Medicare inbound activation and signed intake routes',async()=>{
  const phone=()=>({update:async value=>updates.push(value)});
  phone.list=async()=>[{sid:'PNded2efa63292b8210420f5711248e0bb'}];
  const calls=()=>({recordings:{create:async()=>({})}});
- const oldFetch=global.fetch;
+ const oldFetch=global.fetch,oldTimeout=global.setTimeout,oldClear=global.clearTimeout;
+ let retryScheduled=false,requests=0;
+ global.setTimeout=(fn,ms,...args)=>ms===15000?(retryScheduled=true,{unref(){}}):oldTimeout(fn,ms,...args);
+ global.clearTimeout=timer=>{if(timer?.unref&&retryScheduled)return;oldClear(timer);};
  global.fetch=async(_url,options)=>{
   const event=JSON.parse(options.body);events.push(event);
-  return {ok:true,json:async()=>({ok:true})};
+  return {ok:++requests>2,json:async()=>({ok:true})};
  };
  try{
   const bridge=registerMedicareVoice({app,pool,twilioClient:{incomingPhoneNumbers:phone,calls},authToken:'test-token',accountSid:'ACtest',publicBaseUrl:'https://voice.example',openaiKey:'test-key',voice:'marin',model:'test-model'});
+  await bridge.activate();
+  assert.equal(retryScheduled,true,'retry must be scheduled when startup reaches the old deployment');
+  assert.equal(updates.length,0,'do not switch the number until the CRM is reachable');
   await bridge.activate();
   assert.equal(updates[0].voiceUrl,'https://voice.example/api/v1/medicare/voice');
   const res={statusCode:200,status(n){this.statusCode=n;return this;},sendStatus(n){this.statusCode=n;return this;},json(value){this.value=value;return this;},type(){return this;},send(value){this.value=value;return this;}};
@@ -47,7 +53,7 @@ test('Medicare inbound activation and signed intake routes',async()=>{
   const invalid=req('/api/v1/medicare/voice',body);invalid.headers={};
   await routes.get('POST /api/v1/medicare/voice')(invalid,res);
   assert.equal(res.statusCode,403);
- }finally{global.fetch=oldFetch;}
+ }finally{global.fetch=oldFetch;global.setTimeout=oldTimeout;global.clearTimeout=oldClear;}
 });
 
 test('intake asks for facts without promising an unconfigured transfer',()=>{
