@@ -15,3 +15,7 @@ test('clipped completion transcripts from the latest real call advance without r
  }
  assert.equal(taxFlowTurn('tax_select_both','Where?',p(),line).scriptLine,'Have you selected both filing-status boxes?');
 });
+
+test('missing return closes with a filing target and supported follow-up instead of a resource tour',()=>{const payload=p();const a=taxFlowTurn('tax_assistant','Sounds great.',payload,line);assert.equal(a.stage,'tax_next_step');assert.match(a.scriptLine,/file your 2025 return/);assert.match(a.scriptLine,/When do you think/);assert.doesNotMatch(a.scriptLine,/explore|calculators|already have someone/i);const b=taxFlowTurn(a.stage,'By next Friday.',payload,line);assert.equal(b.stage,'callback_time');assert.equal(b.preparationCommitment.target_quote,'By next Friday.');assert.equal(b.preparationCommitment.milestone,'File 2025 tax return');assert.match(b.scriptLine,/When would you like me to call you back/);assert.doesNotMatch(b.scriptLine,/scheduled|booked/);});
+
+test('filing target requires a time statement; acknowledgments do not become commitments',()=>{for(const words of ['Sounds great.','Yes.','My friend is doing it.']){const t=taxFlowTurn('tax_next_step',words,p(),line);assert.equal(t.stage,'tax_next_step');assert.equal(t.preparationCommitment,undefined);}const t=taxFlowTurn('tax_next_step','Yes, by next Friday.',p(),line);assert.equal(t.preparationCommitment.target_quote,'Yes, by next Friday.');});

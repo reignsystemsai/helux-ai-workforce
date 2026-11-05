@@ -10,3 +10,5 @@ test('tickets are single-use and reject wrong-origin browser connections',async(
  const socket=new Socket();room.handleUpgrade({url:'/api/v1/manager/test-media',headers:{origin:'https://www.dpahelpcenter.com'}},socket,null);socket.emit('message',JSON.stringify({event:'authorize',id:r.body.id,token:r.body.token}));assert.equal(connected,1);
  const replay=new Socket();room.handleUpgrade({url:'/api/v1/manager/test-media',headers:{origin:'https://www.dpahelpcenter.com'}},replay,null);replay.emit('message',JSON.stringify({event:'authorize',id:r.body.id,token:r.body.token}));assert.equal(replay.readyState,3);assert.equal(connected,1);socket.close();await new Promise(r=>setImmediate(r));assert.ok(queries.some(q=>q.s.includes('ended_at=now()')));assert.ok(queries.every(q=>!q.s.includes('prephub_leads')&&!q.s.includes('daisy_manager_calls')));
 });
+
+test('rehearsal audio extends beyond five minutes and caps at thirty minutes',()=>{const {wav}=load();const six=wav([],6*60*1000);assert.ok(six.length>44+5*60*8000*4);const capped=wav([],31*60*1000);assert.equal(capped.length,44+30*60*8000*4);});

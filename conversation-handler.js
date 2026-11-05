@@ -19,6 +19,7 @@ response is only acknowledgment/explanation, never a tool-success statement. Nev
 
 function eligible(stage,p){return p.prephub_login_confirmed===true&&(/^(?:credit_|tax_|conversation_)/.test(stage)||stage==='website_help'||['needs','orientation','orientation_checklist','preparation','follow_up_resume','callback_time'].includes(stage)&&['credit','taxes'].includes(p.prephub_section_confirmed));}
 function needsInterpretation(stage,words,p,scripted){
+ if(scripted?.incompleteReply||stage==='tax_next_step'&&scripted?.preparationCommitment)return false;
  if(!eligible(stage,p))return false;
  if(stage.startsWith('conversation_'))return true;
  if(stage==='website_help'&&p.website_help?.pending_callback)return false;

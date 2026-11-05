@@ -3,4 +3,5 @@ function fillerReply(words){const s=String(words||'').toLowerCase().replace(/[â€
 function greetingReply(words){return /\b(?:hello|hi|hey)\b/i.test(String(words||''));}
 function speechParts(line){return String(line||'').split(/(?:\r?\n\s*){2,}|(?:\\n\s*){2,}/).map(s=>s.trim()).filter(Boolean);}
 function priorityReply(words){return /\b(?:stop|don't call|do not call|remove me|wrong number|goodbye|bye|have to go|got to go|need to go|hang up|getting off|end (?:the|this) call|call.{0,25}back|callback|can't talk|cannot talk|instead|actually)\b/i.test(String(words||''));}
-module.exports={fillerReply,greetingReply,speechParts,priorityReply};
+function incompleteReply(words){return /^(?:the|a|an|and|but|because|i|i was|i think|it|that|well i|so i)[.! ]*$/i.test(String(words||'').trim());}
+module.exports={incompleteReply,fillerReply,greetingReply,speechParts,priorityReply};
