@@ -1,5 +1,5 @@
 'use strict';
-const LOGIN_LINE='Excellent. Go ahead and scroll down in the email, click the login button, and sign in to PrepHub. Let me know when you’re finished.';
+const LOGIN_LINE='Excellent. Go ahead and scroll down in the email, click the login button, and sign in to PrepHub. Take your time. Let me know when you’re done.';
 const EMAIL_WAIT='Let me know when you find the welcome email from your PrepHub.';
 const SECTIONS={credit:{label:'Credit Preparation',heading:'Your Credit Readiness'},income:{label:'Income & DTI',heading:'Understand Your Income'},employment:{label:'Employment History',heading:'Do You Have Two Years of Work History?'},taxes:{label:'Taxes',heading:'Prepare Your Tax Returns'}};
 const AREA_TAB={Credit:'credit',Income:'income',DTI:'income','Work History':'employment',Taxes:'taxes'};
