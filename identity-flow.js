@@ -27,7 +27,7 @@ function identityFlow(stage,words,payload,opening=''){
   if(no)return end('completed',message,'Customer unavailable after transfer or screening','Customer not reached; follow the existing callback workflow');
   if(/one (?:moment|second)|hold on|please wait|getting (?:him|her|them)/i.test(text))return {...turn(stage,null),hold:true};
   if(/\b(?:this is|i am|speaking|that.s me)\b/i.test(text))return {identityFlow:true,recheckIdentity:true};
-  return turn('identity_confirm','Hi, is '+name+' speaking?');
+  return turn('identity_confirm','Oh, hi. Is this '+name+' speaking?');
  }
  if(stage==='identity'&&!payload.identity_confirming_reply&&/available/i.test(opening)){if(no)return end('completed',message,'Customer unavailable; message left with person answering','Customer not reached; follow the existing callback workflow');if(/(?:let me|i.ll|i will).{0,15}(?:get|find|grab)|one (?:moment|second)|hold (?:on|please)|get (?:him|her|them)/i.test(text))return turn('identity_holding','Thank you. I’ll hold.');if(/^(?:yes|yeah|yep|sure|okay|ok)[.! ]*$/i.test(text))return turn('identity_confirm','Am I speaking with '+name+'?');}
  if(no)return turn('identity_availability','Oh, okay. No problem. This is Daisy with the Down Payment Assistance Help Center. Is '+name+' available to speak?');
