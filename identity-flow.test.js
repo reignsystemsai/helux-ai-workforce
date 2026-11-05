@@ -1,7 +1,7 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict');
 const {nextGuidedTurn,simpleLine}=require('./manager-calls');
-const p=()=>({first_name:'Doug',lead_id:'test',script:{script_text:''},caller_settings:{settings:{script_delivery:'guided'}}});
+const p=()=>({first_name:'Doug',lead_id:'test',preparation_context:{intake:{estimated_dpa:35000}},script:{script_text:''},caller_settings:{settings:{script_delivery:'guided'}}});
 test('identity no asks availability; second no leaves approved message and ends',()=>{const payload=p();const a=nextGuidedTurn('identity','No.',payload);assert.equal(a.stage,'identity_availability');assert.match(a.scriptLine,/Is Doug available to speak/);const b=nextGuidedTurn(a.stage,'No.',payload);assert.equal(b.finishOutcome,'completed');assert.match(b.finishLine,/let Doug know Daisy/);assert.doesNotMatch(b.finishLine,/credit|down payment assistance form|640/i);});
 test('availability yes waits, hello rechecks identity, matching name advances',()=>{const payload=p();assert.equal(simpleLine('identity',payload),'Hi, is Doug speaking?');const a=nextGuidedTurn('identity_availability','Yes, one second.',payload);assert.equal(a.stage,'identity_holding');assert.equal(a.scriptLine,'Thank you. I’ll hold.');const b=nextGuidedTurn(a.stage,'Hello?',payload);assert.equal(b.stage,'identity');assert.equal(b.scriptLine,'Hi, is Doug speaking?');assert.equal(nextGuidedTurn(b.stage,'This is Doug speaking.',payload).stage,'amount');});
 test('wrong number ends without identity loop',()=>{const a=nextGuidedTurn('identity','No, wrong number.',p());assert.equal(a.finishOutcome,'wrong_number');assert.match(a.finishLine,/Sorry for the inconvenience/);});
