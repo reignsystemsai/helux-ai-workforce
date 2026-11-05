@@ -2,6 +2,7 @@ const {taxObservation,selectionSummary,observedTaxTurn}=require('./tax-observati
 const {sectionVisible,sectionPrompt}=require('./guided-access');
 'use strict';
 const {fillerReply}=require('./turn-taking');
+const {booleanReply,realQuestion}=require('./reply-clarification');
 const {recentTaxYears}=require('./tax-years');
 function followupPurpose(p){const missing=recentTaxYears(p).filter(y=>p.client_reported_tax_years?.years?.[y]===false);return 'I’d follow up to check on '+(missing.length?'your '+missing.join(' and ')+' tax filing':'your next preparation milestone')+' and help you keep moving forward. ';}
 const INVITE='When would you like me to call you back—maybe in a few days, a few weeks, or a month?';
@@ -17,7 +18,7 @@ function completedTaxAction(words,stage){
  return /\b(?:selected|checked|marked|chosen|clicked|completed|finished|done)\b/.test(s)&&(/\b(?:both|boxes|selections|years|them|everything|all|it|that|done)\b/.test(s)||/\b(?:i am|i'm|i have|i've|that's|that is|it is|it's) (?:done|finished|completed)\b/.test(s));
 }
 function taxFlowTurn(stage,words,p,line){
- if(!stage.startsWith('tax_')||['tax_years','tax_missing_year','tax_year_missing','tax_years_confirm'].includes(stage))return null;
+ if(!stage.startsWith('tax_')||['tax_years','tax_missing_year','tax_year_missing','tax_years_confirm','tax_intake_confirm'].includes(stage))return null;
  if(fillerReply(words))return {stage,hold:true};
  const text=String(words||''),yes=/^(?:yes|yeah|yep|sure|okay|ok|done|saved|ready|i did|i have|i.m in|i am in|i.ve|that.s done|it.s done|sounds good|absolutely)\b/i.test(text),no=/^(?:no|not yet|nope|i can.t|i cannot)\b/i.test(text);
  const years=recentTaxYears(p),values=p.client_reported_tax_years?.years||{},missing=years.filter(y=>values[y]===false),say=(next,scriptLine)=>({stage:next,scriptLine,instructions:'Read only this approved tax-guidance step, then wait. Do not restart the introduction or reassurance. Never claim to see an unsaved click.'});
@@ -36,13 +37,15 @@ function taxFlowTurn(stage,words,p,line){
  if(stage==='tax_assistant')return {stage:'tax_resources',instructions:'Briefly address the client reaction, then read the saved tax_resources block. Use only the fresh saved percentage if supplied; otherwise omit any numeric progress claim. Do not claim 100% is loan approval.' ,scriptLine:line('tax_resources',p)};
  if(stage==='tax_resources')return missing.length?say('tax_obstacle','Based on what we covered, you still need to file your '+missing.join(' and ')+' '+(missing.length===1?'return.':'returns.')+' If you don’t mind me asking, what’s been holding you back?'):say('callback_time','When you have time, you can upload your filed returns here so everything stays in one place. '+INVITE);
  if(stage==='tax_obstacle')return {stage:'tax_referral_offer',instructions:'Acknowledge their actual obstacle in one short sentence without tax advice, then ask the saved tax_referral_offer question. Do not add a new intake interview.',scriptLine:line('tax_referral_offer',p)};
- if(stage==='tax_referral_offer')return {...say('callback_time',(yes?'I’ll note your request for a tax-professional referral. ':'')+followupPurpose(p)+INVITE),...(yes?{referralRequest:true}:{})};
+ if(stage==='tax_month_offer'){if(booleanReply(text)===true&&!realQuestion(text))return {stage:'callback_time',callbackRequest:'Call me back in about a month.'};if(no)return say('callback_time','No problem. What callback timing would work better for you?');return say(stage,'Would a callback in about a month work for you?');}
+ if(stage==='tax_referral_offer'&&(no||booleanReply(text)===false))return say('tax_month_offer','Okay, I don’t want to be pushy. Would it be okay if I give you a callback in about a month?');
+ if(stage==='tax_referral_offer')return {...say('callback_time',(booleanReply(text)===true?'I’ll note your request for a tax-professional referral. ':'')+followupPurpose(p)+INVITE),...(booleanReply(text)===true?{referralRequest:true}:{})};
  return null;
 }
 function taxSavedTurn(output,p,line){
  const observation=taxObservation(output,p),expected=p.client_reported_tax_years?.years||{},match=observation?.source==='saved'&&Object.keys(expected).length===2&&Object.entries(expected).every(([y,filed])=>observation.years[y]===filed);
  p.prephub_live_status=output;
  const acknowledgment=match?'Excellent. I can see your filing-status selections are saved: '+selectionSummary(observation)+'. ':'';
- return {stage:'tax_assistant',scriptLine:acknowledgment+line('tax_assistant',p),instructions:'Render the saved assistant introduction and tie-down. Saved selections are client-reported, not IRS verification. No claim about unsaved clicks.'};
+ const missing=recentTaxYears(p).filter(y=>expected[y]===false);if(missing.length)return {stage:'tax_next_step',scriptLine:acknowledgment+'If you don’t mind me asking, '+(p.first_name||'')+', when do you think you’ll have time to file your missing '+missing.join(' and ')+' tax '+(missing.length===1?'return':'returns')+' so I can follow up with you to help you keep moving forward?',instructions:'Ask for the actual filing target, then offer a callback in a couple of days, a couple of weeks or a month. Only the existing scheduler can save an agreed appointment. Do not repeat the orientation or a general resource tour.'};return {stage:'callback_time',scriptLine:acknowledgment+INVITE};
 }
 module.exports={completedTaxAction,taxActionStart,taxSelections,taxFlowTurn,taxSavedTurn,INVITE};

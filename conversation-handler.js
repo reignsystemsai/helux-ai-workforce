@@ -19,6 +19,9 @@ response is only acknowledgment/explanation, never a tool-success statement. Nev
 
 function eligible(stage,p){return p.prephub_login_confirmed===true&&(/^(?:credit_|tax_|conversation_)/.test(stage)||stage==='website_help'||['needs','orientation','orientation_checklist','preparation','follow_up_resume','callback_time'].includes(stage)&&['credit','taxes'].includes(p.prephub_section_confirmed));}
 function needsInterpretation(stage,words,p,scripted){
+ if(['tax_referral_offer','tax_month_offer','tax_intake_confirm'].includes(stage)&&booleanReply(words)!==null&&!/[?]|\b(?:but|instead|i.ll call|i will call|why|how|what)\b/i.test(words))return false;
+ if(stage==='tax_next_step'&&scripted?.stage==='tax_referral_offer'&&!/[?]|^(?:what|how|why)/i.test(words))return false;
+ if(scripted?.callbackRequest&&stage==='tax_month_offer')return false;
  if(scripted?.incompleteReply||stage==='tax_next_step'&&scripted?.preparationCommitment)return false;
  if(!eligible(stage,p))return false;
  if(stage.startsWith('conversation_'))return true;
