@@ -5,8 +5,8 @@ const {callbackZone}=require('./callback-relative');
 const {callbackSuggestions}=require('./callback-suggestions');
 const PLANS={self:{name:'Instant Prep Plan',price:'$49.97',includes:['Credit preparation priorities','DTI and student loan questions','Home affordability snapshot','Next-step checklist']},review:{name:'Agent Review + Plan',price:'$97',includes:['Everything in the preparation plan','Report and profile review','Priorities explained in plain language','Questions for your lender']},full:{name:'First-Time Homebuyer Credit Pathway',price:'$249',includes:['Personalized homebuyer roadmap','Credit, DTI and student loan priorities','Credit and affordability preparation','Follow-up and progress checkpoints']},sweep:{name:'Credit Sweep + Tradeline Assessment',price:'$599',includes:['Review of inaccurate or unverifiable items','Specialist dispute assistance','Tradeline profile assessment','Homebuying impact and next steps']}};
 const BLOCKS={
- credit_intro:'Have you already reviewed your credit reports, or would this be your first time?',
- credit_overview:'Would you prefer to work through the free tools yourself, or have someone help you review your next steps?',
+ credit_intro:'{first_name}, credit can be a major hurdle when you’re preparing to buy your first home. PrepHub connects your credit preparation to that homebuying goal. I’ll be working alongside you as your personal PrepHub first-time homebuyer preparation assistant. Our focus is helping you understand the next step and keep moving toward a home. Does that sound helpful?',
+ credit_overview:'Now that you’re inside PrepHub, here’s what’s available to help you. First, use the rent-cost calculator to see what you pay in rent over twelve months. Second, when you have time, gather your credit reports and use the free analysis to review possible discrepancies. You can review specific inaccuracies before starting disputes and track your progress here. You don’t need your reports in hand for this conversation.\n\nIf you’d rather have personal support, our optional preparation plans connect credit, affordability and your homebuying milestones. If you’ve tried credit repair before and felt you weren’t moving toward a home, this gives you a preparation roadmap focused on that goal. Your progress will depend on your situation and the work needed. Do you have two to three minutes now to look at the plans together, or would you prefer a callback?',
  credit_plan_overview:'The Instant Prep Plan is $49.97 for preparation priorities, an affordability snapshot and a next-step checklist. Agent Review + Plan is $97 for a personal report and profile review, explained priorities and questions for your lender.\n\nThe First-Time Homebuyer Credit Pathway is $249 for a personalized roadmap covering credit, DTI, affordability and progress checkpoints. Credit Sweep + Tradeline Assessment is $599 for specialist report review, assistance with specific inaccuracies and a tradeline profile assessment. All four prices are one-time.\n\nWhich plan would you like to know more about?',
  credit_plans:'Take a look at the four preparation plans below. Each lists its one-time price and what’s included. What questions can I answer about them?',
  credit_support_offer:'Would you like me to make a note and ask our team to follow up about the credit preparation plans?',
@@ -74,23 +74,11 @@ function creditFlowTurn(stage,words,p,line){
   stage='credit_plan_questions';
  }
  if(stage==='credit_intro'){
-  if(/^this is my first time|^first time|never|haven.t|have not|not yet|^no[.! ]*$/i.test(text)){p.credit_reports_reviewed=false;return say('credit_overview','We can start with gathering your three credit reports so you can see what needs attention. '+line('credit_overview',p));}
-  if(/already|reviewed|looked|checked|have (?:seen|read)|not (?:my |the )?first time|^yes[.! ]*$/i.test(text)){p.credit_reports_reviewed=true;return say('credit_overview','Since you’ve reviewed your reports, we can focus on understanding the items you found. '+line('credit_overview',p));}
-  if(planQuestion(text)||lowEffort(text))return say('credit_overview');
-  return say(stage,'Have you reviewed your credit reports before?');
+  if(value===true||positiveReaction(text)||/sounds helpful|go ahead|tell me more/i.test(text))return say('credit_overview');
+  if(value===false)return questions();
+  return say(stage,'I’m sorry, I didn’t catch that. Would you like me to explain the credit preparation tools and support plans?');
  }
- if(stage==='credit_overview'){
-  if(/myself|my own|self.?guided|free tools|do it myself/i.test(text)||value===false){p.credit_plan_deferred=true;p.credit_next_step=p.credit_reports_reviewed?'reviewing your uploaded reports with the free analysis':'gathering your three credit reports';return say('credit_self_guided',p.credit_reports_reviewed?'Your next step is to upload your reports for the free analysis. Would you like help finding the upload control?':'Your next step is to gather your three credit reports. Would you like help finding “Gather My Three Credit Reports”?');}
-  if(lowEffort(text)||planQuestion(text)||/someone|personal|help me|have help|support|guided/i.test(text)||value===true)return say('credit_support_choice','We have optional plans for personal review and preparation support. Do you have two to three minutes to look at them together, or would you prefer a callback?');
-  return say(stage,'Would you prefer the free tools on your own, or personal help reviewing your next steps?');
- }
- if(stage==='credit_self_guided'){
-  if(value===true)return say('credit_gather_step','Select “Gather My Three Credit Reports.” Let me know when you see the report instructions.');
-  if(value===false)return say('credit_close_offer','You can return to that step when you’re ready. Would you like a follow-up call about your credit preparation?');
-  return say(stage,'Would you like help finding the credit-report instructions?');
- }
- if(stage==='credit_gather_step')return say('credit_close_offer','Follow the report instructions when you’re ready. Would you like a follow-up call about that step?');
- if(['credit_support_choice','credit_reports','credit_upload_offer','credit_upload','credit_tools'].includes(stage)){
+ if(['credit_overview','credit_reports','credit_upload_offer','credit_upload','credit_tools'].includes(stage)){
   if(lowEffort(text))return say('credit_plan_questions','If you want personal guidance, compare Agent Review + Plan at $97 and the First-Time Homebuyer Credit Pathway at $249. The pathway includes a personalized roadmap and progress checkpoints. Credit Sweep + Tradeline Assessment at $599 adds specialist support for specific report inaccuracies. Our team can confirm what support fits your situation and what you’ll need to provide. Which plan would you like to explore?');
   if(value===true||positiveReaction(text)||planQuestion(text)||/couple minutes|have.{0,15}minutes|right now|go ahead/i.test(text))return overview();
   if(value===false)return say('credit_close_offer','You can return to the tools and plans whenever you’re ready. Would you like a follow-up call to work through your next credit preparation step?');
