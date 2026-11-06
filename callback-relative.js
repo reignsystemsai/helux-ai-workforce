@@ -1,13 +1,16 @@
 'use strict';
-function relativeDelay(value){
- let s=String(value||'').toLowerCase();if(!/call.{0,25}back|call back|callback/.test(s)||/\b(?:don.t|do not|cancel|never|not in|instead of)\b/.test(s))return null;
- const words={fifty:50,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10,eleven:11,twelve:12,fifteen:15,twenty:20,thirty:30,forty:40,fortyfive:45,sixty:60};
- s=s.replace(/\b(twenty|thirty|forty|fifty)[ -]+(one|two|three|four|five|six|seven|eight|nine)\b/g,(_,t,u)=>String(words[t]+words[u]));
- s=s.replace(/half an? hour/g,'30 minutes').replace(/(?:a )?couple(?: of)?/g,'2').replace(/\b(?:a|an) (?=minute|hour)/g,'1 ').replace(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|forty|fifty|sixty)\b/g,w=>String(words[w]));
- let seconds=0;for(const m of s.matchAll(/\b(\d+(?:\.\d+)?)\s*(minutes?|mins?|hours?|hrs?)\b/g))seconds+=Number(m[1])*(/^h/.test(m[2])?3600:60);
- if(!Number.isFinite(seconds)||seconds<60||seconds>366*86400)return null;
- const label=seconds%3600===0?(seconds/3600)+' hour'+(seconds===3600?'':'s'):seconds%60===0?(seconds/60)+' minute'+(seconds===60?'':'s'):null;
- return label?{seconds,label}:null;
+function relativeDelay(value,options={}){
+ let s=String(value||'').toLowerCase().replace(/[’]/g,"'");if(!/call.{0,25}back|callback|\bcall me\b/.test(s)||/\b(?:don't|do not|cancel|never|not in|instead of)\b/.test(s)||/\bi(?:'ll| will) call you\b/.test(s))return null;
+ const small={zero:0,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,ten:10,eleven:11,twelve:12,thirteen:13,fourteen:14,fifteen:15,sixteen:16,seventeen:17,eighteen:18,nineteen:19,twenty:20,thirty:30,forty:40,fifty:50,sixty:60,seventy:70,eighty:80,ninety:90};
+ const number=words=>{let total=0,part=0;for(const w of words.split(/[ -]+/)){if(w==='hundred')part*=100;else if(w==='thousand'){total+=part*1000;part=0;}else if(w!=='and')part+=small[w]||0;}return total+part;};
+ const names=Object.keys(small).concat(['hundred','thousand','and']).join('|');
+ s=s.replace(/half an? hour/g,'30 minutes').replace(/half an? minute/g,'30 seconds').replace(/(?:a )?couple(?: of)?/g,'2').replace(/(?:a )?few/g,'3').replace(/\b(?:a|an|next) (?=second|minute|hour|day|week|month|year)/g,'1 ');
+ s=s.replace(new RegExp('\\b((?:'+names+')(?:[ -]+(?:'+names+'))*)(?=\\s+(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?))','g'),(_,n)=>String(number(n)));
+ let elapsed=0,months=0,days=0;const labels=[];
+ for(const m of s.matchAll(/\b(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?)\b/g)){const n=+m[1],u=m[2];if(!Number.isFinite(n)||n<=0)return null;const unit=/^sec/.test(u)?'second':/^min/.test(u)?'minute':/^h/.test(u)?'hour':/^d/.test(u)?'day':/^w/.test(u)?'week':/^mo/.test(u)?'month':'year';labels.push(n+' '+unit+(n===1?'':'s'));if(unit==='month'||unit==='year')months+=n*(unit==='year'?12:1);else if(unit==='day'||unit==='week')days+=n*(unit==='week'?7:1);else elapsed+=n*({second:1,minute:60,hour:3600}[unit]);}
+ if(!labels.length)return null;const now=Number(options.now??Date.now()),zone=options.timezone||'Etc/UTC';let at=now;
+ if(months||days){const v=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:zone,year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',second:'numeric',hourCycle:'h23'}).formatToParts(now).map(p=>[p.type,+p.value]));const whole=Math.floor(months),target=new Date(Date.UTC(v.year,v.month-1+whole,1,v.hour,v.minute,v.second));target.setUTCDate(Math.min(v.day,new Date(Date.UTC(target.getUTCFullYear(),target.getUTCMonth()+1,0)).getUTCDate()));target.setUTCDate(target.getUTCDate()+Math.floor(days));const desired=+target+(months-whole)*30*86400000+(days-Math.floor(days))*86400000;at=desired;for(let i=0;i<4;i++){const p=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:zone,year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',second:'numeric',hourCycle:'h23'}).formatToParts(at).map(p=>[p.type,+p.value]));const delta=desired-Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute,p.second);at+=delta;if(!delta)break;}}
+ const seconds=Math.round((at-now)/1000+elapsed);return Number.isFinite(seconds)&&seconds>=1?{seconds,label:labels.join(' and ')}:null;
 }
 function callbackZone(value){
  const s=String(value||'').toLowerCase().replace(/[.,!?]/g,' ').replace(/\s+/g,' ').trim();
