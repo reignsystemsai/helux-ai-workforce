@@ -8,7 +8,7 @@ function recoveryDecision(call){
  const recovery=p.disconnect_recovery;
  if(recovery?.attempt===1)return {policy:1,operation:'email',root_action_id:recovery.root_action_id};
  if(call.status!=='completed'&&call.status!=='failed')return null;
- if(turns.filter(t=>t.role==='client'&&String(t.text||'').trim()).length<2||!r.recovery_checkpoint)return null;
+ if(!r.recovery_checkpoint||call.status==='failed'&&!turns.some(t=>t.role==='client'&&String(t.text||'').trim()))return null;
  return {policy:1,operation:'call',root_action_id:call.action_id};
 }
 function recoveryOpening(p){const name=String(p.first_name||'').trim();return 'Hi'+(name?', '+name:'')+'. This is Daisy with the DPA Help Center. It looks like we got disconnected. '+(name?'Is this '+name+' speaking?':'Am I speaking with the person I was just talking with?');}
