@@ -1,6 +1,8 @@
 const {test}=require('node:test'),assert=require('node:assert/strict');
 const {qualified,complete,phone,TRANSFER}=require('./index');
-const lead={first_name:'Test',last_name:'Person',email:'test@example.com',role:'Business owner',classes:['CRMs'],goal:'Build something for my business',budget:'$2,500+',timing:'As soon as possible',ad_budget:1000,phone_confirmed:true};
+const lead={first_name:'Test',last_name:'Person',email:'test@example.com',role:'Business owner',classes:['CRMs'],goal:'Build something for my business',budget:'$2,500+',timing:'As soon as possible',ad_budget:1000,email_confirmed:true,phone_confirmed:true};
 test('only confirmed ad budget at least 1000 qualifies',()=>{assert.equal(qualified(lead),true);assert.equal(qualified({...lead,ad_budget:999}),false);assert.equal(qualified({...lead,ad_budget:0}),false);assert.equal(qualified({...lead,ad_budget:undefined}),false);assert.equal(qualified({...lead,ad_budget:'1000'}),false);assert.equal(qualified({...lead,do_not_call:true}),false)});
 test('learning budget never qualifies an incomplete lead',()=>{assert.equal(complete({...lead,email:''}),false);assert.equal(qualified({...lead,phone_confirmed:false}),false);assert.equal(qualified({...lead,budget:'$2,500+',ad_budget:500}),false)});
 test('transfer is fixed to verified owner number and cannot be an emergency number',()=>{assert.equal(TRANSFER,'+16892828783');assert.equal(phone('911'),null);assert.equal(phone('+1911'),null);assert.equal(phone(TRANSFER),TRANSFER)});
+
+test('email needs confirmation and unknown budget can finish intake without qualifying',()=>{assert.equal(complete({...lead,email_confirmed:false}),false);assert.equal(complete({...lead,ad_budget:null,ad_budget_status:'unknown'}),true);assert.equal(qualified({...lead,ad_budget:null,ad_budget_status:'unknown'}),false);assert.equal(complete({...lead,ad_budget:null}),false);});
