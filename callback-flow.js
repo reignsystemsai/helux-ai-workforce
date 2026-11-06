@@ -10,9 +10,12 @@ function dateChoice(words,options){const s=words.toLowerCase();if(/\b(first|form
 function callbackFlow(stage,words,p){
  if(stage!=='callback_time'||p.callback_suggestions?.kind!=='dates')return null;
  const options=p.callback_suggestions.options;if(!options?.length)return null;
- const text=String(words||'').trim();if(/^(?:why|what|how|who|where|can you|could you|do you|does|is there)\b/i.test(text))return null;if(/\b(?:stop|cancel|don.t call|do not call|i.ll call you|i will call you)\b/i.test(text))return null;
+ const text=String(words||'').trim();if(/^(?:why|what|how|who|where|can you|could you|do you|does|is there)\b/i.test(text))return null;if(/\b(?:stop|cancel|don.t call|do not call|i.ll call you|i will call you)\b/i.test(text)||/\b(?:don.t|do not|no need|never mind|forget).{0,35}(?:call|callback)\b/i.test(text)||/\b(?:can.t|cannot|not at)\b/i.test(text))return null;
  let f=p.callback_flow;if(!f)f=p.callback_flow={phase:'date',options};
- if(/\b(?:instead|actually|change)\b/i.test(text)&&f.phase!=='date'){delete p.callback_flow;return null;}
+ const revisedClock=clockChoice(text),revisedZone=callbackZone(text),revisedDate=f.phase!=='date'?dateChoice(text,f.options):null;
+ if(revisedDate){f.date=revisedDate.date;f.date_label=revisedDate.label;}
+ if(f.phase==='complete'){if(!revisedClock&&!revisedZone&&!revisedDate)return null;if(revisedClock){f.clock=revisedClock;f.clock_quote=text;if(revisedClock.period)f.period=revisedClock.period;}if(revisedZone){f.zone=revisedZone;f.zone_confirmed=true;}}
+ if(f.phase==='zone'&&revisedClock)f.phase='time';
  const say=line=>({stage:'callback_time',scriptLine:line,callbackFlow:true,instructions:'Read only this callback question and wait. These are choices, not a scheduled appointment. Never infer AM/PM or timezone confirmation.'});
  if(f.phase==='date'){
   const selected=dateChoice(text,f.options);if(!selected)return null;
@@ -37,7 +40,7 @@ function callbackFlow(stage,words,p){
   else if(f.suggested_zone&&callbackAffirmative(text)){f.zone=f.suggested_zone;f.zone_confirmed=true;}
   else {delete f.suggested_zone;return say('What time zone should I use for your callback?');}
  }
- if(f.zone_confirmed&&f.clock&&f.period){const hour=f.clock.hour%12+(f.period==='pm'?12:0);try{const callback_at=localInstant(f.date,hour,f.clock.minute,f.zone);f.phase='complete';return {stage:'callback_time',callbackFlow:true,callbackProposal:{callback_at,timezone:f.zone,client_quote:f.clock_quote},instructions:'Prepare the one exact appointment readback through the existing callback tool, then wait for consent before saving.'};}catch{return say('That local time is unavailable. What other time would work?');}}
+ if(f.zone_confirmed&&f.clock&&f.period){const hour=f.clock.hour%12+(f.period==='pm'?12:0);try{const callback_at=localInstant(f.date,hour,f.clock.minute,f.zone);f.phase='complete';return {stage:'callback_time',callbackFlow:true,callbackProposal:{callback_at,timezone:f.zone,client_quote:f.clock_quote},instructions:'Prepare the one exact appointment readback through the existing callback tool, then wait for consent before saving.'};}catch{f.phase='time';delete f.clock;return say('That local time is unavailable. What other time would work?');}}
  return null;
 }
 module.exports={callbackFlow,zipZone,localInstant,clockChoice};
