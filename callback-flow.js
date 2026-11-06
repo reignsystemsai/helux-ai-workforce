@@ -36,14 +36,14 @@ function callbackFlow(stage,words,p){
   if(!f.period)return say('Would morning or evening work better for you?');
   if(!f.clock){f.phase='time';return say(f.period==='am'?'What time in the morning works best—perhaps 8 AM or 9 AM?':'What time in the evening works best—perhaps 6 PM or 7 PM?');}
   f.phase='zone';
-  if(!f.zone_confirmed){const suggested=zipZone(p);if(suggested&&LABELS[suggested]){f.suggested_zone=suggested;return say('Based on your ZIP code, I have '+LABELS[suggested]+'. Is that correct?');}return say('Would that be Eastern, Central, Mountain, or Pacific time—or another time zone?');}
+  if(!f.zone_confirmed){const suggested=zipZone(p);if(suggested&&LABELS[suggested]){f.suggested_zone=suggested;f.zone=suggested;f.zone_suggested=true;}else return say('Would that be Eastern, Central, Mountain, or Pacific time—or another time zone?');}
  }else if(f.phase==='zone'){
   const explicit=callbackZone(text);
   if(explicit){f.zone=explicit;f.zone_confirmed=true;}
   else if(f.suggested_zone&&callbackAffirmative(text)){f.zone=f.suggested_zone;f.zone_confirmed=true;}
   else {delete f.suggested_zone;return say('What time zone should I use for your callback?');}
  }
- if(f.zone_confirmed&&f.clock&&f.period){const hour=f.clock.hour%12+(f.period==='pm'?12:0);try{const callback_at=localInstant(f.date,hour,f.clock.minute,f.zone);f.phase='complete';return {stage:'callback_time',callbackFlow:true,callbackProposal:{callback_at,timezone:f.zone,client_quote:f.clock_quote},instructions:'Prepare the one exact appointment readback through the existing callback tool, then wait for consent before saving.'};}catch{f.phase='time';delete f.clock;return say('That local time is unavailable. What other time would work?');}}
+ if((f.zone_confirmed||f.zone_suggested)&&f.clock&&f.period){const hour=f.clock.hour%12+(f.period==='pm'?12:0);try{const callback_at=localInstant(f.date,hour,f.clock.minute,f.zone);f.phase='complete';return {stage:'callback_time',callbackFlow:true,callbackProposal:{callback_at,timezone:f.zone,client_quote:f.clock_quote,...(!f.zone_confirmed&&f.zone_suggested?{timezone_suggested:true}:{})},instructions:'Prepare the one exact appointment readback through the existing callback tool, then wait for consent before saving.'};}catch{f.phase='time';delete f.clock;return say('That local time is unavailable. What other time would work?');}}
  return null;
 }
 module.exports={callbackFlow,zipZone,localInstant,clockChoice};
