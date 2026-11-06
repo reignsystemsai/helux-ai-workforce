@@ -7601,8 +7601,11 @@ const medicareVoice = process.env.MEDICARE_VOICE_ENABLED === 'false'
   ? { activate: async () => {}, handleUpgrade: () => false }
   : require('./medicare').registerMedicareVoice({app,pool,twilioClient,authToken:TWILIO_AUTH_TOKEN,accountSid:TWILIO_ACCOUNT_SID,publicBaseUrl:PUBLIC_BASE_URL,openaiKey:OPENAI_API_KEY,voice:process.env.MEDICARE_OPENAI_VOICE || OPENAI_VOICE,model:process.env.MEDICARE_OPENAI_MODEL || OPENAI_REALTIME_MODEL});
 
+const aiBuilderVoice = require('./ai-builder').registerAiBuilder({app,twilioClient,authToken:TWILIO_AUTH_TOKEN,accountSid:TWILIO_ACCOUNT_SID,publicBaseUrl:PUBLIC_BASE_URL,openaiKey:OPENAI_API_KEY,heluxKey:HELUX_API_KEY,voice:process.env.MEDICARE_OPENAI_VOICE || OPENAI_VOICE,model:OPENAI_REALTIME_MODEL});
+
 server.on("upgrade", (request, socket, head) => {
   try {
+    if (aiBuilderVoice.handleUpgrade(request, socket, head)) return;
     if (medicareVoice.handleUpgrade(request, socket, head)) return;
     if (managerCalls.handleUpgrade(request, socket, head)) return;
     const requestUrl = new URL(
@@ -7650,6 +7653,7 @@ async function start() {
 
     server.listen(PORT, "0.0.0.0", () => {
       void medicareVoice.activate();
+      void aiBuilderVoice.activate();
       console.log(`HELUX AI Workforce running on port ${PORT}`);
       console.log(`Agent version: ${DOUG_CONFIG.agentVersion}`);
       console.log(`Realtime model: ${OPENAI_REALTIME_MODEL}`);
