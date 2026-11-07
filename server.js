@@ -7602,6 +7602,7 @@ const medicareVoice = process.env.MEDICARE_VOICE_ENABLED === 'false'
   : require('./medicare').registerMedicareVoice({app,pool,twilioClient,authToken:TWILIO_AUTH_TOKEN,accountSid:TWILIO_ACCOUNT_SID,publicBaseUrl:PUBLIC_BASE_URL,openaiKey:OPENAI_API_KEY,voice:process.env.MEDICARE_OPENAI_VOICE || OPENAI_VOICE,model:process.env.MEDICARE_OPENAI_MODEL || OPENAI_REALTIME_MODEL});
 
 const aiBuilderVoice = require('./ai-builder').registerAiBuilder({app,twilioClient,authToken:TWILIO_AUTH_TOKEN,accountSid:TWILIO_ACCOUNT_SID,publicBaseUrl:PUBLIC_BASE_URL,openaiKey:OPENAI_API_KEY,heluxKey:HELUX_API_KEY,voice:process.env.MEDICARE_OPENAI_VOICE || OPENAI_VOICE,model:OPENAI_REALTIME_MODEL});
+require('./ai-builder/browser-voice').registerBrowserVoice({app,openaiKey:OPENAI_API_KEY,voice:OPENAI_VOICE,model:OPENAI_REALTIME_MODEL});
 
 server.on("upgrade", (request, socket, head) => {
   try {
